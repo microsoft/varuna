@@ -99,10 +99,9 @@ class PartitionedModel(Module):
         else:
             raise ValueError("Rank " + self.rank + " not found in stage to rank map!")
 
-    def initialize(self, dummy_inputs, batch_size):
+    def initialize(self, dummy_inputs):
         # print("Initializing partitioned model!")
         start = time.time()
-        self.batch_size = batch_size
         self.dry_run(dummy_inputs)
         print("dry run time", time.time() - start)
         self.prep_cutpoints()

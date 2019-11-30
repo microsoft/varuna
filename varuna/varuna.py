@@ -83,7 +83,7 @@ class Varuna(Module):
         self.model.zero_grad()
     
     def generate_schedule(self):
-        c_schedule = os.popen('./genschedule '+str(self.partitions)+' '+str(self.chunks)+' '+str(self.rank)).read()
+        c_schedule = os.popen(os.path.join(os.path.dirname(os.path.abspath(__file__)),'genschedule ')+str(self.partitions)+' '+str(self.chunks)+' '+str(self.rank)).read()
         schedule = list()
 
         steps = c_schedule.split(';')
@@ -317,6 +317,7 @@ def scatter(input, chunks):
     
     microbatches = [dict() for _ in range(chunks)]
     for k,v in input.items():
+        print(k)
         chunked_values = v.chunk(chunks)
         for i,value in enumerate(chunked_values):
             microbatches[i][k]=value
