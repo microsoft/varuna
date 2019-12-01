@@ -2,6 +2,7 @@ _tmp_inp_shapes
 _tmp_ord_mod
 runs/
 varuna/genschedule
+genschedule
 
 # Byte-compiled / optimized / DLL files
 *__pycache__/
