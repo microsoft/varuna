@@ -156,13 +156,15 @@ class Pipeline:
         # stores output of recompute(/forward) pass to be used by backward()
         # assuming we never encounter 'rfb'/'rrb' schedule
         self.loss = None
+        self.average_loss = 0
+
         # stores input activations to recompute(/forward) - in order to access its grads and send it (rank-1)th device
         self.input_acts = None
 
-        # needs to be changed / removed
-        if self.rank == 0:
-            for batch in batches:
-                self.acts_queue.put(batch['input_ids'])
+        # needs to be removed
+        # if self.rank == 0:
+        #     for batch in batches:
+        #         self.acts_queue.put(batch['input_ids'])
 
     def spawn_recieve_workers(self):
         self.acts_recieve_thread = Thread(target=self.acts_reciever, args=())
@@ -222,11 +224,14 @@ class Pipeline:
 
     # tells the model how to recieve acts and gradients
     def set_model_recv_fn(self, recompute = False):
-        if recompute:
-            ctx, acts = self.recompute_queue.get()
-            restore_rng_states(ctx)
+        if self.rank > 0:
+            if recompute:
+                ctx, acts = self.recompute_queue.get()
+                restore_rng_states(ctx)
+            else:
+                acts = self.acts_queue.get()
         else:
-            acts = self.acts_queue.get()
+            acts = None
 
         def recv(grads = False):
             if grads:
@@ -246,11 +251,11 @@ class Pipeline:
             torch.set_grad_enabled(grad_mode)
 
             self.set_model_send_fn(recompute = False)
+            # if self.rank > 0:
             acts = self.set_model_recv_fn(recompute = False)
-
             output = self.model(**inputs_as_dict)
 
-            if grad_mode == False:
+            if grad_mode == False and self.rank > 0:
                 # if these acts are going to be recomputed
                 rng_states = save_rng_states()
                 ctx = (rng_states, acts)
@@ -263,6 +268,7 @@ class Pipeline:
             torch.set_grad_enabled(True)
 
             self.set_model_send_fn(recompute = True)
+            # if self.rank > 0:
             self.set_model_recv_fn(recompute = True)
 
             output = self.model(**inputs_as_dict)
@@ -280,6 +286,7 @@ class Pipeline:
             else:
                 chunks = len(self.batches)
                 self.loss = self.loss/chunks
+                self.average_loss += self.loss.item()
 
                 if self.fp16:
                     with amp.scale_loss(self.loss, self.optimizer) as scaled_loss:
@@ -306,7 +313,7 @@ class Pipeline:
 
         # return loss
         if self.rank == self.world_size - 1:
-            return self.loss
+            return self.average_loss
         return 0
 
 def scatter(input, chunks):
@@ -317,7 +324,7 @@ def scatter(input, chunks):
     
     microbatches = [dict() for _ in range(chunks)]
     for k,v in input.items():
-        print(k)
+        # print(k)
         chunked_values = v.chunk(chunks)
         for i,value in enumerate(chunked_values):
             microbatches[i][k]=value
