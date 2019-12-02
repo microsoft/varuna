@@ -378,8 +378,7 @@ class BertEncoder(nn.Module):
             if self.output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            # if  torch.distributed.get_rank() == 1:
-            #     print("rank", torch.distributed.get_rank(), "layer", i, type(hidden_states), type(layer_module))
+            # print("rank", torch.distributed.get_rank(), "layer", i, type(hidden_states), hidden_states.get_device() if isinstance(hidden_states,torch.Tensor) else "")
 
             layer_outputs = layer_module(hidden_states, attention_mask, head_mask[i], encoder_hidden_states, encoder_attention_mask)
             hidden_states = layer_outputs[0] if isinstance(layer_outputs,tuple) else layer_outputs

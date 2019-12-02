@@ -54,10 +54,6 @@ from transformers import AdamW, WarmupLinearSchedule
 from utils_squad import (read_squad_examples, convert_examples_to_features,
                          RawResult, write_predictions)
 
-# The follwing import is the official SQuAD evaluation script (2.0).
-# You can remove it from the dependencies if you are using this script outside of the library
-# We've added it here for automated tests (see examples/test_examples.py file)
-from utils_squad_evaluate import EVAL_OPTS, main as evaluate_on_squad
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +125,7 @@ def train(args, train_dataset, model, tokenizer):
                 'end_positions':   dummy_inp[4]}
     inputs['token_type_ids'] = dummy_inp[2]    
 
-    model = Varuna(model, args.partitions, inputs, args.train_batch_size, optimizer, chunks=args.chunks)
+    model = Varuna(model, args.partitions, inputs, args.train_batch_size, optimizer, chunks=args.chunks, local_rank=args.local_rank)
     model.to(args.device)
 
     for _ in train_iterator:
@@ -356,10 +352,8 @@ if __name__ == "__main__":
     parser.add_argument('--rank', type=int, default=0, help='Partition index')
     args = parser.parse_args()
     
-    os.environ['MASTER_ADDR'] = '127.0.0.1'
-    os.environ['MASTER_PORT'] = '29500'
 
     connect_timeout = datetime.timedelta(minutes=4)
-    dist.init_process_group('gloo', rank=args.rank, world_size=args.partitions, timeout=connect_timeout)
+    dist.init_process_group('gloo', timeout=connect_timeout)
 
     main(args)

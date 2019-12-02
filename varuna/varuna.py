@@ -29,23 +29,31 @@ class Varuna(Module):
                 batch_size,
                 optimizer,
                 fp16 = False,
-                chunks: int=1):
+                chunks: int=1,
+                local_rank=-1):
         super().__init__()
 
         self.chunks = chunks
         self.partitions = partitions
         self.rank = dist.get_rank()
+        self.local_rank = local_rank if local_rank != -1 else self.rank
         self.stage = self.rank
+
+        torch.cuda.set_device(self.local_rank)
+        self.device = torch.device("cuda", self.local_rank)
 
         self.optimizer = optimizer
         self.fp16 = fp16
+
+        if self.fp16:
+            from apex import amp
 
         stage_to_rank_map = {}
         for i in range(partitions):
             stage_to_rank_map[i] = [i]
         
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
-        self.model = PartitionedModel(model, self.rank, self.rank, self.rank, stage_to_rank_map)
+        self.model = PartitionedModel(model, self.rank, self.local_rank, self.local_rank, stage_to_rank_map)
         self.model.initialize( dummy_inputs )
 
         # set expected shapes of inputs and gradients for each partition
@@ -70,7 +78,7 @@ class Varuna(Module):
         # avoid dataloader compute in machines other than the first
         # ask the model writer to pass the input batch generating dataloader function to Varuna::__init__
         # and Varuna can take care of input dataloader explicitly
-        pipeline = Pipeline(batches, self.partitions, self.model, self.schedule, self.optimizer, fwd_input_shape = self.fwd_inp_shape, bwd_grad_shape = self.bwd_grad_shape, fp16 = self.fp16)
+        pipeline = Pipeline(batches, self.partitions, self.model, self.device, self.schedule, self.optimizer, fwd_input_shape = self.fwd_inp_shape, bwd_grad_shape = self.bwd_grad_shape, fp16 = self.fp16)
         return pipeline.run()
     
     def eval(self):
@@ -127,11 +135,12 @@ def grads_sender(rank, grads_send_queue):
 class Pipeline:
     """ Pipeline parallelism for Varuna """
 
-    def __init__(self, batches, partitions, model, schedule, optimizer, fwd_input_shape = None, bwd_grad_shape = None, fp16=False):
+    def __init__(self, batches, partitions, model, device, schedule, optimizer, fwd_input_shape = None, bwd_grad_shape = None, fp16=False):
         self.batches = batches
         self.partitions = partitions
 
         self.model = model
+        self.device = device
         self.rank=dist.get_rank()
         self.world_size = partitions
         self.schedule = schedule
@@ -157,14 +166,6 @@ class Pipeline:
         # assuming we never encounter 'rfb'/'rrb' schedule
         self.loss = None
         self.average_loss = 0
-
-        # stores input activations to recompute(/forward) - in order to access its grads and send it (rank-1)th device
-        self.input_acts = None
-
-        # needs to be removed
-        # if self.rank == 0:
-        #     for batch in batches:
-        #         self.acts_queue.put(batch['input_ids'])
 
     def spawn_recieve_workers(self):
         self.acts_recieve_thread = Thread(target=self.acts_reciever, args=())
@@ -195,7 +196,7 @@ class Pipeline:
                 req = dist.irecv(acts_tensor, src=self.rank-1)
                 req.wait()
                 count-=1
-                self.acts_queue.put(acts_tensor.cuda())
+                self.acts_queue.put(acts_tensor.to(self.device))
     
     def grads_reciever(self):
         world_size = self.world_size        # todo: get world_size instead of rank?
@@ -209,7 +210,7 @@ class Pipeline:
                 req = dist.irecv(grads_tensor, src=self.rank+1)
                 req.wait()              
                 count-=1
-                self.grads_queue.put(grads_tensor.cuda())
+                self.grads_queue.put(grads_tensor.to(self.device))
 
     # tells the model where to send acts and gradients
     def set_model_send_fn(self, recompute = False):
@@ -251,7 +252,6 @@ class Pipeline:
             torch.set_grad_enabled(grad_mode)
 
             self.set_model_send_fn(recompute = False)
-            # if self.rank > 0:
             acts = self.set_model_recv_fn(recompute = False)
             output = self.model(**inputs_as_dict)
 
@@ -268,9 +268,7 @@ class Pipeline:
             torch.set_grad_enabled(True)
 
             self.set_model_send_fn(recompute = True)
-            # if self.rank > 0:
             self.set_model_recv_fn(recompute = True)
-
             output = self.model(**inputs_as_dict)
 
             self.loss = output[0] if isinstance(output,tuple) else output
@@ -281,7 +279,7 @@ class Pipeline:
                     with amp.scale_loss(self.loss, self.optimizer) as scaled_loss:
                         scaled_loss.backward(grads)
                 else:
-                    self.loss.backward(torch.ones(self.loss.size()).cuda())
+                    self.loss.backward(torch.ones(self.loss.size()).to(self.device))
 
             else:
                 chunks = len(self.batches)

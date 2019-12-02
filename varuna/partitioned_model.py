@@ -21,7 +21,7 @@ class CutPoint(Module):
         self.cp_func = None
         
         self.set_ret_val_func = None
-
+        self.device = None
         self.send_fn = self.recv_fn = None
 
 
@@ -31,7 +31,7 @@ class CutPoint(Module):
             return inputs[0]
 
         if len(inputs) < 0 or (len(inputs) == 1 and inputs[0] is None):
-            inputs = (torch.tensor([-1.0],requires_grad = True).cuda(),)
+            inputs = (torch.tensor([-1.0],requires_grad = True).to(self.device),)
 
         if isinstance(self.cp_func, torch.autograd.Function):
             out = self.cp_func.apply(*inputs, **kwargs)            
@@ -84,8 +84,9 @@ class PartitionedModel(Module):
         self.stage_to_rank_map = stage_to_rank_map
         self.rank = rank
         self.local_rank = local_rank
-        # torch.cuda.set_device(device)
-        self.device = device
+        
+        torch.cuda.set_device(self.local_rank)
+        self.device = torch.device("cuda", self.local_rank)
 
         self.ret_val = None
         self.pre_cp = None
@@ -172,6 +173,7 @@ class PartitionedModel(Module):
             cutpoint.num_stages = self.num_stages
             cutpoint.set_ret_val_func = self.set_ret_val
             cutpoint.stage = self.stage
+            cutpoint.device = self.device
             cutpoint.set_cp_func()
 
         self.cuts_per_stage = (self.num_cutpoints + 1) // self.num_stages
