@@ -10,6 +10,8 @@ from collections import OrderedDict
 
 blob_store_folder = "~/myblobcontainer"
 
+cp_partition_prefix = "cp-partition"
+
 
 class CutPoint(Module):
     def __init__(self):
@@ -254,7 +256,7 @@ class PartitionedModel(Module):
 
     def checkpoint(self, checkpoint_name = "model-checkpoint"):
         if self.rank != 0:
-            file_name = checkpoint_name + "-" + str(self.rank)
+            file_name = cp_partition_prefix + "-" + str(self.rank)
             torch.save(self.module.state_dict(), file_name)
             os.system("sudo mv " +  file_name + " " + os.path.join(blob_store_folder, file_name))
             torch.distributed.barrier()
@@ -267,11 +269,11 @@ class PartitionedModel(Module):
                 for rank in self.stage_to_rank_map[i]:
                     if rank == 0:
                         continue
-                    file_name = checkpoint_name + "-" + str(rank)
+                    file_name = cp_partition_prefix + "-" + str(rank)
                     os.system("sudo mv " + os.path.join(blob_store_folder, file_name) + " " + file_name)
                     state_dict = torch.load(file_name)
                     for key in state_dict:
-                        if key not in complete_state_dict or complete_state_dict[key] == None:
+                        if key not in complete_state_dict or complete_state_dict[key] is None:
                             complete_state_dict[key] = state_dict[key]
                     os.system("sudo rm " + file_name)
 

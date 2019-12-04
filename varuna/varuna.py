@@ -90,6 +90,9 @@ class Varuna(Module):
     def zero_grad(self):
         self.model.zero_grad()
     
+    def checkpoint(self, cpname):
+        self.model.checkpoint(cpname)
+    
     def generate_schedule(self):
         c_schedule = os.popen(os.path.join(os.path.dirname(os.path.abspath(__file__)),'genschedule ')+str(self.partitions)+' '+str(self.chunks)+' '+str(self.rank)).read()
         schedule = list()
