@@ -264,7 +264,7 @@ class PartitionedModel(Module):
             torch.distributed.barrier()
             complete_state_dict = self.module.state_dict()
 
-            # gather and read all local pickles to form combined state_dicts
+            # gather and read all pickles to form combined state_dicts
             for i in range(self.num_stages):
                 for rank in self.stage_to_rank_map[i]:
                     if rank == 0:

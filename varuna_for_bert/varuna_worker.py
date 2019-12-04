@@ -71,7 +71,7 @@ def set_seed(args):
 def to_list(tensor):
     return tensor.detach().cpu().tolist()
 
-def train(args, train_dataset, model, tokenizer):
+def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
 
     if args.rank == 0:
         tb_writer = SummaryWriter()
@@ -114,9 +114,6 @@ def train(args, train_dataset, model, tokenizer):
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.rank != 0)
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
 
-    stage_to_rank_map = {}
-    for i in range(args.partitions):
-        stage_to_rank_map[i] = [i]
 
     dummy_inp = train_dataset[:1]
     inputs = {  'input_ids':       dummy_inp[0],
@@ -125,7 +122,7 @@ def train(args, train_dataset, model, tokenizer):
                 'end_positions':   dummy_inp[4]}
     inputs['token_type_ids'] = dummy_inp[2]    
 
-    model = Varuna(model, args.partitions, inputs, args.train_batch_size, optimizer, chunks=args.chunks, local_rank=args.local_rank)
+    model = Varuna(model, stage_to_rank_map, inputs, args.train_batch_size, optimizer, chunks=args.chunks, local_rank=args.local_rank)
     model.to(args.device)
 
     for _ in train_iterator:
@@ -139,7 +136,7 @@ def train(args, train_dataset, model, tokenizer):
                       'start_positions': batch[3], 
                       'end_positions':   batch[4]}
             
-            loss = model(inputs)
+            loss = model.run_pipeline(inputs)
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 optimizer.step()
@@ -217,7 +214,7 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
     return dataset
 
 
-def main(args):
+def main(args, stage_to_rank_map):
 
     rank = args.rank
     size = args.partitions
@@ -260,7 +257,7 @@ def main(args):
 
     # Training
     train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False)
-    global_step, tr_loss = train(args, train_dataset, model, tokenizer)
+    global_step, tr_loss = train(args, train_dataset, model, tokenizer, stage_to_rank_map)
     logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
 
@@ -356,4 +353,8 @@ if __name__ == "__main__":
     connect_timeout = datetime.timedelta(minutes=4)
     dist.init_process_group('gloo', timeout=connect_timeout)
 
-    main(args)
+    stage_to_rank_map = {}
+    for i in range(args.partitions):
+        stage_to_rank_map[i] = [i]
+
+    main(args, stage_to_rank_map)
