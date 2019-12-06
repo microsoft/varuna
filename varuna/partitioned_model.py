@@ -117,7 +117,7 @@ class PartitionedModel(Module):
         self.input_shapes = {}
         self.num_cutpoints = 0
 
-        if self.local_rank == 0:
+        if self.local_rank == 0 and not (os.path.exists("_tmp_ord_mod") and os.path.exists("_tmp_inp_shapes")):
             # store input shapes for each module (or atleast each cp)
             print("Initializing partitioned model!")
 

@@ -128,7 +128,6 @@ if __name__ == "__main__":
             # each process's rank
             current_env["RANK"] = str(rank)
             current_env["LOCAL_RANK"] = str(local_rank)
-            current_env["CUDA_VISIBLE_DEVICES"] = str(local_rank)
 
             # spawn the processes
             cmd = [sys.executable, "-u"]
