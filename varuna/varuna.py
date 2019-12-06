@@ -13,7 +13,7 @@ import sys
 
 Module = nn.Module
 
-class Varuna:
+class Varuna(Module):
     """
     model = nn.Sequential(a,b,c,d)
     model = Varuna(model, microbatches/minibatch, list_of_devices)
@@ -27,7 +27,6 @@ class Varuna:
                 stage_to_rank_map,
                 dummy_inputs,
                 batch_size,
-                optimizer,
                 fp16 = False,
                 chunks: int=1,
                 local_rank=-1):
@@ -37,6 +36,7 @@ class Varuna:
         self.partitions = len(stage_to_rank_map)
         self.rank = dist.get_rank()
         self.local_rank = local_rank if local_rank != -1 else self.rank
+        self.stage_to_rank_map = stage_to_rank_map
         
         self.stage = -1
         for stage in self.stage_to_rank_map:
@@ -46,8 +46,9 @@ class Varuna:
                     rank_within_stage = i
                     self.stage = stage
                     break
-        else:
-            raise ValueError("Rank " + self.rank + " not found in stage to rank map!")
+                i += 1
+        if self.stage == -1:
+            raise ValueError("Rank " + str(self.rank) + " not found in stage to rank map!")
 
         # if multiple ranks in stage:
         #     # DistributedSampler(shuffle = False)
@@ -57,7 +58,7 @@ class Varuna:
         torch.cuda.set_device(self.local_rank)
         self.device = torch.device("cuda", self.local_rank)
 
-        self.optimizer = optimizer
+        self.optimizer = None
         self.fp16 = fp16
 
         if self.fp16:
@@ -65,11 +66,11 @@ class Varuna:
 
         
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
-        self.model = PartitionedModel(model, self.rank, self.local_rank, self.local_rank, stage_to_rank_map)
+        self.model = PartitionedModel(model, self.rank, self.local_rank, self.local_rank, self.stage_to_rank_map)
         self.model.initialize( dummy_inputs )
 
         self.micro_batch_size = int(batch_size // chunks)
-        self.init_communication(rank_within_stage, stage_to_rank_map)
+        self.init_communication(rank_within_stage)
 
         # set expected shapes of inputs and gradients for each partition
         self.fwd_inp_shape = self.bwd_grad_shape = None
@@ -92,53 +93,67 @@ class Varuna:
             "recieve_indices": self.recieve_indices,
             "send_ranks": self.send_ranks,
             "send_indices": self.send_indices,
-            "device": self.device
+            "device": self.device,
+            "data_parallel": bool(len(self.stage_to_rank_map[self.stage]) > 1)
         }
+
+        print(self.rank, "with stage", self.stage, "has recieve",  [z for z in zip(self.recieve_ranks, self.recieve_indices)], "and send",  [z for z in zip(self.send_ranks,self.send_indices)])
 
         self.schedule = self.generate_schedule()
 
-    def init_communication(self, rank_within_stage, stage_to_rank_map):
+    def init_communication(self, rank_within_stage):
 
-        per_gpu_batch_size = self.micro_batch_size / len(stage_to_rank_map[self.stage])
+        per_gpu_batch_size = self.micro_batch_size // len(self.stage_to_rank_map[self.stage])
         self.start = rank_within_stage * per_gpu_batch_size
         self.end = self.start + per_gpu_batch_size - 1
 
-        self.recieve_ranks = self.send_ranks = None
-        self.recieve_indices = self.send_indices = None
+        self.recieve_ranks = []; self.send_ranks = []
+        self.recieve_indices = []; self.send_indices = []
 
         # send ranks
         if self.stage < (self.partitions-1):
-            depth_next = stage_to_rank_map[self.stage + 1]
-            per_gpu_batch_size_next = self.micro_batch_size / depth_next
+            depth_next = len(self.stage_to_rank_map[self.stage + 1])
+            per_gpu_batch_size_next = self.micro_batch_size // depth_next
 
-            send_rank_indices = range(self.start // per_gpu_batch_size_next, (self.end // per_gpu_batch_size_next) + 1)
-            self.send_indices = []
-            self.send_ranks = []
+            send_rank_indices = range(int(self.start // per_gpu_batch_size_next), int(self.end // per_gpu_batch_size_next) + 1)
 
             start_ = self.start
             for i in send_rank_indices:
                 end_ = max(self.end+1, per_gpu_batch_size_next * (i+1))
                 self.send_indices.append((start_ - self.start, end_ - self.start) )
-                self.send_ranks()
+                self.send_ranks.append(self.stage_to_rank_map[self.stage + 1][i])
                 start_ = end_
 
         # recieve ranks
         if self.stage > 0:
-            depth_prev = stage_to_rank_map[self.stage + 1]
-            per_gpu_batch_size_prev = self.micro_batch_size / depth_prev
+            depth_prev = len(self.stage_to_rank_map[self.stage - 1])
+            per_gpu_batch_size_prev = self.micro_batch_size // depth_prev
 
             recieve_rank_inidices = range(self.start // per_gpu_batch_size_prev, (self.end // per_gpu_batch_size_prev) + 1 )
-            self.recieve_ranks = []
-            self.recieve_indices = []
 
             start_ = self.start
             for i in recieve_rank_inidices:
                 end_ = max(self.end+1, per_gpu_batch_size_prev * (i+1))
                 self.recieve_indices.append((start_ - self.start, end_ - self.start) )
-                self.recieve_ranks.append(stage_to_rank_map[i])
+                self.recieve_ranks.append(self.stage_to_rank_map[self.stage-1][i])
                 start_ = end_
 
-    def run_pipeline(self, inputs):
+    def init_distributed(self):
+        # create same process groups on all ranks
+        process_groups = {}
+        for stage in range(self.partitions):
+            ranks = self.stage_to_rank_map[stage]
+            if len(ranks) > 1:
+                process_groups[stage] = dist.new_group(ranks=ranks)
+                print("is DDP !!!!")
+            else:
+                process_groups[stage] = None
+
+        if process_groups[self.stage] is not None:
+            print("is DDP")
+            self.model.mark_distributed(process_groups[self.stage])
+    
+    def forward(self, inputs):
         # Divide a mini-batch into micro-batches.
         batches = scatter(inputs, self.chunks)
         
@@ -160,6 +175,9 @@ class Varuna:
     
     def checkpoint(self, cpname):
         self.model.checkpoint(cpname)
+
+    def to(self, device):
+        self.model.to(device)
     
     def generate_schedule(self):
         c_schedule = os.popen(os.path.join(os.path.dirname(os.path.abspath(__file__)),'genschedule ')+str(self.partitions)+' '+str(self.chunks)+' '+str(self.rank)).read()
@@ -190,29 +208,6 @@ def restore_rng_states(rng_states):
     torch.cuda.set_rng_state_all(gpu_rng_states)        # todo: verify correctness;   batchNorm, dropouts, convlayers?
 
 
-def acts_sender(rank, acts_send_queue):
-    while (True):
-        output_acts = acts_send_queue.get()
-
-        # for rank, (s,e) in zip(self.send_ranks, self.send_indices):
-        #     handle = dist.isend(output_acts[s:e].cpu(), dst=rank)
-        #     handle.wait()
-
-        handle = dist.isend(output_acts.cpu(), dst=rank+1)
-        handle.wait()
-
-def grads_sender(rank, grads_send_queue):
-    while (True):
-        input_grads = grads_send_queue.get()
-
-        # for rank, (s,e) in zip(self.recieve_ranks, self.recieve_indices):
-        #     handle = dist.isend(output_acts[s:e].cpu(), dst=rank)
-        #     handle.wait()
-
-        handle = dist.isend(input_grads.cpu(), dst=rank-1)
-        handle.wait()
-
-
 class Pipeline:
     """ Pipeline parallelism for Varuna """
 
@@ -221,11 +216,14 @@ class Pipeline:
         self.partitions = config["partitions"]
         self.stage = config["stage"]
 
+        assert(self.stage == dist.get_rank(), "Nooooo")
+        self.data_parallel = config["data_parallel"]
+
         self.model = model
         self.device = config["device"]
         self.world_size = self.partitions
         self.schedule = schedule
-        self.fwd_inp_shape = config["fwd_input_shape"]
+        self.fwd_inp_shape = config["fwd_inp_shape"]
         self.bwd_grad_shape = config["bwd_grad_shape"]
         
         self.recieve_ranks = config["recieve_ranks"]
@@ -263,11 +261,11 @@ class Pipeline:
         self.grads_recieve_thread.start()
     
     def spawn_send_workers(self):
-        self.acts_send_thread = Thread(target=acts_sender, args=(self.stage, self.acts_send_queue))
+        self.acts_send_thread = Thread(target=self.acts_sender, args=())
         self.acts_send_thread.daemon=True
         self.acts_send_thread.start()
 
-        self.grads_send_thead = Thread(target=grads_sender, args=(self.stage, self.grads_send_queue))
+        self.grads_send_thead = Thread(target=self.grads_sender, args=())
         self.grads_send_thead.daemon=True
         self.grads_send_thead.start() 
     
@@ -278,21 +276,20 @@ class Pipeline:
                 if task == 0:
                     count += 1
             while count > 0:
-                # inp_shape = self.fwd_inp_shape
-                # acts_tensor = torch.ones(self.fwd_inp_shape, dtype=torch.float32)
-                # start = 0; 
-                # for rank, (s,e) in zip(self.recieve_ranks, self.recieve_indices):
-                #     fwd_inp_shape[0] = e-s
-                #     acts_tensor_i = torch.ones(fwd_inp_shape, dtype=torch.float32)
-                #     handle = dist.irecv(acts_tensor_i, src=rank)
-                #     handle.wait()
-                #     end = start + fwd_inp_shape[0]
-                #     acts_tensor[start:end] = acts_tensor_i
-                #     start = end
-
+                fwd_inp_shape = self.fwd_inp_shape
                 acts_tensor = torch.ones(self.fwd_inp_shape, dtype=torch.float32)
-                req = dist.irecv(acts_tensor, src=self.rank-1)
-                req.wait()
+                start = 0; 
+                for rank, (s,e) in zip(self.recieve_ranks, self.recieve_indices):
+                    fwd_inp_shape[0] = e-s
+                    if start != 0 or fwd_inp_shape != self.fwd_inp_shape:
+                        print("Difff!!")
+                    acts_tensor_i = torch.ones(fwd_inp_shape, dtype=torch.float32)
+                    handle = dist.irecv(acts_tensor_i, src=rank)
+                    handle.wait()
+                    end = start + fwd_inp_shape[0]
+                    acts_tensor[start:end] = acts_tensor_i
+                    start = end
+
                 count -= 1
                 self.acts_queue.put(acts_tensor.to(self.device))
     
@@ -304,24 +301,45 @@ class Pipeline:
                 if task == 2:
                     count += 1
             while count > 0:
-                # grad_shape = self.bwd_grad_shape
-                # grads_tensor = torch.ones(grad_shape, dtype=torch.float32)
-                # start = 0; 
-                # for rank, (s,e) in zip(self.recieve_ranks, self.recieve_indices):
-                #     grad_shape[0] = e-s
-                #     grads_tensor_i = torch.ones(grad_shape, dtype=torch.float32)
-                #     handle = dist.irecv(grads_tensor_i, src=rank)
-                #     handle.wait()
-                #     end = start + grad_shape[0]
-                #     acts_tensor[start:end] = grads_tensor_i
-                #     start = end
-
-                grads_tensor = torch.ones(self.bwd_grad_shape, dtype=torch.float32)
-                req = dist.irecv(grads_tensor, src=self.rank+1)
-                req.wait()              
+                grad_shape = self.bwd_grad_shape
+                grads_tensor = torch.ones(grad_shape, dtype=torch.float32)
+                start = 0; 
+                for rank, (s,e) in zip(self.recieve_ranks, self.recieve_indices):
+                    grad_shape[0] = e-s
+                    if start != 0 or grad_shape != self.bwd_grad_shape:
+                        print("Difff!!")
+                    grads_tensor_i = torch.ones(grad_shape, dtype=torch.float32)
+                    handle = dist.irecv(grads_tensor_i, src=rank)
+                    handle.wait()
+                    end = start + grad_shape[0]
+                    grads_tensor[start:end] = grads_tensor_i
+                    start = end
+ 
                 count -= 1
                 self.grads_queue.put(grads_tensor.to(self.device))
 
+    def acts_sender(self):
+        while (True):
+            output_acts = self.acts_send_queue.get()
+            count = 0
+            for rank, (s,e) in zip(self.send_ranks, self.send_indices):
+                if count > 0:
+                    print("Diff!")
+                handle = dist.isend(output_acts[s:e].cpu(), dst=rank)
+                handle.wait()
+                count += 1
+
+    def grads_sender(self):
+        while (True):
+            input_grads = self.grads_send_queue.get()
+            count = 0
+            for rank, (s,e) in zip(self.recieve_ranks, self.recieve_indices):
+                if count > 0:
+                    print("Diff!")
+                handle = dist.isend(input_grads[s:e].cpu(), dst=rank)
+                handle.wait()
+                count += 1
+    
     # tells the model where to send acts and gradients
     def set_model_send_fn(self, recompute = False):
         def send(tensor, grads = False):
@@ -365,7 +383,7 @@ class Pipeline:
             acts = self.set_model_recv_fn(recompute = False)
             output = self.model(**inputs_as_dict)
 
-            if grad_mode == False and self.rank > 0:
+            if grad_mode == False and self.stage > 0:
                 # if these acts are going to be recomputed
                 rng_states = save_rng_states()
                 ctx = (rng_states, acts)
@@ -413,8 +431,13 @@ class Pipeline:
                     # if next task in schedule is backward  -- no recomputation
                     grad_mode=True
 
-            self.worker(task[0], grad_mode, self.batches[task[1]])
-            # todo: return loss at (rank-1)th device
+            # For data parallel, sync only when doing last microbatch backward
+            if self.data_parallel and task[1] < (len(batches) - 1):
+                print("no syncc")
+                with self.model.module.no_sync():
+                    self.worker(task[0], grad_mode, self.batches[task[1]])
+            else:
+                self.worker(task[0], grad_mode, self.batches[task[1]])
         
         self.acts_recieve_thread.join()
         self.grads_recieve_thread.join()

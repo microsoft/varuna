@@ -40,7 +40,7 @@ np.random.seed(42)
 import random 
 random.seed(42)
 
-from torch.utils.data import (DataLoader, TensorDataset)
+from torch.utils.data import (DataLoader, TensorDataset, DistributedSampler)
 from tqdm import tqdm, trange
 
 from tensorboardX import SummaryWriter
@@ -77,9 +77,38 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
         tb_writer = SummaryWriter()
 
     args.train_batch_size = args.per_gpu_train_batch_size
-    train_dataloader = DataLoader(train_dataset, batch_size=args.train_batch_size)
+
+    for stage in stage_to_rank_map:
+        i = 0
+        for rank in stage_to_rank_map[stage]:
+            if rank == args.rank:
+                rank_within_stage = i
+                my_stage = stage
+                break
+            i += 1
+
+    # Each stage divides data according to it's depth
+    if len(stage_to_rank_map[my_stage]) > 1:
+        num_replicas = len(stage_to_rank_map[my_stage])
+        train_sampler = DistributedSampler(train_dataset, num_replicas=num_replicas, rank=rank_within_stage ,shuffle=False)
+        train_batch_size = args.train_batch_size // num_replicas
+        train_dataloader = DataLoader(train_dataset, batch_size=train_batch_size, sampler=train_sampler, shuffle = False, drop_last = True)
+    else:
+        print("no DDP!!!")
+        train_sampler = None
+        train_dataloader = DataLoader(train_dataset, batch_size=args.train_batch_size, shuffle = False, drop_last = True)
 
     t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
+
+    dummy_inp = train_dataset[:1]
+    inputs = {  'input_ids':       dummy_inp[0],
+                'attention_mask':  dummy_inp[1], 
+                'start_positions': dummy_inp[3], 
+                'end_positions':   dummy_inp[4]}
+    inputs['token_type_ids'] = dummy_inp[2]    
+
+    model = Varuna(model, stage_to_rank_map, inputs, args.train_batch_size, chunks=args.chunks, local_rank=args.local_rank)
+    model.to(args.device)
 
     # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ['bias', 'LayerNorm.weight']
@@ -97,6 +126,9 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
             raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
         model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
 
+    model.optimizer = optimizer
+    model.init_distributed()
+
     # Train!
     if args.rank == 0:
         logger.info("***** Running training *****")
@@ -111,22 +143,11 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
     global_step = 0
     tr_loss, logging_loss = 0.0, 0.0
     model.zero_grad()
-    train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.rank != 0)
+    train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=my_stage!=(args.partitions-1))
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
 
-
-    dummy_inp = train_dataset[:1]
-    inputs = {  'input_ids':       dummy_inp[0],
-                'attention_mask':  dummy_inp[1], 
-                'start_positions': dummy_inp[3], 
-                'end_positions':   dummy_inp[4]}
-    inputs['token_type_ids'] = dummy_inp[2]    
-
-    model = Varuna(model, stage_to_rank_map, inputs, args.train_batch_size, optimizer, chunks=args.chunks, local_rank=args.local_rank)
-    model.to(args.device)
-
     for _ in train_iterator:
-        epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.rank != 0)
+        epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=my_stage!=(args.partitions-1))
         for step, batch in enumerate(epoch_iterator):
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
@@ -136,7 +157,9 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
                       'start_positions': batch[3], 
                       'end_positions':   batch[4]}
             
-            loss = model.run_pipeline(inputs)
+            loss = model(inputs)
+            if my_stage == (args.partitions - 1):
+                print("loss at step",step, "is ", loss )
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 optimizer.step()
@@ -144,16 +167,16 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
                 model.zero_grad()
                 global_step += 1
 
-                if args.rank == (args.partitions - 1) and args.logging_steps > 0 and global_step % args.logging_steps == 0:
-                    # Log metrics
-                    if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
-                        results = evaluate(args, model, tokenizer)
-                        for key, value in results.items():
-                            tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
-                    # tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
-                    # tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
-                    print("loss at step",global_step, "is ", loss )
-                    # logging_loss = tr_loss
+                # if my_stage == (args.partitions - 1) and args.logging_steps > 0 and global_step % args.logging_steps == 0:
+                #     # Log metrics
+                #     if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
+                #         results = evaluate(args, model, tokenizer)
+                #         for key, value in results.items():
+                #             tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
+                #     # tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
+                #     # tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
+                #     print("loss at step",global_step, "is ", loss )
+                #     # logging_loss = tr_loss
 
     if args.rank == 0:
         tb_writer.close()

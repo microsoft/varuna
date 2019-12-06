@@ -110,6 +110,9 @@ class PartitionedModel(Module):
         self.prep_cutpoints()
         self.remove_unused_parameters()
         self.model_pruned = True
+
+    def mark_distributed(self, process_group):
+        self.module = torch.nn.DistributedDataParallel(self.module, process_group=process_group, device_ids=[self.local_rank])
     
     def dry_run(self, dummy_inputs):
         # """ executes the forward pass of the module on dummy inputs. Sets the order in which modules are used and the total number of cutpoints declared. """
@@ -117,7 +120,7 @@ class PartitionedModel(Module):
         self.input_shapes = {}
         self.num_cutpoints = 0
 
-        if self.local_rank == 0:
+        if self.local_rank == 0 and not os.path.exists("_tmp_ord_mod") and not os.path.exists("_tmp_inp_shapes"):
             # store input shapes for each module (or atleast each cp)
             print("Initializing partitioned model!")
 
