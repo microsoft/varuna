@@ -112,7 +112,7 @@ class PartitionedModel(Module):
         self.model_pruned = True
 
     def mark_distributed(self, process_group):
-        self.module = torch.nn.DistributedDataParallel(self.module, process_group=process_group, device_ids=[self.local_rank])
+        self.module = torch.nn.parallel.DistributedDataParallel(self.module, process_group=process_group, device_ids=[self.local_rank], find_unused_parameters=True)
     
     def dry_run(self, dummy_inputs):
         # """ executes the forward pass of the module on dummy inputs. Sets the order in which modules are used and the total number of cutpoints declared. """

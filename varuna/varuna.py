@@ -5,6 +5,7 @@ import torch.distributed as dist
 from torch.multiprocessing import Process
 from queue import Queue
 from threading import Thread
+import math
 
 from .partitioned_model import PartitionedModel
 
@@ -72,17 +73,6 @@ class Varuna(Module):
         self.micro_batch_size = int(batch_size // chunks)
         self.init_communication(rank_within_stage)
 
-        # set expected shapes of inputs and gradients for each partition
-        self.fwd_inp_shape = self.bwd_grad_shape = None
-        if self.stage > 0:
-            self.fwd_inp_shape = self.model.forward_input_shapes[0]
-            self.fwd_inp_shape[0] = self.micro_batch_size
-            # print("Varuna fwd inp shape ", self.fwd_inp_shape)
-        if self.stage < (self.partitions-1):
-            self.bwd_grad_shape = self.model.backward_grad_shapes[0]
-            self.bwd_grad_shape[0] = self.micro_batch_size
-            # print("Varuna bwd grad shape", self.bwd_grad_shape)
-
         self.config = {
             "stage": self.stage,
             "partitions": self.partitions,
@@ -97,13 +87,11 @@ class Varuna(Module):
             "data_parallel": bool(len(self.stage_to_rank_map[self.stage]) > 1)
         }
 
-        print(self.rank, "with stage", self.stage, "has recieve",  [z for z in zip(self.recieve_ranks, self.recieve_indices)], "and send",  [z for z in zip(self.send_ranks,self.send_indices)])
-
         self.schedule = self.generate_schedule()
 
     def init_communication(self, rank_within_stage):
 
-        per_gpu_batch_size = self.micro_batch_size // len(self.stage_to_rank_map[self.stage])
+        per_gpu_batch_size = math.ceil( float(self.micro_batch_size) / len(self.stage_to_rank_map[self.stage]) )
         self.start = rank_within_stage * per_gpu_batch_size
         self.end = self.start + per_gpu_batch_size - 1
 
@@ -113,13 +101,13 @@ class Varuna(Module):
         # send ranks
         if self.stage < (self.partitions-1):
             depth_next = len(self.stage_to_rank_map[self.stage + 1])
-            per_gpu_batch_size_next = self.micro_batch_size // depth_next
+            per_gpu_batch_size_next = math.ceil( float(self.micro_batch_size) / depth_next )
 
             send_rank_indices = range(int(self.start // per_gpu_batch_size_next), int(self.end // per_gpu_batch_size_next) + 1)
 
             start_ = self.start
             for i in send_rank_indices:
-                end_ = max(self.end+1, per_gpu_batch_size_next * (i+1))
+                end_ = min(self.end+1, per_gpu_batch_size_next * (i+1))
                 self.send_indices.append((start_ - self.start, end_ - self.start) )
                 self.send_ranks.append(self.stage_to_rank_map[self.stage + 1][i])
                 start_ = end_
@@ -127,16 +115,27 @@ class Varuna(Module):
         # recieve ranks
         if self.stage > 0:
             depth_prev = len(self.stage_to_rank_map[self.stage - 1])
-            per_gpu_batch_size_prev = self.micro_batch_size // depth_prev
+            per_gpu_batch_size_prev = math.ceil( float(self.micro_batch_size) / depth_prev )
 
             recieve_rank_inidices = range(self.start // per_gpu_batch_size_prev, (self.end // per_gpu_batch_size_prev) + 1 )
 
             start_ = self.start
             for i in recieve_rank_inidices:
-                end_ = max(self.end+1, per_gpu_batch_size_prev * (i+1))
+                end_ = min(self.end+1, per_gpu_batch_size_prev * (i+1))
                 self.recieve_indices.append((start_ - self.start, end_ - self.start) )
                 self.recieve_ranks.append(self.stage_to_rank_map[self.stage-1][i])
                 start_ = end_
+
+        # set expected shapes of inputs and gradients for each partition
+        self.fwd_inp_shape = self.bwd_grad_shape = None
+        if self.stage > 0:
+            self.fwd_inp_shape = self.model.forward_input_shapes[0]
+            self.fwd_inp_shape[0] = per_gpu_batch_size
+            # print("Varuna fwd inp shape ", self.fwd_inp_shape)
+        if self.stage < (self.partitions-1):
+            self.bwd_grad_shape = self.model.backward_grad_shapes[0]
+            self.bwd_grad_shape[0] = per_gpu_batch_size
+            # print("Varuna bwd grad shape", self.bwd_grad_shape)
 
     def init_distributed(self):
         # create same process groups on all ranks
@@ -145,15 +144,13 @@ class Varuna(Module):
             ranks = self.stage_to_rank_map[stage]
             if len(ranks) > 1:
                 process_groups[stage] = dist.new_group(ranks=ranks)
-                print("is DDP !!!!")
             else:
                 process_groups[stage] = None
 
         if process_groups[self.stage] is not None:
-            print("is DDP")
             self.model.mark_distributed(process_groups[self.stage])
     
-    def forward(self, inputs):
+    def forward(self, inputs):        
         # Divide a mini-batch into micro-batches.
         batches = scatter(inputs, self.chunks)
         
@@ -180,7 +177,7 @@ class Varuna(Module):
         self.model.to(device)
     
     def generate_schedule(self):
-        c_schedule = os.popen(os.path.join(os.path.dirname(os.path.abspath(__file__)),'genschedule ')+str(self.partitions)+' '+str(self.chunks)+' '+str(self.rank)).read()
+        c_schedule = os.popen(os.path.join(os.path.dirname(os.path.abspath(__file__)),'genschedule ')+str(self.partitions)+' '+str(self.chunks)+' '+str(self.stage)).read()
         schedule = list()
 
         steps = c_schedule.split(';')
@@ -215,8 +212,6 @@ class Pipeline:
         self.batches = batches
         self.partitions = config["partitions"]
         self.stage = config["stage"]
-
-        assert(self.stage == dist.get_rank(), "Nooooo")
         self.data_parallel = config["data_parallel"]
 
         self.model = model
@@ -236,7 +231,6 @@ class Pipeline:
 
         self.grads_send_queue = Queue()
         self.acts_send_queue = Queue()
-
         self.spawn_send_workers()
 
         self.acts_queue = Queue()       # activation at the boundary, rename as input_acts
@@ -252,79 +246,77 @@ class Pipeline:
         self.average_loss = 0
 
     def spawn_recieve_workers(self):
-        self.acts_recieve_thread = Thread(target=self.acts_reciever, args=())
-        self.acts_recieve_thread.daemon=True
-        self.acts_recieve_thread.start()
+        if self.stage > 0:
+            self.acts_recieve_thread = Thread(target=self.acts_reciever, args=())
+            self.acts_recieve_thread.daemon=True
+            self.acts_recieve_thread.start()
 
-        self.grads_recieve_thread = Thread(target=self.grads_reciever, args=())
-        self.grads_recieve_thread.daemon=True
-        self.grads_recieve_thread.start()
+        if self.stage < self.world_size-1:
+            self.grads_recieve_thread = Thread(target=self.grads_reciever, args=())
+            self.grads_recieve_thread.daemon=True
+            self.grads_recieve_thread.start()
     
     def spawn_send_workers(self):
-        self.acts_send_thread = Thread(target=self.acts_sender, args=())
-        self.acts_send_thread.daemon=True
-        self.acts_send_thread.start()
+        if self.stage < self.world_size-1:
+            self.acts_send_thread = Thread(target=self.acts_sender, args=())
+            self.acts_send_thread.daemon=True
+            self.acts_send_thread.start()
 
-        self.grads_send_thead = Thread(target=self.grads_sender, args=())
-        self.grads_send_thead.daemon=True
-        self.grads_send_thead.start() 
+        if self.stage > 0:
+            self.grads_send_thead = Thread(target=self.grads_sender, args=())
+            self.grads_send_thead.daemon=True
+            self.grads_send_thead.start() 
     
     def acts_reciever(self):
         count=0
-        if self.stage != 0:
-            for task,index in self.schedule:
-                if task == 0:
-                    count += 1
-            while count > 0:
-                fwd_inp_shape = self.fwd_inp_shape
-                acts_tensor = torch.ones(self.fwd_inp_shape, dtype=torch.float32)
-                start = 0; 
-                for rank, (s,e) in zip(self.recieve_ranks, self.recieve_indices):
-                    fwd_inp_shape[0] = e-s
-                    if start != 0 or fwd_inp_shape != self.fwd_inp_shape:
-                        print("Difff!!")
-                    acts_tensor_i = torch.ones(fwd_inp_shape, dtype=torch.float32)
-                    handle = dist.irecv(acts_tensor_i, src=rank)
-                    handle.wait()
-                    end = start + fwd_inp_shape[0]
-                    acts_tensor[start:end] = acts_tensor_i
-                    start = end
+        for task,index in self.schedule:
+            if task == 0:
+                count += 1
+        while count > 0:
+            # copy orig shape
+            fwd_inp_shape = list(self.fwd_inp_shape)
+            acts_tensor = torch.ones(self.fwd_inp_shape, dtype=torch.float32)
+            start = 0; 
+            for rank, (s,e) in zip(self.recieve_ranks, self.recieve_indices):
+                fwd_inp_shape[0] = e-s
+                acts_tensor_i = torch.ones(fwd_inp_shape, dtype=torch.float32)
+                handle = dist.irecv(acts_tensor_i, src=rank)
+                handle.wait()
+                end = start + fwd_inp_shape[0]
+                acts_tensor[start:end] = acts_tensor_i
+                start = end
 
-                count -= 1
-                self.acts_queue.put(acts_tensor.to(self.device))
+            count -= 1
+            self.acts_queue.put(acts_tensor.to(self.device))
     
     def grads_reciever(self):
         world_size = self.world_size        # todo: get world_size instead of rank?
         count = 0
-        if self.stage != world_size-1:
-            for task,index in self.schedule:
-                if task == 2:
-                    count += 1
-            while count > 0:
-                grad_shape = self.bwd_grad_shape
-                grads_tensor = torch.ones(grad_shape, dtype=torch.float32)
-                start = 0; 
-                for rank, (s,e) in zip(self.recieve_ranks, self.recieve_indices):
-                    grad_shape[0] = e-s
-                    if start != 0 or grad_shape != self.bwd_grad_shape:
-                        print("Difff!!")
-                    grads_tensor_i = torch.ones(grad_shape, dtype=torch.float32)
-                    handle = dist.irecv(grads_tensor_i, src=rank)
-                    handle.wait()
-                    end = start + grad_shape[0]
-                    grads_tensor[start:end] = grads_tensor_i
-                    start = end
- 
-                count -= 1
-                self.grads_queue.put(grads_tensor.to(self.device))
+        for task,index in self.schedule:
+            if task == 2:
+                count += 1
+        while count > 0:
+            # copy orig shape
+            grad_shape = list(self.bwd_grad_shape)
+            grads_tensor = torch.ones(grad_shape, dtype=torch.float32)
+            start = 0; 
+            for rank, (s,e) in zip(self.send_ranks, self.send_indices):
+                grad_shape[0] = e-s
+                grads_tensor_i = torch.ones(grad_shape, dtype=torch.float32)
+                handle = dist.irecv(grads_tensor_i, src=rank)
+                handle.wait()
+                end = start + grad_shape[0]
+                grads_tensor[start:end] = grads_tensor_i
+                start = end
+
+            count -= 1
+            self.grads_queue.put(grads_tensor.to(self.device))
 
     def acts_sender(self):
         while (True):
             output_acts = self.acts_send_queue.get()
             count = 0
             for rank, (s,e) in zip(self.send_ranks, self.send_indices):
-                if count > 0:
-                    print("Diff!")
                 handle = dist.isend(output_acts[s:e].cpu(), dst=rank)
                 handle.wait()
                 count += 1
@@ -334,8 +326,6 @@ class Pipeline:
             input_grads = self.grads_send_queue.get()
             count = 0
             for rank, (s,e) in zip(self.recieve_ranks, self.recieve_indices):
-                if count > 0:
-                    print("Diff!")
                 handle = dist.isend(input_grads[s:e].cpu(), dst=rank)
                 handle.wait()
                 count += 1
@@ -432,15 +422,16 @@ class Pipeline:
                     grad_mode=True
 
             # For data parallel, sync only when doing last microbatch backward
-            if self.data_parallel and task[1] < (len(batches) - 1):
-                print("no syncc")
+            if self.data_parallel and task[1] < (len(self.batches) - 1):
                 with self.model.module.no_sync():
                     self.worker(task[0], grad_mode, self.batches[task[1]])
             else:
                 self.worker(task[0], grad_mode, self.batches[task[1]])
         
-        self.acts_recieve_thread.join()
-        self.grads_recieve_thread.join()
+        if self.acts_recieve_thread is not None:
+            self.acts_recieve_thread.join()
+        if self.grads_recieve_thread is not None:
+            self.grads_recieve_thread.join()
 
         # return loss
         if self.stage == self.world_size - 1:
@@ -455,7 +446,16 @@ def scatter(input, chunks):
     
     microbatches = [dict() for _ in range(chunks)]
     for k,v in input.items():
-        # print(k)
+        v_size = list(v.size())
+        # make divisible
+        # TODO: what will happen for indivisibilities in uneven data parallelism !!
+        if v_size[0] % chunks != 0:
+            orig_len = v_size[0]
+            v_size[0] += chunks - (v_size[0] % chunks) 
+            v_ = torch.zeros(v_size, dtype=v.dtype)
+            v_[:orig_len] = v
+            v_[orig_len:] = v[:(v_size[0] - orig_len)]
+            v = v_
         chunked_values = v.chunk(chunks)
         for i,value in enumerate(chunked_values):
             microbatches[i][k]=value

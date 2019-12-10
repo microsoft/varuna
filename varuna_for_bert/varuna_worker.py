@@ -90,11 +90,10 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
     # Each stage divides data according to it's depth
     if len(stage_to_rank_map[my_stage]) > 1:
         num_replicas = len(stage_to_rank_map[my_stage])
-        train_sampler = DistributedSampler(train_dataset, num_replicas=num_replicas, rank=rank_within_stage ,shuffle=False)
+        train_sampler = DistributedSampler(train_dataset, num_replicas=num_replicas, rank=rank_within_stage, shuffle=False)
         train_batch_size = args.train_batch_size // num_replicas
         train_dataloader = DataLoader(train_dataset, batch_size=train_batch_size, sampler=train_sampler, shuffle = False, drop_last = True)
     else:
-        print("no DDP!!!")
         train_sampler = None
         train_dataloader = DataLoader(train_dataset, batch_size=args.train_batch_size, shuffle = False, drop_last = True)
 
@@ -369,6 +368,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--chunks', type=int, default=1, help="Number of micro-batches per mini-batch")
     parser.add_argument('--partitions', type=int, default=3, help='Number of devices over which the model is split')
+    parser.add_argument('--stage_to_rank_map',type=str, default="",help="How GPU processes are divided among partitions")
     parser.add_argument('--rank', type=int, default=0, help='Partition index')
     args = parser.parse_args()
     
@@ -376,8 +376,11 @@ if __name__ == "__main__":
     connect_timeout = datetime.timedelta(minutes=4)
     dist.init_process_group('gloo', timeout=connect_timeout)
 
+    # parse stage_to_rank_map
+    stage_ranks = args.stage_to_rank_map.split(";", args.partitions)
     stage_to_rank_map = {}
     for i in range(args.partitions):
-        stage_to_rank_map[i] = [i]
+        ranks = stage_ranks[i].split(",")
+        stage_to_rank_map[i] = [int(r) for r in ranks]
 
     main(args, stage_to_rank_map)
