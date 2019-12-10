@@ -166,7 +166,6 @@ class Pipeline:
         self.grads_recieve_thread = None
 
         # stores output of recompute(/forward) pass to be used by backward()
-        # assuming we never encounter 'rfb'/'rrb' schedule
         self.loss = None
         self.average_loss = 0
 
@@ -307,7 +306,6 @@ class Pipeline:
                     grad_mode=True
 
             self.worker(task[0], grad_mode, self.batches[task[1]])
-            # todo: return loss at (rank-1)th device
         
         self.acts_recieve_thread.join()
         self.grads_recieve_thread.join()
@@ -325,7 +323,6 @@ def scatter(input, chunks):
     
     microbatches = [dict() for _ in range(chunks)]
     for k,v in input.items():
-        # print(k)
         chunked_values = v.chunk(chunks)
         for i,value in enumerate(chunked_values):
             microbatches[i][k]=value

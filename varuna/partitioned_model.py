@@ -146,7 +146,7 @@ class PartitionedModel(Module):
 
             # actually just need the order as a list of names
             with open("_tmp_ord_mod",'wb') as f:
-                pickle.dump(self.ordered_modules,f)
+                pickle.dump(list(self.ordered_modules.keys()),f)
             with open("_tmp_inp_shapes",'wb') as f:
                 pickle.dump(self.input_shapes,f)
             dist.barrier()
