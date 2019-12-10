@@ -3,6 +3,8 @@ _tmp_ord_mod
 runs/
 varuna/genschedule
 genschedule
+n_stages
+training_output
 
 # Byte-compiled / optimized / DLL files
 *__pycache__/

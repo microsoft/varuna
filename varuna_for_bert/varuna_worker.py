@@ -147,6 +147,8 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
 
     for _ in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=my_stage!=(args.partitions-1))
+        avg_mb_time = 0.0
+
         for step, batch in enumerate(epoch_iterator):
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
@@ -156,9 +158,10 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
                       'start_positions': batch[3], 
                       'end_positions':   batch[4]}
             
+            minibatch_time = time.time()
             loss = model(inputs)
-            if my_stage == (args.partitions - 1):
-                print("loss at step",step, "is ", loss )
+            minibatch_time = time.time() - minibatch_time
+            avg_mb_time += minibatch_time
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 optimizer.step()
@@ -166,16 +169,17 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
                 model.zero_grad()
                 global_step += 1
 
-                # if my_stage == (args.partitions - 1) and args.logging_steps > 0 and global_step % args.logging_steps == 0:
-                #     # Log metrics
-                #     if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
-                #         results = evaluate(args, model, tokenizer)
-                #         for key, value in results.items():
-                #             tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
-                #     # tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
-                #     # tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
-                #     print("loss at step",global_step, "is ", loss )
-                #     # logging_loss = tr_loss
+                if my_stage == (args.partitions - 1) and args.logging_steps > 0 and global_step % args.logging_steps == 0:
+                    # Log metrics
+                    if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
+                        results = evaluate(args, model, tokenizer)
+                        for key, value in results.items():
+                            tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
+                    # tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
+                    # tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
+                    print("loss at step",global_step, "is ", loss )
+                    print("Current average pipeline time", avg_mb_time / step )
+                    # logging_loss = tr_loss
 
     if args.rank == 0:
         tb_writer.close()
