@@ -6,16 +6,16 @@ from torch.multiprocessing import Process
 from queue import Queue
 from threading import Thread
 
+from .partitioned_model import PartitionedModel
+
 import os
 import sys
-import time
-from apex import amp
 
 Module = nn.Module
 
 class Varuna(Module):
     """
-    model = nn.Sequential(a,b,c,d)      # standard pytorch model
+    model = nn.Sequential(a,b,c,d)
     model = Varuna(model, microbatches/minibatch, list_of_devices)
     for iteration in epoch:
         model(input)   # execute Varuna's pipeline (forward and backward pass)
@@ -25,21 +25,48 @@ class Varuna(Module):
     def __init__(self,
                 model,
                 partitions,
+                dummy_inputs,
+                batch_size,
                 optimizer,
-                fp16,
-                chunks: int=1):
+                fp16 = False,
+                chunks: int=1,
+                local_rank=-1):
         super().__init__()
-        # todo: distributed process initialization
-        # move init_processes() here
-        # p = Process(target=init_processes, args=(1,2,main))
-        # p.start()
 
-        self.model = model
         self.chunks = chunks
         self.partitions = partitions
+        self.rank = dist.get_rank()
+        self.local_rank = local_rank if local_rank != -1 else self.rank
+        self.stage = self.rank
+
+        torch.cuda.set_device(self.local_rank)
+        self.device = torch.device("cuda", self.local_rank)
+
         self.optimizer = optimizer
         self.fp16 = fp16
-        self.rank = dist.get_rank()
+
+        if self.fp16:
+            from apex import amp
+
+        stage_to_rank_map = {}
+        for i in range(partitions):
+            stage_to_rank_map[i] = [i]
+        
+        # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
+        self.model = PartitionedModel(model, self.rank, self.local_rank, self.local_rank, stage_to_rank_map)
+        self.model.initialize( dummy_inputs )
+
+        # set expected shapes of inputs and gradients for each partition
+        self.micro_batch_size = int(batch_size // chunks)
+        self.fwd_inp_shape = self.bwd_grad_shape = None
+        if self.stage > 0:
+            self.fwd_inp_shape = self.model.forward_input_shapes[0]
+            self.fwd_inp_shape[0] = self.micro_batch_size
+            # print("Varuna fwd inp shape ", self.fwd_inp_shape)
+        if self.stage < (partitions-1):
+            self.bwd_grad_shape = self.model.backward_grad_shapes[0]
+            self.bwd_grad_shape[0] = self.micro_batch_size
+            # print("Varuna bwd grad shape", self.bwd_grad_shape)
 
         self.schedule = self.generate_schedule()
 
@@ -51,20 +78,23 @@ class Varuna(Module):
         # avoid dataloader compute in machines other than the first
         # ask the model writer to pass the input batch generating dataloader function to Varuna::__init__
         # and Varuna can take care of input dataloader explicitly
-        pipeline = Pipeline(batches, self.partitions, self.model, self.schedule, self.optimizer, self.fp16)
-        pipeline.run()
+        pipeline = Pipeline(batches, self.partitions, self.model, self.device, self.schedule, self.optimizer, fwd_input_shape = self.fwd_inp_shape, bwd_grad_shape = self.bwd_grad_shape, fp16 = self.fp16)
+        return pipeline.run()
     
     def eval(self):
         self.model.eval()
     
     def train(self):
         self.model.train()
-    
+
     def zero_grad(self):
         self.model.zero_grad()
     
+    def checkpoint(self, cpname):
+        self.model.checkpoint(cpname)
+    
     def generate_schedule(self):
-        c_schedule = os.popen('./genschedule '+str(self.partitions)+' '+str(self.chunks)+' '+str(self.rank)).read()
+        c_schedule = os.popen(os.path.join(os.path.dirname(os.path.abspath(__file__)),'genschedule ')+str(self.partitions)+' '+str(self.chunks)+' '+str(self.rank)).read()
         schedule = list()
 
         steps = c_schedule.split(';')
@@ -92,10 +122,6 @@ def restore_rng_states(rng_states):
     torch.cuda.set_rng_state_all(gpu_rng_states)        # todo: verify correctness;   batchNorm, dropouts, convlayers?
 
 
-def get_size():        # todo
-    acts_size = (30, 384, 1024)
-    return acts_size
-
 def acts_sender(rank, acts_send_queue):
     while (True):
         output_acts = acts_send_queue.get()
@@ -112,13 +138,18 @@ def grads_sender(rank, grads_send_queue):
 class Pipeline:
     """ Pipeline parallelism for Varuna """
 
-    def __init__(self, batches, partitions, model, schedule, optimizer, fp16):
+    def __init__(self, batches, partitions, model, device, schedule, optimizer, fwd_input_shape = None, bwd_grad_shape = None, fp16=False):
         self.batches = batches
         self.partitions = partitions
+
         self.model = model
+        self.device = device
         self.rank=dist.get_rank()
         self.world_size = partitions
         self.schedule = schedule
+        self.fwd_inp_shape = fwd_input_shape
+        self.bwd_grad_shape = bwd_grad_shape
+
         self.optimizer = optimizer
         self.fp16 = fp16
 
@@ -136,13 +167,8 @@ class Pipeline:
 
         # stores output of recompute(/forward) pass to be used by backward()
         self.loss = None
-        # stores input activations to recompute(/forward) - in order to access its grads and send it to  (rank-1)th device
-        self.input_acts = None
+        self.average_loss = 0
 
-        if (self.rank==0):
-            for batch in batches:
-                self.acts_queue.put(batch['input_ids'])
-    
     def spawn_recieve_workers(self):
         self.acts_recieve_thread = Thread(target=self.acts_reciever, args=())
         self.acts_recieve_thread.daemon=True
@@ -163,137 +189,138 @@ class Pipeline:
     
     def acts_reciever(self):
         count=0
-        if (self.rank!=0):
+        if self.rank != 0:
             for task,index in self.schedule:
                 if (task==0):
                     count+=1
             while (count>0):
-                acts_tensor = torch.ones(get_size(), dtype=torch.float32)
-                # acts_tensor = torch.randn(get_size())
+                acts_tensor = torch.ones(self.fwd_inp_shape, dtype=torch.float32)
                 req = dist.irecv(acts_tensor, src=self.rank-1)
                 req.wait()
                 count-=1
-                self.acts_queue.put(acts_tensor.cuda())
+                self.acts_queue.put(acts_tensor.to(self.device))
     
     def grads_reciever(self):
-        world_size=self.world_size
-        count=0
-        if (self.rank!=world_size-1):
+        world_size = self.world_size        # todo: get world_size instead of rank?
+        count = 0
+        if self.rank != world_size-1:
             for task,index in self.schedule:
                 if (task==2):
                     count+=1
             while (count>0):
-                grads_tensor = torch.ones(get_size(), dtype=torch.float32)
+                grads_tensor = torch.ones(self.bwd_grad_shape, dtype=torch.float32)
                 req = dist.irecv(grads_tensor, src=self.rank+1)
-                req.wait()
+                req.wait()              
                 count-=1
-                self.grads_queue.put(grads_tensor.cuda())
+                self.grads_queue.put(grads_tensor.to(self.device))
 
+    # tells the model where to send acts and gradients
+    def set_model_send_fn(self, recompute = False):
+        def send(tensor, grads = False):
+            if grads:
+                self.grads_send_queue.put(tensor)
+            else:
+                if not recompute:
+                    self.acts_send_queue.put(tensor)
+        
+        self.model.set_send_fn(send)
 
-    def worker(self, task, grad_mode, std_in_for_bert):
+    # tells the model how to recieve acts and gradients
+    def set_model_recv_fn(self, recompute = False):
+        if self.rank > 0:
+            if recompute:
+                ctx, acts = self.recompute_queue.get()
+                restore_rng_states(ctx)
+            else:
+                acts = self.acts_queue.get()
+        else:
+            acts = None
+
+        def recv(grads = False):
+            if grads:
+                return self.grads_queue.get()
+            else:
+                return acts
+        
+        self.model.set_recv_fn(recv)
+        # because there's no peek/front method for these queues
+        return acts
+
+    def worker(self, task, grad_mode, inputs_as_dict):
         """ Main body of worker loop """
-        world_size=self.world_size
-        if (task==0):        # forward
-            torch.set_grad_enabled(grad_mode)       # computation graph not needed if recomputing later
-            acts = self.acts_queue.get()
-            if (self.rank!=0):
-                acts.requires_grad=True
-            std_in_for_bert['input_ids']=acts
-            output = self.model(**std_in_for_bert)
+        world_size = self.world_size
 
-            if (self.rank!=world_size-1):
-                self.acts_send_queue.put(output[0])
-            
-            if (grad_mode==False):          # if these acts are going to be recomputed
-                # save random number states
+        if task == 0:       
+            torch.set_grad_enabled(grad_mode)
+
+            self.set_model_send_fn(recompute = False)
+            acts = self.set_model_recv_fn(recompute = False)
+            output = self.model(**inputs_as_dict)
+
+            if grad_mode == False and self.rank > 0:
+                # if these acts are going to be recomputed
                 rng_states = save_rng_states()
                 ctx = (rng_states, acts)
                 self.recompute_queue.put(ctx)
             else:
                 # save loss and input activations for the backward pass to use
-                self.loss = output[0]
-                self.input_acts = acts        
+                self.loss = output[0] if isinstance(output,tuple) else output
         
-        elif (task==1):     # recompute
+        elif task == 1:
             torch.set_grad_enabled(True)
-            ctx, acts = self.recompute_queue.get()
-            restore_rng_states(ctx)
-            std_in_for_bert['input_ids']=acts
-            output = self.model(**std_in_for_bert)
-            self.input_acts = acts
-            self.loss = output[0]
 
-        else:           # backward
-            if (self.rank!=world_size-1):
-                grads = self.grads_queue.get()
+            self.set_model_send_fn(recompute = True)
+            self.set_model_recv_fn(recompute = True)
+            output = self.model(**inputs_as_dict)
 
-                if (self.fp16==1):
+            self.loss = output[0] if isinstance(output,tuple) else output
+        
+        else:
+            if self.rank != world_size-1:
+                if self.fp16:
                     with amp.scale_loss(self.loss, self.optimizer) as scaled_loss:
                         scaled_loss.backward(grads)
                 else:
-                    self.loss.backward(grads)
+                    self.loss.backward(torch.ones(self.loss.size()).to(self.device))
 
             else:
                 chunks = len(self.batches)
                 self.loss = self.loss/chunks
+                self.average_loss += self.loss.item()
 
-                if (self.fp16==1):
+                if self.fp16:
                     with amp.scale_loss(self.loss, self.optimizer) as scaled_loss:
                         scaled_loss.backward()
                 else:
                     self.loss.backward()
 
-            if (self.rank!=0):
-                self.grads_send_queue.put(self.input_acts.grad.data)
-
         
     def run(self):
-        self.spawn_recieve_workers()        # recieve workers
+        self.spawn_recieve_workers()
 
         for index, task in enumerate(self.schedule):
             grad_mode = False
-            if (task[0]==0):
-                if (self.schedule[index+1][0]==2):      # if next task in schedule is backward  -- no recomputation
+            if task[0] == 0:
+                if self.schedule[index+1][0] == 2:      
+                    # if next task in schedule is backward  -- no recomputation
                     grad_mode=True
 
             self.worker(task[0], grad_mode, self.batches[task[1]])
-            # todo: return loss at (rank-1)th device
-        
-        # dynamic schedule - run forward if gradients for backward are not ready yet
-        '''
-        schedule = [s for s in enumerate(self.schedule)]
-        i=0
-        count_fwd = 0
-        while (i<len(schedule)):
-            grad_mode = False
-            index, task = schedule[i]
-            if (task[0]==1 and count_fwd<len(self.batches) and self.grads_queue.empty()):
-                j=i
-                while (j<len(schedule)):
-                    if (schedule[j][1][0]==0):
-                        index, task = schedule[j]
-                        schedule.insert(i, schedule[j])
-                        del schedule[j+1]
-                        break
-                    j+=1
-            if (task[0]==0):
-                count_fwd+=1
-                if (self.schedule[index+1][0]==2):      # if next task in schedule is backward  -- no recomputation
-                    grad_mode=True
-            
-            self.worker(task[0], grad_mode, self.batches[task[1]])
-            i+=1
-        '''
-
         
         self.acts_recieve_thread.join()
         self.grads_recieve_thread.join()
 
+        # return loss
+        if self.rank == self.world_size - 1:
+            return self.average_loss
+        return 0
 
 def scatter(input, chunks):
-    """Split for Bert
+    """
     Accepts input dictionary and splits into microbatches
     """
+    # assert(isinstance(inputs,dict) , "varuna inputs must be given as a dictionary")
+    
     microbatches = [dict() for _ in range(chunks)]
     for k,v in input.items():
         chunked_values = v.chunk(chunks)
