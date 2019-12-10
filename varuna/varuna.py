@@ -28,7 +28,7 @@ class Varuna(Module):
                 stage_to_rank_map,
                 dummy_inputs,
                 batch_size,
-                fp16 = False,
+                fp16 = False, 
                 chunks: int=1,
                 local_rank=-1):
         super().__init__()
@@ -241,7 +241,6 @@ class Pipeline:
         self.grads_recieve_thread = None
 
         # stores output of recompute(/forward) pass to be used by backward()
-        # assuming we never encounter 'rfb'/'rrb' schedule
         self.loss = None
         self.average_loss = 0
 
