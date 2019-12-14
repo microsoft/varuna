@@ -99,16 +99,6 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
 
     t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
 
-    dummy_inp = train_dataset[:1]
-    inputs = {  'input_ids':       dummy_inp[0],
-                'attention_mask':  dummy_inp[1], 
-                'start_positions': dummy_inp[3], 
-                'end_positions':   dummy_inp[4]}
-    inputs['token_type_ids'] = dummy_inp[2]    
-
-    model = Varuna(model, stage_to_rank_map, inputs, args.train_batch_size, chunks=args.chunks, local_rank=args.local_rank)
-    model.to(args.device)
-
     # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
@@ -125,8 +115,15 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
             raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
         model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
 
-    model.optimizer = optimizer
-    model.init_distributed()
+    dummy_inp = train_dataset[:1]
+    inputs = {  'input_ids':       dummy_inp[0],
+                'attention_mask':  dummy_inp[1], 
+                'start_positions': dummy_inp[3], 
+                'end_positions':   dummy_inp[4]}
+    inputs['token_type_ids'] = dummy_inp[2]    
+
+    model = Varuna(model, stage_to_rank_map, inputs, args.train_batch_size, optimizer, chunks=args.chunks, local_rank=args.local_rank)
+    model.to(args.device)
 
     # Train!
     if args.rank == 0:
@@ -148,6 +145,7 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
     for _ in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=my_stage!=(args.partitions-1))
         avg_mb_time = 0.0
+        avg_tflops = 0.0
 
         for step, batch in enumerate(epoch_iterator):
             model.train()
@@ -161,7 +159,9 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
             minibatch_time = time.time()
             loss = model(inputs)
             minibatch_time = time.time() - minibatch_time
+            tflops = args.train_batch_size / minibatch_time     # TFLOPS ~ examples per sec
             avg_mb_time += minibatch_time
+            avg_tflops += tflops
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 optimizer.step()
@@ -179,6 +179,7 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
                     # tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
                     print("loss at step",global_step, "is ", loss )
                     print("Current average pipeline time", avg_mb_time / step )
+                    print("Avg TFLOPS", avg_tflops)
                     # logging_loss = tr_loss
 
     if args.rank == 0:

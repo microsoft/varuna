@@ -28,6 +28,7 @@ class Varuna(Module):
                 stage_to_rank_map,
                 dummy_inputs,
                 batch_size,
+                optimizer,
                 fp16 = False, 
                 chunks: int=1,
                 local_rank=-1):
@@ -51,15 +52,10 @@ class Varuna(Module):
         if self.stage == -1:
             raise ValueError("Rank " + str(self.rank) + " not found in stage to rank map!")
 
-        # if multiple ranks in stage:
-        #     # DistributedSampler(shuffle = False)
-        #     nn.DistributedDataParallel()
-        #     # dataloader
-
         torch.cuda.set_device(self.local_rank)
         self.device = torch.device("cuda", self.local_rank)
 
-        self.optimizer = None
+        self.optimizer = optimizer
         self.fp16 = fp16
 
         if self.fp16:
@@ -72,6 +68,8 @@ class Varuna(Module):
 
         self.micro_batch_size = int(batch_size // chunks)
         self.init_communication(rank_within_stage)
+        self.init_distributed()
+
 
         self.config = {
             "stage": self.stage,
