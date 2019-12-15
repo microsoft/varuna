@@ -18,13 +18,12 @@ class CutPoint(Module):
         super(CutPoint, self).__init__()
         # start with 1 and end before last stage (total num_stages - 1 )
         self.cp_index = -1
-        self.num_stages = -1
-
         self.cp_func = None
         
         self.set_ret_val_func = None
         self.device = None
         self.send_fn = self.recv_fn = None
+        self.stage = -1
 
 
     def forward(self, *inputs, **kwargs):
@@ -65,8 +64,8 @@ class CutPoint(Module):
             def backward(ctx, grad_output):
                 if is_in_prev_stage:
                     # receive gradients.
-                    gradients = self.recv_fn(grads = True)
-                    return gradients
+                    if self.recv_fn is not None:
+                        grad_output = self.recv_fn(grads = True)
                 elif is_in_next_stage:
                     # send gradients
                     self.send_fn(grad_output, grads = True)
@@ -80,7 +79,6 @@ class PartitionedModel(Module):
 
     def __init__(self, module, rank, local_rank, device, stage_to_rank_map):
         super(PartitionedModel, self).__init__()
-        # print("Got device", device,"!!")
         self.module = module
         self.num_stages = len(stage_to_rank_map)
         self.stage_to_rank_map = stage_to_rank_map
