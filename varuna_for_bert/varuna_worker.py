@@ -123,7 +123,6 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
     inputs['token_type_ids'] = dummy_inp[2]    
 
     model = Varuna(model, stage_to_rank_map, inputs, args.train_batch_size, optimizer, chunks=args.chunks, local_rank=args.local_rank)
-    model.to(args.device)
 
     # Train!
     if args.rank == 0:
@@ -179,7 +178,7 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
                     # tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
                     print("loss at step",global_step, "is ", loss )
                     print("Current average pipeline time", avg_mb_time / step )
-                    print("Avg TFLOPS", avg_tflops)
+                    print("Avg TFLOPS", (avg_tflops / step) * 1.33 )
                     # logging_loss = tr_loss
 
     if args.rank == 0:
@@ -189,7 +188,7 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
 
 
 def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False):
-    if args.rank != 0 and not evaluate:
+    if args.local_rank != 0 and not evaluate:
         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
 
     # Load data features from cache or dataset file
@@ -212,11 +211,11 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
                                                 doc_stride=args.doc_stride,
                                                 max_query_length=args.max_query_length,
                                                 is_training=not evaluate)
-        if args.rank == 0:
+        if args.local_rank == 0:
             logger.info("Saving features into cached file %s", cached_features_file)
             torch.save(features, cached_features_file)
 
-    if args.rank == 0 and not evaluate:
+    if args.local_rank == 0 and not evaluate:
         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
 
     # Convert to Tensors and build dataset
@@ -270,14 +269,14 @@ def main(args, stage_to_rank_map):
     set_seed(args)
 
     # Load pretrained model and tokenizer
-    if args.rank != 0:
+    if args.local_rank != 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
     config = BertConfig.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
     tokenizer = BertTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
     model = BertForQuestionAnswering.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path), config=config)
 
-    if args.rank == 0:
+    if args.local_rank == 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
     logger.info("Training/evaluation parameters %s", args)
