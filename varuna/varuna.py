@@ -68,6 +68,8 @@ class Varuna(Module):
 
         self.micro_batch_size = int(batch_size // chunks)
         self.init_communication(rank_within_stage)
+
+        self.model.to(self.device)
         self.init_distributed()
 
 
@@ -300,6 +302,7 @@ class Pipeline:
             for rank, (s,e) in zip(self.send_ranks, self.send_indices):
                 grad_shape[0] = e-s
                 grads_tensor_i = torch.ones(grad_shape, dtype=torch.float32)
+                # print("stage", self.stage, "expecting grads of shape", grad_shape)
                 handle = dist.irecv(grads_tensor_i, src=rank)
                 handle.wait()
                 end = start + grad_shape[0]
