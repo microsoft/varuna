@@ -16,37 +16,32 @@ cp_partition_prefix = "cp-partition"
 
 class Profiling:
 
-    def __init__(self, module):
-        self.module = module
+    def __init__(self, model, device):
+        self.model = model
         self.ret_val = None
-        self.pre_cp = None
-        self.post_cp = None
-        self.device = torch.device("cuda", torch.cuda.current_device())
+        self.device = device
 
-    def initialize(self, dummy_inputs):
+    def initialize(self, dummy_inputs, num_stages=1, from_cache=False):
         start = time.time()
         self.dry_run(dummy_inputs)
-        # print("dry run time", time.time() - start)
-        self.trim_model()
+        print("dry run time", time.time() - start)
+        self.trim_model(k=num_stages)
 
     def dry_run(self, dummy_inputs):
         # executes the forward pass of the module on dummy inputs. 
         # Sets the order in which modules are used and the total number of cutpoints declared.
 
         self.ordered_modules = OrderedDict()
-        self.input_shapes = {}
         self.num_cutpoints = 0
 
-        # store input shapes for each module (or atleast each cp)
+        # if not (from_cache and os.path.exists("_tmp_ord_mod") and os.path.exists("_tmp_inp_shapes"))
+
         def get_hook(name):
             def add_module_hook(module, inputs, _output):
                 self.ordered_modules[name] = module
-                if isinstance(module, CutPoint):
-                    # if len(inputs) > 1: error
-                    self.input_shapes[name] = [list(inputs[0].size())]
             return add_module_hook
 
-        modules = self.module.named_modules()
+        modules = self.model.named_modules()
         hooks = []
 
         for name, module in modules:
@@ -56,16 +51,16 @@ class Profiling:
             if isinstance(module, CutPoint):
                 self.num_cutpoints += 1
         
-        self.module(**dummy_inputs)
+        self.model(**dummy_inputs)
 
         for h in hooks:
             h.remove()
     
-# """ Trims out the forst stage from model. """
-    def trim_model(self):
+# """ Trims out the first stage from model. """
+    def trim_model(self, k=1):
 
         def attach_meta(cutpoint, index):
-            cutpoint.cp_index = index
+            cutpoint.cp_index = 1
             cutpoint.set_ret_val_func = self.set_ret_val
             cutpoint.stage = 0
             cutpoint.device = self.device
@@ -75,20 +70,18 @@ class Profiling:
         modules = self.ordered_modules
         index = 1
 
-        self.forward_input_shapes = []
-        self.backward_grad_shapes = []
-
         used_modules = []
         is_used = {}
 
         for name in modules:
-            module = modules[name]
-            is_used[name] = False
             if name == "":
                 continue
-            if index == 1:
+            module = modules[name]
+            is_used[name] = False
+            if index <= k:
                 if isinstance(module, CutPoint):    
-                    attach_meta(module, index)
+                    if index == k:
+                        attach_meta(module, index)
                     index += 1
                 used_modules.append(name)
                 is_used[name] = True
@@ -104,7 +97,7 @@ class Profiling:
         for m in is_used:
             if not is_used[m]:
                 path = m.split(".")
-                modules = self.module._modules
+                modules = self.model._modules
                 for i in range(len(path) - 1):
                     modules = modules[path[i]]._modules
                 modules[path[-1]] = None
@@ -115,32 +108,79 @@ class Profiling:
         self.ret_val = val
     
 
-    def profile(self, train_dataset, max_batch_size = None):
-        if max_batch_size is None:
-            max_batch_size = len(train_dataset)
+    def profile(self, get_batch_fn,  microbatch_sizes, optimizer, filename="profile.csv"):
 
-        batch_size = 2
         profile = {}
 
-        model.to
-        mem usage so far
-        
-        while not OOM and batch_size < max_batch_size:
-            inputs = train_dataset[:batch_size]
-            inputs.to
-            start = time.time()
-            fwd_out = self.module(inputs)
-            fwd_time = time.time() - start
-            bwd_time = time.time()
-            fwd_out.backward(torch.ones(list(fwd_out.size())))
-            bwd_time = time.time() - bwd_time
-            profile[batch_size] = {
-                "fwd_time"
-                "bwd_time"
-                "mem_usage"
-            }
-            batch_size *= 2
-            remove inputs from mem
+        initial_mem = torch.cuda.memory_allocated(self.device)
+        self.model.to(self.device)
+        model_mem = torch.cuda.memory_allocated(self.device) - initial_mem
+        print("Model memory", model_mem)
+
+        of = open(filename,"w")
+        of.write("Batch size, fwd_time, bwd_time, max_mem_usage, input_mem, model_mem, post_fwd_bwd_mem\n")
+
+        for batch_size in microbatch_sizes:
+            self.model.train()
+            try: 
+                torch.cuda.reset_max_memory_allocated(self.device)
+                # get_batch_fn should load inputs into device and return dict
+                input_mem = torch.cuda.memory_allocated()
+                inputs = get_batch_fn(batch_size)
+                print(inputs["input_ids"].size())
+                input_mem = torch.cuda.memory_allocated() - input_mem
+                start = time.time()
+
+                post_fwd_bwd_mem = torch.cuda.memory_allocated()
+                try:
+                    calc_val = self.model(**inputs)
+                    fwd_out = self.ret_val if self.ret_val is not None else calc_val
+                except Exception as e:
+                    if self.ret_val is None:
+                        print("Calc error!!!")
+                        raise e
+                    fwd_out = self.ret_val
+                self.ret_val = None
+                fwd_time = time.time() - start
+
+                bwd_time = time.time()
+                grads = torch.ones(list(fwd_out.size()), device = self.device)
+                fwd_out.backward(grads)
+                bwd_time = time.time() - bwd_time
+
+                update_time = time.time()
+                optimizer.step()
+                post_fwd_bwd_mem = torch.cuda.memory_allocated() - post_fwd_bwd_mem
+                self.model.zero_grad()
+                optimizer.zero_grad()
+                update_time = time.time() - update_time
+
+                mem_usage = torch.cuda.max_memory_allocated(self.device)
+                profile[batch_size] = {
+                    "fwd_time": fwd_time,
+                    "bwd_time": bwd_time,
+                    "max_mem_usage": mem_usage,
+                    "input_mem": input_mem,
+                    "model_mem": model_mem,
+                    "post_fwd_bwd_mem": post_fwd_bwd_mem
+                }
+                of.write("{}, {}, {}, {}, {}, {}, {}\n".format(batch_size, fwd_time, bwd_time, mem_usage, input_mem, model_mem, post_fwd_bwd_mem))
+                print("Batch size", batch_size, ": ")
+                print("fwd_time", fwd_time)
+                print("bwd_time", bwd_time)
+                print("mem_usage", mem_usage)
+                print("-------------------------")
+                print()
+                del inputs, fwd_out, grads
+
+            except RuntimeError as e:
+                if 'out of memory' in str(e):
+                    print("Out of memorryyyy")
+                    break
+                else:
+                    raise e
+
+        of.close()
 
 
 class PassThroughModule(Module):
