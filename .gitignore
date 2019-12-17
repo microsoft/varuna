@@ -5,6 +5,7 @@ varuna/genschedule
 genschedule
 n_stages
 training_output
+train_reports
 
 # Byte-compiled / optimized / DLL files
 *__pycache__/
