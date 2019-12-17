@@ -75,6 +75,12 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
 
     if args.rank == 0:
         tb_writer = SummaryWriter()
+    
+    data_depth = len(stage_to_rank_map[0])
+    filename = "train_reports/report-{}-{}-{}-{}_{}.csv".format(args.partitions, data_depth , args.per_gpu_train_batch_size, args.chunks, args.rank)
+    of = open(filename, "w")
+
+    of.write("MB time, TFLOPS, GPU mem, loss\n")
 
     args.train_batch_size = args.per_gpu_train_batch_size
 
@@ -154,11 +160,14 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
                       'token_type_ids':  batch[2],  
                       'start_positions': batch[3], 
                       'end_positions':   batch[4]}
+
+            torch.cuda.reset_max_memory_allocated(args.device)
             
             minibatch_time = time.time()
             loss = model(inputs)
             minibatch_time = time.time() - minibatch_time
-            tflops = args.train_batch_size / minibatch_time     # TFLOPS ~ examples per sec
+            tflops = 1.33 * (args.train_batch_size / minibatch_time)     # TFLOPS ~ 1.33 * examples per sec
+            tflops = tflops / (args.partitions * data_depth)        # scale by # gpus
             avg_mb_time += minibatch_time
             avg_tflops += tflops
 
@@ -167,6 +176,8 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
                 # scheduler.step()  # Update learning rate schedule
                 model.zero_grad()
                 global_step += 1
+                max_mem = torch.cuda.max_memory_allocated(args.device)
+                of.write("{}, {}, {}, {}\n".format(minibatch_time, tflops, max_mem, loss))
 
                 if my_stage == (args.partitions - 1) and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     # Log metrics
@@ -177,12 +188,24 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
                     # tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
                     # tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
                     print("loss at step",global_step, "is ", loss )
-                    print("Current average pipeline time", avg_mb_time / step )
-                    print("Avg TFLOPS", (avg_tflops / step) * 1.33 )
+                    print("Current average pipeline time", avg_mb_time / global_step )
+                    print("Avg TFLOPS", (avg_tflops / global_step) )
                     # logging_loss = tr_loss
+
+            del batch, inputs
+
+            if args.max_steps > 0 and global_step > args.max_steps:
+                epoch_iterator.close()
+                break
+
+        if args.max_steps > 0 and global_step > args.max_steps:
+            train_iterator.close()
+            break
 
     if args.rank == 0:
         tb_writer.close()
+
+    of.close()
 
     return global_step, tr_loss / global_step
 
@@ -342,6 +365,8 @@ if __name__ == "__main__":
                         help="Epsilon for Adam optimizer.")
     parser.add_argument("--num_train_epochs", default=3.0, type=float,
                         help="Total number of training epochs to perform.")
+    parser.add_argument("--max_steps", default=-1, type=int,
+                        help="If > 0: set total number of training steps to perform. Override num_train_epochs.")
     parser.add_argument("--warmup_steps", default=0, type=int,
                         help="Linear warmup over warmup_steps.")
     parser.add_argument("--verbose_logging", action='store_true',

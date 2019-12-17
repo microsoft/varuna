@@ -64,7 +64,7 @@ class Varuna(Module):
         
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
         self.model = PartitionedModel(model, self.rank, self.local_rank, self.local_rank, self.stage_to_rank_map)
-        self.model.initialize( dummy_inputs )
+        self.model.initialize( dummy_inputs, from_cache=True )
 
         self.micro_batch_size = int(batch_size // chunks)
         self.init_communication(rank_within_stage)
