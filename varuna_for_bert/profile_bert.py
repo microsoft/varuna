@@ -80,7 +80,7 @@ def profile(args, train_dataset, model, num_stages, filename, profiler):
         model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
 
     set_seed(args)
-    profile = profiler.profile(get_batch, range(1,41), optimizer, filename)
+    profile = profiler.profile(get_batch, range(1,100), optimizer, filename)
     return profile
                     
 
@@ -160,7 +160,7 @@ def main(args):
     # Training
     train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False)
     profiler = Profiling(model, args.device)
-    profile_gen = profile(args, train_dataset, model, 2, "profile_2.csv", profiler)
+    profile_gen = profile(args, train_dataset, model, 1, "profile.csv", profiler)
 
 
 
@@ -206,8 +206,6 @@ if __name__ == "__main__":
     parser.add_argument("--do_lower_case", action='store_true',
                         help="Set this flag if you are using an uncased model.")
 
-    parser.add_argument("--per_gpu_train_batch_size", default=8, type=int,
-                        help="Batch size per GPU/CPU for training.")
     parser.add_argument("--learning_rate", default=5e-5, type=float,
                         help="The initial learning rate for Adam.")
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
@@ -216,8 +214,6 @@ if __name__ == "__main__":
                         help="Weight deay if we apply some.")
     parser.add_argument("--adam_epsilon", default=1e-8, type=float,
                         help="Epsilon for Adam optimizer.")
-    parser.add_argument("--num_train_epochs", default=3.0, type=float,
-                        help="Total number of training epochs to perform.")
     parser.add_argument("--warmup_steps", default=0, type=int,
                         help="Linear warmup over warmup_steps.")
     parser.add_argument("--verbose_logging", action='store_true',
@@ -244,7 +240,6 @@ if __name__ == "__main__":
                              "See details at https://nvidia.github.io/apex/amp.html")
 
 
-    parser.add_argument('--chunks', type=int, default=1, help="Number of micro-batches per mini-batch")
     parser.add_argument('--partitions', type=int, default=3, help='Number of devices over which the model is split')
     args = parser.parse_args()
 

@@ -80,7 +80,7 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
     filename = "train_reports/report-{}-{}-{}-{}_{}.csv".format(args.partitions, data_depth , args.per_gpu_train_batch_size, args.chunks, args.rank)
     of = open(filename, "w")
 
-    of.write("MB time, TFLOPS, GPU mem, loss\n")
+    of.write("MB time, TFLOPS, Max GPU mem, Curr GPU mem, loss\n")
 
     args.train_batch_size = args.per_gpu_train_batch_size
 
@@ -177,7 +177,8 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map):
                 model.zero_grad()
                 global_step += 1
                 max_mem = torch.cuda.max_memory_allocated(args.device)
-                of.write("{}, {}, {}, {}\n".format(minibatch_time, tflops, max_mem, loss))
+                curr_mem = torch.cuda.memory_allocated(args.device)
+                of.write("{}, {}, {}, {}, {}\n".format(minibatch_time, tflops, max_mem, curr_mem, loss))
 
                 if my_stage == (args.partitions - 1) and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     # Log metrics

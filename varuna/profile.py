@@ -34,7 +34,7 @@ class Profiling:
         self.ordered_modules = OrderedDict()
         self.num_cutpoints = 0
 
-        # if not (from_cache and os.path.exists("_tmp_ord_mod") and os.path.exists("_tmp_inp_shapes"))
+        # if not (from_cache and os.path.exists("_tmp_ord_mod")):
 
         def get_hook(name):
             def add_module_hook(module, inputs, _output):
@@ -135,6 +135,7 @@ class Profiling:
                 try:
                     calc_val = self.model(**inputs)
                     fwd_out = self.ret_val if self.ret_val is not None else calc_val
+                    del calc_val
                 except Exception as e:
                     if self.ret_val is None:
                         print("Calc error!!!")
@@ -150,6 +151,7 @@ class Profiling:
 
                 update_time = time.time()
                 optimizer.step()
+                del grads, fwd_out
                 post_fwd_bwd_mem = torch.cuda.memory_allocated() - post_fwd_bwd_mem
                 self.model.zero_grad()
                 optimizer.zero_grad()
@@ -171,7 +173,7 @@ class Profiling:
                 print("mem_usage", mem_usage)
                 print("-------------------------")
                 print()
-                del inputs, fwd_out, grads
+                del inputs
 
             except RuntimeError as e:
                 if 'out of memory' in str(e):

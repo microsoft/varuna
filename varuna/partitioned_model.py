@@ -305,15 +305,14 @@ class PartitionedModel(Module):
     
         try:
             calc_val = self.module(*inputs, **kwargs)
-            ret_val = self.ret_val
+            ret_val = self.ret_val if self.ret_val is not None else calc_val
+            del calc_val
         except Exception as e:
             if self.ret_val is None:
                 raise e
             ret_val = self.ret_val
 
         self.ret_val = None
-        if ret_val is None:
-            return calc_val
         return ret_val 
 
 

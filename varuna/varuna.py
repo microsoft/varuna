@@ -159,7 +159,9 @@ class Varuna(Module):
         # ask the model writer to pass the input batch generating dataloader function to Varuna::__init__
         # and Varuna can take care of input dataloader explicitly
         pipeline = Pipeline(batches, self.model, self.config, self.schedule, self.optimizer)
-        return pipeline.run()
+        loss = pipeline.run()
+        del batches, pipeline
+        return loss
     
     def eval(self):
         self.model.eval()
@@ -239,6 +241,8 @@ class Pipeline:
 
         self.acts_recieve_thread = None
         self.grads_recieve_thread = None
+        self.acts_send_thread = None
+        self.grads_send_thread = None
 
         # stores output of recompute(/forward) pass to be used by backward()
         self.loss = None
@@ -262,9 +266,9 @@ class Pipeline:
             self.acts_send_thread.start()
 
         if self.stage > 0:
-            self.grads_send_thead = Thread(target=self.grads_sender, args=())
-            self.grads_send_thead.daemon=True
-            self.grads_send_thead.start() 
+            self.grads_send_thread = Thread(target=self.grads_sender, args=())
+            self.grads_send_thread.daemon=True
+            self.grads_send_thread.start() 
     
     def acts_reciever(self):
         count=0
@@ -287,6 +291,8 @@ class Pipeline:
 
             count -= 1
             self.acts_queue.put(acts_tensor.to(self.device))
+
+        del acts_tensor, acts_tensor_i
     
     def grads_reciever(self):
         world_size = self.world_size        # todo: get world_size instead of rank?
@@ -312,23 +318,24 @@ class Pipeline:
             count -= 1
             self.grads_queue.put(grads_tensor.to(self.device))
 
+        del grads_tensor, grads_tensor_i
+
     def acts_sender(self):
-        while (True):
+        while self.acts_send_queue is not None:
             output_acts = self.acts_send_queue.get()
-            count = 0
             for rank, (s,e) in zip(self.send_ranks, self.send_indices):
                 handle = dist.isend(output_acts[s:e].cpu(), dst=rank)
                 handle.wait()
-                count += 1
+        del output_acts
 
     def grads_sender(self):
-        while (True):
+        while self.grads_send_queue is not None:
             input_grads = self.grads_send_queue.get()
-            count = 0
             for rank, (s,e) in zip(self.recieve_ranks, self.recieve_indices):
                 handle = dist.isend(input_grads[s:e].cpu(), dst=rank)
                 handle.wait()
-                count += 1
+        del input_grads
+        
     
     # tells the model where to send acts and gradients
     def set_model_send_fn(self, recompute = False):
@@ -381,6 +388,8 @@ class Pipeline:
             else:
                 # save loss and input activations for the backward pass to use
                 self.loss = output[0] if isinstance(output,tuple) else output
+
+            
         
         elif task == 1:
             torch.set_grad_enabled(True)
@@ -397,7 +406,9 @@ class Pipeline:
                     with amp.scale_loss(self.loss, self.optimizer) as scaled_loss:
                         scaled_loss.backward(grads)
                 else:
-                    self.loss.backward(torch.ones(self.loss.size()).to(self.device))
+                    grads = torch.ones(self.loss.size()).to(self.device)
+                    self.loss.backward(grads)
+                    del grads
 
             else:
                 chunks = len(self.batches)
@@ -410,6 +421,8 @@ class Pipeline:
                 else:
                     self.loss.backward()
 
+            del self.loss
+            self.loss = None
         
     def run(self):
         self.spawn_recieve_workers()
@@ -432,6 +445,17 @@ class Pipeline:
             self.acts_recieve_thread.join()
         if self.grads_recieve_thread is not None:
             self.grads_recieve_thread.join()
+
+        # can we do this ????
+        del self.grads_send_queue, self.acts_send_queue, self.acts_queue, self.grads_queue, self.recompute_queue
+        self.grads_send_queue = self.acts_send_queue = self.acts_queue = self.grads_queue = self.recompute_queue = None
+        self.model.set_send_fn(None)
+        self.model.set_recv_fn(None)
+
+        if self.acts_send_thread is not None:
+            self.acts_send_thread.join()
+        if self.grads_send_thread is not None:
+            self.grads_send_thread.join()
 
         # return loss
         if self.stage == self.world_size - 1:
