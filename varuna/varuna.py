@@ -321,20 +321,30 @@ class Pipeline:
         del grads_tensor, grads_tensor_i
 
     def acts_sender(self):
-        while self.acts_send_queue is not None:
+        count = 0
+        for task,index in self.schedule:
+            if task == 0:
+                count += 1
+        while count > 0:
             output_acts = self.acts_send_queue.get()
             for rank, (s,e) in zip(self.send_ranks, self.send_indices):
                 handle = dist.isend(output_acts[s:e].cpu(), dst=rank)
                 handle.wait()
-        del output_acts
+            del output_acts, handle
+            count -= 1
 
     def grads_sender(self):
-        while self.grads_send_queue is not None:
+        count = 0
+        for task,index in self.schedule:
+            if task == 2:
+                count += 1
+        while count > 0:
             input_grads = self.grads_send_queue.get()
             for rank, (s,e) in zip(self.recieve_ranks, self.recieve_indices):
                 handle = dist.isend(input_grads[s:e].cpu(), dst=rank)
                 handle.wait()
-        del input_grads
+            del input_grads, handle
+            count -= 1
         
     
     # tells the model where to send acts and gradients
