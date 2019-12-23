@@ -49,7 +49,7 @@ def set_seed(args):
     torch.backends.cudnn.benchmark = False
     
 
-def profile(args, train_dataset, model, num_stages, filename, profiler):
+def profile(args, train_dataset, model, stage_num, filename, profiler):
     
     def get_batch(size, cpu=False):
         dummy_inp = train_dataset[:size]
@@ -62,7 +62,7 @@ def profile(args, train_dataset, model, num_stages, filename, profiler):
                     'end_positions':   dummy_inp[4]}
         return inputs 
 
-    profiler.initialize(get_batch(1, cpu=True), num_stages=num_stages, from_cache=True)
+    profiler.initialize(get_batch(1, cpu=True), stage_num=stage_num, from_cache=True)
 
     # Prepare optimizer
     no_decay = ['bias', 'LayerNorm.weight']
@@ -160,7 +160,7 @@ def main(args):
     # Training
     train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False)
     profiler = Profiling(model, args.device)
-    profile_gen = profile(args, train_dataset, model, 1, "profile.csv", profiler)
+    profile_gen = profile(args, train_dataset, model, 24, "profile24.csv", profiler)
 
 
 

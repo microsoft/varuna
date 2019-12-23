@@ -21,54 +21,83 @@ class Profiling:
         self.ret_val = None
         self.device = device
 
-    def initialize(self, dummy_inputs, num_stages=1, from_cache=False):
+    def initialize(self, dummy_inputs, stage_num=1, from_cache=False):
         start = time.time()
-        self.dry_run(dummy_inputs)
+        self.dry_run(dummy_inputs, from_cache)
         print("dry run time", time.time() - start)
-        self.trim_model(k=num_stages)
+        self.trim_model(k=stage_num)
 
-    def dry_run(self, dummy_inputs):
+    def dry_run(self, dummy_inputs, from_cache):
         # executes the forward pass of the module on dummy inputs. 
         # Sets the order in which modules are used and the total number of cutpoints declared.
 
         self.ordered_modules = OrderedDict()
+        self.input_shapes = {}
         self.num_cutpoints = 0
 
-        # if not (from_cache and os.path.exists("_tmp_ord_mod")):
+        if not (from_cache and os.path.exists("_tmp_ord_mod") and os.path.exists("_tmp_inp_shapes")):
 
-        def get_hook(name):
-            def add_module_hook(module, inputs, _output):
-                self.ordered_modules[name] = module
-            return add_module_hook
+            def get_hook(name):
+                def add_module_hook(module, inputs, _output):
+                    self.ordered_modules[name] = module
+                    if isinstance(module, CutPoint):
+                        # if len(inputs) > 1: error
+                        self.input_shapes[name] = [list(inputs[0].size())]
+                return add_module_hook
 
-        modules = self.model.named_modules()
-        hooks = []
+            modules = self.model.named_modules()
+            hooks = []
 
-        for name, module in modules:
-            if name == "":
-                continue
-            hooks.append( module.register_forward_hook(get_hook(name)))
-            if isinstance(module, CutPoint):
-                self.num_cutpoints += 1
-        
-        self.model(**dummy_inputs)
+            for name, module in modules:
+                if name == "":
+                    continue
+                hooks.append( module.register_forward_hook(get_hook(name)))
+                if isinstance(module, CutPoint):
+                    self.num_cutpoints += 1
+            
+            self.model(**dummy_inputs)
 
-        for h in hooks:
-            h.remove()
+            for h in hooks:
+                h.remove()
+
+            with open("_tmp_ord_mod",'wb') as f:
+                pickle.dump(list(self.ordered_modules.keys()),f)
+            with open("_tmp_inp_shapes",'wb') as f:
+                pickle.dump(self.input_shapes,f)
+
+        else:
+            with open("_tmp_ord_mod",'rb') as f:
+                ordered_modules = pickle.load(f)
+
+            for n in ordered_modules:
+                path = n.split(".")
+                modules = self.model._modules
+                for i in range(len(path) - 1):
+                    modules = modules[path[i]]._modules
+                self.ordered_modules[n] = modules[path[-1]]
+
+            with open("_tmp_inp_shapes",'rb') as f:
+                self.input_shapes = pickle.load(f)
+            self.num_cutpoints = len(self.input_shapes)
     
-# """ Trims out the first stage from model. """
+# """ Trims out the kth stage (starting from 1) from model. """
     def trim_model(self, k=1):
 
         def attach_meta(cutpoint, index):
-            cutpoint.cp_index = 1
+            cutpoint.cp_index = index
             cutpoint.set_ret_val_func = self.set_ret_val
-            cutpoint.stage = 0
+            cutpoint.stage = k-1
             cutpoint.device = self.device
-            cutpoint.send_fn = lambda x: None
+            cutpoint.send_fn = lambda x,grads=False: None
             cutpoint.set_cp_func()
 
         modules = self.ordered_modules
         index = 1
+
+        self.fwd_inp_shape = None
+        self.bwd_grad_shape = None
+
+        self.pre_cp = None
 
         used_modules = []
         is_used = {}
@@ -77,14 +106,24 @@ class Profiling:
             if name == "":
                 continue
             module = modules[name]
+
             is_used[name] = False
-            if index <= k:
-                if isinstance(module, CutPoint):    
-                    if index == k:
-                        attach_meta(module, index)
-                    index += 1
+            if index > (k-1) and index <= k:
                 used_modules.append(name)
                 is_used[name] = True
+            
+            if isinstance(module, CutPoint):    
+                if index == k:
+                    attach_meta(module, index)
+                    # self.bwd_grad_shape_shape = self.input_shapes[name][0]
+                if index == k-1:
+                    self.fwd_inp_shape = self.input_shapes[name][0]
+                    used_modules.append(name)
+                    is_used[name] = True
+                    attach_meta(module, index)
+                    self.pre_cp = module
+                index += 1
+            
 
         # any module that is used or has children that are used are needed
         for u in used_modules:
@@ -102,15 +141,20 @@ class Profiling:
                     modules = modules[path[i]]._modules
                 modules[path[-1]] = None
                 modules[path[-1]] = PassThroughModule()
-                self.ordered_modules[path[-1]] = None
-
+    
     def set_ret_val(self, val):
         self.ret_val = val
-    
+
+    def recv(self, grads=False):
+        # if grads:
+        #     return self.bwd_grad
+        return self.fwd_inp
 
     def profile(self, get_batch_fn,  microbatch_sizes, optimizer, filename="profile.csv"):
 
         profile = {}
+        if self.pre_cp is not None:
+            self.pre_cp.recv_fn = self.recv
 
         initial_mem = torch.cuda.memory_allocated(self.device)
         self.model.to(self.device)
@@ -124,13 +168,15 @@ class Profiling:
             self.model.train()
             try: 
                 torch.cuda.reset_max_memory_allocated(self.device)
+                
                 # get_batch_fn should load inputs into device and return dict
                 input_mem = torch.cuda.memory_allocated()
                 inputs = get_batch_fn(batch_size)
-                print(inputs["input_ids"].size())
                 input_mem = torch.cuda.memory_allocated() - input_mem
-                start = time.time()
+                if self.fwd_inp_shape is not None:
+                    self.fwd_inp = torch.ones(self.fwd_inp_shape, dtype = torch.float32).to(self.device)
 
+                start = time.time()
                 post_fwd_bwd_mem = torch.cuda.memory_allocated()
                 try:
                     calc_val = self.model(**inputs)
@@ -145,7 +191,11 @@ class Profiling:
                 fwd_time = time.time() - start
 
                 bwd_time = time.time()
+                if isinstance(fwd_out, tuple):
+                    fwd_out = fwd_out[0]
                 grads = torch.ones(list(fwd_out.size()), device = self.device)
+                if self.bwd_grad_shape is not None:
+                    self.bwd_grad = torch.ones(self.bwd_grad_shape, dtype = torch.float32).to(self.device)
                 fwd_out.backward(grads)
                 bwd_time = time.time() - bwd_time
 

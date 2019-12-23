@@ -51,23 +51,21 @@ class CutPoint(Module):
 
             @staticmethod
             def forward(ctx, i):
-                if is_in_next_stage:
-                    # receive inputs.
-                    inputs = self.recv_fn()
-                    return inputs
+                # recieve activations
+                if is_in_next_stage and self.recv_fn is not None:
+                    i = self.recv_fn()
+                # send activations
                 elif is_in_prev_stage:
-                    # send activations
                     self.send_fn(i)
                 return i
 
             @staticmethod
             def backward(ctx, grad_output):
-                if is_in_prev_stage:
-                    # receive gradients.
-                    if self.recv_fn is not None:
-                        grad_output = self.recv_fn(grads = True)
+                # receive gradients.
+                if is_in_prev_stage and self.recv_fn is not None:
+                    grad_output = self.recv_fn(grads = True)
+                # send gradients
                 elif is_in_next_stage:
-                    # send gradients
                     self.send_fn(grad_output, grads = True)
                 return grad_output
         
