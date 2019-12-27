@@ -102,22 +102,25 @@ class PartitionedModel(Module):
         else:
             raise ValueError("Rank " + self.rank + " not found in stage to rank map!")
 
-    def initialize(self, dummy_inputs):
+    def initialize(self, dummy_inputs, from_cache=False):
         # print("Initializing partitioned model!")
         start = time.time()
-        self.dry_run(dummy_inputs)
+        self.dry_run(dummy_inputs, from_cache)
         print("dry run time", time.time() - start)
         self.prep_cutpoints()
         self.remove_unused_parameters()
         self.model_pruned = True
+
+    def mark_distributed(self, process_group):
+        self.module = torch.nn.parallel.DistributedDataParallel(self.module, process_group=process_group, device_ids=[self.local_rank], find_unused_parameters=True)
     
-    def dry_run(self, dummy_inputs):
+    def dry_run(self, dummy_inputs, from_cache):
         # """ executes the forward pass of the module on dummy inputs. Sets the order in which modules are used and the total number of cutpoints declared. """
         self.ordered_modules = OrderedDict()
         self.input_shapes = {}
         self.num_cutpoints = 0
 
-        if self.local_rank == 0:
+        if self.local_rank == 0 and not (from_cache and os.path.exists("_tmp_ord_mod") and os.path.exists("_tmp_inp_shapes")):
             # store input shapes for each module (or atleast each cp)
             print("Initializing partitioned model!")
 
@@ -264,7 +267,7 @@ class PartitionedModel(Module):
             torch.distributed.barrier()
             complete_state_dict = self.module.state_dict()
 
-            # gather and read all local pickles to form combined state_dicts
+            # gather and read all pickles to form combined state_dicts
             for i in range(self.num_stages):
                 for rank in self.stage_to_rank_map[i]:
                     if rank == 0:

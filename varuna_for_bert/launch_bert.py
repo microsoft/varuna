@@ -22,6 +22,9 @@ def parse_args():
     parser.add_argument("--node_rank", type=int, default=0,
                         help="Rank of node amongst servers.")
 
+    parser.add_argument("--nstages", type=int, required = True,
+                        help="Depth of pipeline (number of stages)")
+
     parser.add_argument("--master_addr", default="127.0.0.1", type=str,
                         help="Master node (rank 0)'s address, should be either "
                              "the IP address or the hostname of node 0, for "
@@ -48,19 +51,36 @@ if __name__ == "__main__":
     print("Parent process ID:",os.getpid())
     args = parse_args()
 
-    first_rank_in_server = args.node_rank * args.ngpus_per_server
-    ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
-
+    # world size in terms of number of processes
+    dist_world_size = args.ngpus_per_server * args.nservers
+    
+    # uneven data parallelism not supported yet
+    if dist_world_size % args.nstages != 0:
+        raise ValueError("Each stage must get equal number of GPU processes")
+    
+    gpus_per_stage = dist_world_size / args.nstages
+    
     stage_to_rank_map = {}
     rank_to_stage_map = {}
 
-    for i in ranks_in_server:
-        stage_to_rank_map[i] = [i]
-        rank_to_stage_map[i] = i    
+    for i in range(dist_world_size):
+        stage = i // gpus_per_stage
+        if stage not in stage_to_rank_map:
+            stage_to_rank_map[stage] = []
+        stage_to_rank_map[stage].append(i)
+        rank_to_stage_map[i] = stage
 
-    # world size in terms of number of processes
-    dist_world_size = args.ngpus_per_server * args.nservers
-    n_stages = dist_world_size
+    stage_to_rank_map_str = ""
+    for stage in stage_to_rank_map:
+        ranks = ",".join([str(r) for r in stage_to_rank_map[stage]])
+        stage_to_rank_map_str += (ranks + ";")
+        
+    # stage_to_rank_map_str = "0,1,2;3,4,5;6,7"
+    # print("Map is",stage_to_rank_map_str)
+
+
+    first_rank_in_server = args.node_rank * args.ngpus_per_server
+    ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
 
     # set PyTorch distributed related environmental variables
     current_env = os.environ.copy()
@@ -81,7 +101,6 @@ if __name__ == "__main__":
 
     for rank in ranks_in_server:
         
-        stage = rank_to_stage_map[rank]
         local_rank = rank % args.ngpus_per_server
 
         # each process's rank
@@ -98,7 +117,8 @@ if __name__ == "__main__":
         # cmd.append("--stage={}".format(stage))
         # cmd.append("--first_rank_in_server={}".format(first_rank_in_server))
         # cmd.append("--ngpus_per_server={}".format(args.ngpus_per_server))
-        cmd.append("--partitions={}".format(n_stages))
+        cmd.append("--partitions={}".format(args.nstages))
+        cmd.append("--stage_to_rank_map={}".format(stage_to_rank_map_str))
         cmd.extend(args.training_script_args)
 
         process = subprocess.Popen(cmd, env=current_env)
