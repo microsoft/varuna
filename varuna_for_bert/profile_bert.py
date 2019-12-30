@@ -134,7 +134,6 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
 
 def main(args):
 
-    size = args.partitions
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
         raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(args.output_dir))
@@ -160,7 +159,7 @@ def main(args):
     # Training
     train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False)
     profiler = Profiling(model, args.device)
-    profile_gen = profile(args, train_dataset, model, 24, "profile24.csv", profiler)
+    profile_gen = profile(args, train_dataset, model, args.stage_num, "profile-{}.csv".format(args.stage_num), profiler)
 
 
 
@@ -240,7 +239,8 @@ if __name__ == "__main__":
                              "See details at https://nvidia.github.io/apex/amp.html")
 
 
-    parser.add_argument('--partitions', type=int, default=3, help='Number of devices over which the model is split')
+    parser.add_argument('--stage_num', type=int, default=1, help='Which stage to profile')
+
     args = parser.parse_args()
 
     main(args)
