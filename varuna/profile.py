@@ -157,12 +157,13 @@ class Profiling:
             self.pre_cp.recv_fn = self.recv
 
         initial_mem = torch.cuda.memory_allocated(self.device)
+        print("initial mem", initial_mem)
         self.model.to(self.device)
         model_mem = torch.cuda.memory_allocated(self.device) - initial_mem
         print("Model memory", model_mem)
 
         of = open(filename,"w")
-        of.write("Batch size, fwd_time, bwd_time, max_mem_usage, input_mem, model_mem, post_fwd_bwd_mem\n")
+        of.write("Batch size, fwd_time, bwd_time, max_mem_usage, input_mem, model_mem, pre_fwd_bwd_mem\n")
 
         for batch_size in microbatch_sizes:
             self.model.train()
@@ -177,7 +178,8 @@ class Profiling:
                     self.fwd_inp = torch.ones(self.fwd_inp_shape, dtype = torch.float32).to(self.device)
 
                 start = time.time()
-                post_fwd_bwd_mem = torch.cuda.memory_allocated()
+                pre_fwd_bwd_mem = torch.cuda.memory_allocated()
+                
                 try:
                     calc_val = self.model(**inputs)
                     fwd_out = self.ret_val if self.ret_val is not None else calc_val
@@ -196,16 +198,16 @@ class Profiling:
                 grads = torch.ones(list(fwd_out.size()), device = self.device)
                 if self.bwd_grad_shape is not None:
                     self.bwd_grad = torch.ones(self.bwd_grad_shape, dtype = torch.float32).to(self.device)
+                
                 fwd_out.backward(grads)
                 bwd_time = time.time() - bwd_time
 
-                update_time = time.time()
                 optimizer.step()
+                
+
                 del grads, fwd_out
-                post_fwd_bwd_mem = torch.cuda.memory_allocated() - post_fwd_bwd_mem
                 self.model.zero_grad()
                 optimizer.zero_grad()
-                update_time = time.time() - update_time
 
                 mem_usage = torch.cuda.max_memory_allocated(self.device)
                 profile[batch_size] = {
@@ -214,9 +216,9 @@ class Profiling:
                     "max_mem_usage": mem_usage,
                     "input_mem": input_mem,
                     "model_mem": model_mem,
-                    "post_fwd_bwd_mem": post_fwd_bwd_mem
+                    "pre_fwd_bwd_mem": pre_fwd_bwd_mem
                 }
-                of.write("{}, {}, {}, {}, {}, {}, {}\n".format(batch_size, fwd_time, bwd_time, mem_usage, input_mem, model_mem, post_fwd_bwd_mem))
+                of.write("{}, {}, {}, {}, {}, {}, {}\n".format(batch_size, fwd_time, bwd_time, mem_usage, input_mem, model_mem ,pre_fwd_bwd_mem))
                 print("Batch size", batch_size, ": ")
                 print("fwd_time", fwd_time)
                 print("bwd_time", bwd_time)
