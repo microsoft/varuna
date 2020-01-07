@@ -86,7 +86,7 @@ if __name__ == "__main__":
                 break
             max_mem[batch_size] = max_mem_usage
 
-    print("max_gradient_accumulation_steps:",max_gradient_accumulation_steps)
+    print("max_micro_batch_size_per_gpu:",max_micro_batch_size_per_gpu)
 
     # if max_micro_batch_size_per_gpu <= 0:
     #     ERRORR
