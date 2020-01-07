@@ -4,6 +4,8 @@ runs/
 varuna/genschedule
 genschedule
 n_stages
+ngpus
+nservers
 training_output
 train_reports
 
