@@ -150,7 +150,7 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map, train_state 
         logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
         logger.info("  Total optimization steps = %d", t_total)
 
-    global_step = epochs_done * (len(train_dataloader) // gradient_accumulation_steps)
+    global_step = epochs_done * (len(train_dataloader) // args.gradient_accumulation_steps)
     tr_loss, logging_loss = 0.0, 0.0
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=my_stage!=(args.partitions-1), initial = epochs_done)

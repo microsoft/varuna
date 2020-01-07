@@ -136,7 +136,8 @@ if __name__ == "__main__":
 
     while True:
         processes = []
-
+        loop_pending = False
+        
         # world size in terms of number of processes
         dist_world_size = args.ngpus_per_server * args.nservers
         current_env["WORLD_SIZE"] = str(dist_world_size)
