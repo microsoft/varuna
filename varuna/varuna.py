@@ -457,10 +457,10 @@ class Pipeline:
             self.grads_recieve_thread.join()
 
         # can we do this ????
-        del self.grads_send_queue, self.acts_send_queue, self.acts_queue, self.grads_queue, self.recompute_queue
-        self.grads_send_queue = self.acts_send_queue = self.acts_queue = self.grads_queue = self.recompute_queue = None
-        self.model.set_send_fn(None)
-        self.model.set_recv_fn(None)
+        # del self.grads_send_queue, self.acts_send_queue, self.acts_queue, self.grads_queue, self.recompute_queue
+        # self.grads_send_queue = self.acts_send_queue = self.acts_queue = self.grads_queue = self.recompute_queue = None
+        # self.model.set_send_fn(None)
+        # self.model.set_recv_fn(None)
 
         if self.acts_send_thread is not None:
             self.acts_send_thread.join()

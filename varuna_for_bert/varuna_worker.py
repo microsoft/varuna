@@ -57,6 +57,7 @@ from utils_squad import (read_squad_examples, convert_examples_to_features,
 
 TERMINATE_TRAINING = False
 total_terminate_time = 0
+blob_store_folder = "~/myblobcontainer"
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +122,13 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map, train_state 
         {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
         ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+    if args.resume:
+        optimizer.load_state_dict(torch.load(os.path.join(args.output_dir,"opt_state.bin")))
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(args.device)
+
     # scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
 
     if args.fp16:
@@ -215,10 +223,18 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map, train_state 
 
             if TERMINATE_TRAINING:
                 start = time.time()
-                model.checkpoint(os.path.join(args.output_dir,"pytorch_model.bin"))
+                model_filename = os.path.join(args.output_dir,"pytorch_model.bin")
+                model.checkpoint(model_filename)
+                if args.rank == 0:
+                    os.system("mv " + model_filename + " " + os.path.join(blob_store_folder, "pytorch_model.bin" ))
+                    os.system("ls " + blob_store_folder)
                 print("Checkpoint time", time.time() - start)
                 train_state = { "epoch": epoch, "minibatches_done": global_step }
-                torch.save(train_state, os.path.join(args.output_dir,"train_state.bin") )
+                if args.local_rank == 0:
+                    torch.save(train_state, os.path.join(args.output_dir,"train_state.bin") )
+                    torch.save(optimizer.state_dict(), os.path.join(args.output_dir,"opt_state.bin") )
+                # all ranks must wait for each other before returning
+                torch.distributed.barrier()
             
             if (args.max_steps > 0 and global_step > args.max_steps) or TERMINATE_TRAINING :
                 epoch_iterator.close()
@@ -326,6 +342,9 @@ def main(args, stage_to_rank_map):
     config = BertConfig.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
     tokenizer = BertTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
     if args.resume:
+        print("Resuming training!!")
+        if args.local_rank == 0:
+            os.system("cp " + os.path.join(blob_store_folder, "pytorch_model.bin" ) + " " + os.path.join(args.output_dir,"pytorch_model.bin" ))
         model = BertForQuestionAnswering.from_pretrained(args.output_dir, config=config)
         train_state = torch.load(os.path.join(args.output_dir,"train_state.bin") )
     else:
@@ -343,7 +362,7 @@ def main(args, stage_to_rank_map):
 
     total_terminate_time = time.time() - total_terminate_time
     print("Total terminate time", total_terminate_time)
-    logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
+    # logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
 
 

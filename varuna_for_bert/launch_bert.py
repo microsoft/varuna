@@ -66,6 +66,10 @@ def parse_args():
 if __name__ == "__main__":
 
     print("Parent process ID:",os.getpid())
+
+    with open("parent_process","w") as f:
+        f.write(str(os.getpid()))
+
     args = parse_args()
 
     max_micro_batch_size_per_gpu = -1
@@ -149,7 +153,7 @@ if __name__ == "__main__":
         gpus_per_stage = dist_world_size // args.nstages
         # print("WARNING: ", str(dist_world_size % args.nstages), "gpus going unused!!")
     
-        first_rank_in_server = args.node_rank * args.nstages
+        first_rank_in_server = args.node_rank * args.ngpus_per_server
         ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
 
         stage_to_rank_map = {}

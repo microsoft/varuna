@@ -255,9 +255,12 @@ class PartitionedModel(Module):
 
     def checkpoint(self, checkpoint_name = "model-checkpoint"):
         if self.rank != 0:
-            file_name = cp_partition_prefix + "-" + str(self.rank)
-            torch.save(self.module.state_dict(), file_name)
-            os.system("sudo mv " +  file_name + " " + os.path.join(blob_store_folder, file_name))
+            # only 1 rank per stage for data ||
+            if self.rank == self.stage_to_rank_map[self.stage][0]:
+                file_name = cp_partition_prefix + "-" + str(self.rank)
+                torch.save(self.module.state_dict(), file_name)
+                os.system("sudo mv " +  file_name + " " + os.path.join(blob_store_folder, file_name))
+                print("checked rank", self.rank)
             torch.distributed.barrier()
         else:
             torch.distributed.barrier()
@@ -265,16 +268,16 @@ class PartitionedModel(Module):
 
             # gather and read all pickles to form combined state_dicts
             for i in range(self.num_stages):
-                for rank in self.stage_to_rank_map[i]:
-                    if rank == 0:
-                        continue
-                    file_name = cp_partition_prefix + "-" + str(rank)
-                    os.system("sudo mv " + os.path.join(blob_store_folder, file_name) + " " + file_name)
-                    state_dict = torch.load(file_name)
-                    for key in state_dict:
-                        if key not in complete_state_dict or complete_state_dict[key] is None:
-                            complete_state_dict[key] = state_dict[key]
-                    os.system("sudo rm " + file_name)
+                rank = self.stage_to_rank_map[i][0]
+                if rank == 0:
+                    continue
+                file_name = cp_partition_prefix + "-" + str(rank)
+                os.system("sudo mv " + os.path.join(blob_store_folder, file_name) + " " + file_name)
+                state_dict = torch.load(file_name)
+                for key in state_dict:
+                    if key not in complete_state_dict or complete_state_dict[key] is None:
+                        complete_state_dict[key] = state_dict[key]
+                os.system("sudo rm " + file_name)
 
             # for key in complete_state_dict:
             #     print(key)
