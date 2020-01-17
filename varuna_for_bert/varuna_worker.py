@@ -88,9 +88,13 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map, train_state 
     data_depth = len(stage_to_rank_map[0])
     total_batch_size = args.train_batch_size * args.gradient_accumulation_steps
     filename = "train_reports/report-{}-{}-{}-{}_{}.csv".format(args.partitions, data_depth , total_batch_size, args.chunks, args.rank)
-    of = open(filename, "w")
-
-    of.write("MB time, TFLOPS, Max GPU mem, Curr GPU mem, loss\n")
+    
+    if os.path.exists(filename) and args.resume:
+        of = open(filename, "a")
+        of.write("morph")
+    else:
+        of = open(filename, "w")
+        of.write("MB time, TFLOPS, Max GPU mem, Curr GPU mem, loss\n")
     of.close()
 
     for stage in stage_to_rank_map:

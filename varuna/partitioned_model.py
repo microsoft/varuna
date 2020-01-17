@@ -78,6 +78,7 @@ class PartitionedModel(Module):
     def __init__(self, module, rank, local_rank, device, stage_to_rank_map):
         super(PartitionedModel, self).__init__()
         self.module = module
+        self.is_data_parallel = False
         self.num_stages = len(stage_to_rank_map)
         self.stage_to_rank_map = stage_to_rank_map
         self.rank = rank
@@ -109,6 +110,8 @@ class PartitionedModel(Module):
 
     def mark_distributed(self, process_group):
         self.module = torch.nn.parallel.DistributedDataParallel(self.module, process_group=process_group, device_ids=[self.local_rank], find_unused_parameters=True)
+        self.is_data_parallel = True
+
     
     def dry_run(self, dummy_inputs, from_cache):
         # """ executes the forward pass of the module on dummy inputs. Sets the order in which modules are used and the total number of cutpoints declared. """
@@ -254,17 +257,20 @@ class PartitionedModel(Module):
         self.model_pruned = True
 
     def checkpoint(self, checkpoint_name = "model-checkpoint"):
+
+        module = self.module.module if self.is_data_parallel else self.module
+
         if self.rank != 0:
             # only 1 rank per stage for data ||
             if self.rank == self.stage_to_rank_map[self.stage][0]:
                 file_name = cp_partition_prefix + "-" + str(self.rank)
-                torch.save(self.module.state_dict(), file_name)
+                torch.save(module.state_dict(), file_name)
                 os.system("sudo mv " +  file_name + " " + os.path.join(blob_store_folder, file_name))
                 print("checked rank", self.rank)
             torch.distributed.barrier()
         else:
             torch.distributed.barrier()
-            complete_state_dict = self.module.state_dict()
+            complete_state_dict = module.state_dict()
 
             # gather and read all pickles to form combined state_dicts
             for i in range(self.num_stages):

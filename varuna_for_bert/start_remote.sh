@@ -1,4 +1,4 @@
-machines=(p100-gpu-0001 p100-gpu-0002 p100-gpu-0003 p100-gpu-0004 p100-gpu-0006 p100-gpu-0007)
+machines=(p40-gpu-0002 p40-gpu-0003 p40-gpu-0005 p40-gpu-0007 p100-gpu-0001 p100-gpu-0002 p100-gpu-0003 p100-gpu-0004)
 
 if [ $# != 3 ]
 then
@@ -6,20 +6,22 @@ then
     exit
 fi
 
-masteraddr="10.4.0.29"
-nservers=$1
-executable=$2
+nservers=$2
+ngpus=$1
+
+# for change signal
+echo $3>args
 
 cd ~/t-nisar/Varuna/varuna_for_bert; source activate varuna;
 
 i=1
-while [ $i != $1 ]
+while [ $i != $nservers ]
 do
     echo $i
-    mid="launch_bert.py --node_rank $i --nservers $1"
-    ssh "${machines[i]}" "echo sshed; cd ~/t-nisar/Varuna/varuna_for_bert; source activate varuna; echo \$SQUAD_DIR; $executable $mid $3" > ssh_out_$i &
+    mid="launch_bert.py --node_rank $i --nservers $nservers --ngpus_per_server $ngpus"
+    ssh "${machines[i]}" "echo sshed; cd ~/t-nisar/Varuna/varuna_for_bert; source ~/anaconda3/bin/activate varuna; echo \$SQUAD_DIR; GLOO_SOCKET_IFNAME=eth0 python $mid $3" > ssh_out_$i  2>ssh_err_$i &
     i=$(($i+1))
 done
-mid="launch_bert.py --node_rank 0 --nservers $1"
-$executable $mid $3
-# ssh p100-gpu-0003 "cd ~/t-nisar/Varuna/varuna_for_bert; source activate varuna;
+mid="launch_bert.py --node_rank 0 --nservers $nservers --ngpus_per_server $ngpus"
+python $mid $3
+
