@@ -114,6 +114,7 @@ if __name__ == "__main__":
         if args.node_rank >= nservers:
             loop_pending = False
         args.ngpus_per_server = ngpus_per_server
+        args.nservers = nservers
         for p in processes:
             p.send_signal(signal.SIGUSR1)
         # send signal to other nodes as well

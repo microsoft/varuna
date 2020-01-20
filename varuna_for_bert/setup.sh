@@ -14,7 +14,7 @@ git checkout nitika/profiling
 cd ..
 cp Varuna/varuna_for_bert/modeling_bert.py transformers/src/transformers/modeling_bert.py
 mkdir -p ~/t-nisar/data/squad
-scp -r core@p100-gpu-0001:t-nisar/data/squad ~/t-nisar/data/
+scp -r core@p40-gpu-0002:t-nisar/data/squad ~/t-nisar/data/
 
 cd $CONDA_PREFIX
 mkdir -p ./etc/conda/activate.d
@@ -34,7 +34,7 @@ sudo chown core /mnt/resource/blobfusetmp
 touch ~/fuse_connection.cfg
 chmod 600 fuse_connection.cfg
 mkdir ~/myblobcontainer
-sudo blobfuse ~/myblobcontainer --tmp-path=/mnt/resource/blobfusetmp  --config-file=/home/core/fuse_connection.cfg -o attr_timeout=240 -o entry_timeout=240 -o negative_timeout=120 -o allow_other -o uid=<check> -o gid=<check>
+sudo blobfuse ~/myblobcontainer --tmp-path=/mnt/resource/blobfusetmp  --config-file=/home/core/fuse_connection.cfg -o attr_timeout=240 -o entry_timeout=240 -o negative_timeout=120 -o allow_other -o uid=1000 -o gid=1000
 
 cd ~/t-nisar/transformers
 python setup.py develop
