@@ -57,7 +57,7 @@ from utils_squad import (read_squad_examples, convert_examples_to_features,
 
 TERMINATE_TRAINING = False
 total_terminate_time = 0
-blob_store_folder = "~/myblobcontainer"
+blob_store_folder = "/home/core/myblobcontainer"
 
 logger = logging.getLogger(__name__)
 
@@ -87,13 +87,16 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map, train_state 
     
     data_depth = len(stage_to_rank_map[0])
     total_batch_size = args.train_batch_size * args.gradient_accumulation_steps
-    filename = "train_reports/report-{}-{}-{}-{}_{}.csv".format(args.partitions, data_depth , total_batch_size, args.chunks, args.rank)
     
-    if os.path.exists(filename) and args.resume:
-        of = open(filename, "a")
-        of.write("morph")
+    if args.report_name == "":
+        args.report_name = "train_reports/report-{}-{}-{}-{}_{}.csv".format(args.partitions, data_depth , total_batch_size, args.chunks, args.rank)
+
+    
+    if os.path.exists(args.report_name) and args.resume:
+        of = open(args.report_name, "a")
+        of.write("morphed to {}-{}-{}\n".format(args.partitions, data_depth, total_batch_size))
     else:
-        of = open(filename, "w")
+        of = open(args.report_name, "w")
         of.write("MB time, TFLOPS, Max GPU mem, Curr GPU mem, loss\n")
     of.close()
 
@@ -127,7 +130,7 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map, train_state 
         ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     if args.resume:
-        optimizer.load_state_dict(torch.load(os.path.join(args.output_dir,"opt_state.bin")))
+        optimizer.load_state_dict(torch.load(os.path.join(blob_store_folder,"opt_state.bin")))
         for state in optimizer.state.values():
             for k, v in state.items():
                 if isinstance(v, torch.Tensor):
@@ -206,7 +209,7 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map, train_state 
                 global_step += 1
                 max_mem = torch.cuda.max_memory_allocated(args.device)
                 curr_mem = torch.cuda.memory_allocated(args.device)
-                of = open(filename, "a")
+                of = open(args.report_name, "a")
                 of.write("{}, {}, {}, {}, {}\n".format(minibatch_time, tflops, max_mem, curr_mem, loss))
                 of.close()
 
@@ -219,28 +222,23 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map, train_state 
                     # tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
                     # tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
                     print("loss at step",global_step, "is ", loss )
-                    print("Current average pipeline time", avg_mb_time / global_step )
-                    print("Avg TFLOPS", (avg_tflops / global_step) )
+                    print("Current average pipeline time", avg_mb_time / step )
+                    print("Avg TFLOPS", (avg_tflops / step) )
                     # logging_loss = tr_loss
 
             del batch, inputs
 
-            if TERMINATE_TRAINING:
+            if (args.max_steps > 0 and global_step > args.max_steps) or TERMINATE_TRAINING:
                 start = time.time()
-                model_filename = os.path.join(args.output_dir,"pytorch_model.bin")
-                model.checkpoint(model_filename)
-                if args.rank == 0:
-                    os.system("mv " + model_filename + " " + os.path.join(blob_store_folder, "pytorch_model.bin" ))
-                    os.system("ls " + blob_store_folder)
+                model.checkpoint(blob_store_folder)
                 print("Checkpoint time", time.time() - start)
-                train_state = { "epoch": epoch, "minibatches_done": global_step }
-                if args.local_rank == 0:
-                    torch.save(train_state, os.path.join(args.output_dir,"train_state.bin") )
-                    torch.save(optimizer.state_dict(), os.path.join(args.output_dir,"opt_state.bin") )
+                if args.rank == 0:
+                    train_state = { "epoch": epoch, "minibatches_done": global_step }
+                    torch.save(train_state, os.path.join(blob_store_folder,"train_state.bin") )
+                    torch.save(optimizer.state_dict(), os.path.join(blob_store_folder,"opt_state.bin") )
                 # all ranks must wait for each other before returning
                 torch.distributed.barrier()
             
-            if (args.max_steps > 0 and global_step > args.max_steps) or TERMINATE_TRAINING :
                 epoch_iterator.close()
                 break
 
@@ -337,22 +335,35 @@ def main(args, stage_to_rank_map):
     # Set seed
     set_seed(args)
 
+    for stage in stage_to_rank_map:
+        if rank in stage_to_rank_map[stage]:
+            my_stage = stage
+            break
+    print(args.rank, "with stage", my_stage)
+
     # Load pretrained model and tokenizer
+    if args.resume:
+        print("Resuming training!!")
+        config = BertConfig.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
+        tokenizer = BertTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
+        state_dict = {}
+        stages_per_worker = config.num_hidden_layers // args.partitions
+        pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
+        print(args.rank, "reads", pstages_to_read)
+        for i in pstages_to_read:
+            print(args.rank,  i)
+            state_dict_ = torch.load(os.path.join(blob_store_folder, "cp-pstage-{}".format(i)))
+            state_dict.update(state_dict_)
+        model = BertForQuestionAnswering.from_pretrained(None, state_dict=state_dict, config=config)
+        train_state = torch.load(os.path.join(blob_store_folder,"train_state.bin") )
+    else:
     if args.local_rank != 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
-    train_state = None
-    start = time.time()
     config = BertConfig.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
     tokenizer = BertTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
-    if args.resume:
-        print("Resuming training!!")
-        if args.local_rank == 0:
-            os.system("cp " + os.path.join(blob_store_folder, "pytorch_model.bin" ) + " " + os.path.join(args.output_dir,"pytorch_model.bin" ))
-        model = BertForQuestionAnswering.from_pretrained(args.output_dir, config=config)
-        train_state = torch.load(os.path.join(args.output_dir,"train_state.bin") )
-    else:
         model = BertForQuestionAnswering.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path), config=config)
+        train_state = None 
 
     if args.local_rank == 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
@@ -459,6 +470,7 @@ if __name__ == "__main__":
     parser.add_argument('--stage_to_rank_map',type=str, default="",help="How GPU processes are divided among partitions")
     parser.add_argument('--rank', type=int, default=0, help='Partition index')
     parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--report_name', type=str, default="", help="file name for training report")
     args = parser.parse_args()
 
     def handler(signum,_):

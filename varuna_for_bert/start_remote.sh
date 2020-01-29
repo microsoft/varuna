@@ -1,4 +1,4 @@
-machines=(p40-gpu-0002 p40-gpu-0004 p40-gpu-0005 p40-gpu-0007 p100-gpu-0001 p100-gpu-0002 p100-gpu-0003 p100-gpu-0004)
+machines=(p40-gpu-0002 p40-gpu-0003 p40-gpu-0004 p40-gpu-0005 p100-gpu-0002 p100-gpu-0003 p100-gpu-0004 p100-gpu-0006)
 
 if [ $# != 3 ]
 then

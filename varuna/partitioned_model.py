@@ -234,8 +234,6 @@ class PartitionedModel(Module):
                     used_modules.append(name)
                 is_used[name] = add_flag
 
-        # print(self.rank, "uses", len(used_modules), "out of", len(self.ordered_modules))
-
         # any module that is used or has children that are used are needed
         for u in used_modules:
             path = u.split(".")
@@ -252,44 +250,87 @@ class PartitionedModel(Module):
                     modules = modules[path[i]]._modules
                 modules[path[-1]] = None
                 modules[path[-1]] = PassThroughModule()
-                self.ordered_modules[path[-1]] = None
+                self.ordered_modules[m] = None
 
         self.model_pruned = True
 
-    def checkpoint(self, checkpoint_name = "model-checkpoint"):
+    def checkpoint(self, checkpoint_dir = "model-checkpoint"):
+        # only 1 rank per stage for data ||
+        if self.rank != self.stage_to_rank_map[self.stage][0]:
+            return
+        
+        # we only want to checkpoint leaf modules
+        leaf_modules = {}
+        non_leaf_modules = {}
 
-        module = self.module.module if self.is_data_parallel else self.module
+        for m in self.ordered_modules:
+            if (m not in leaf_modules) and (m not in non_leaf_modules):
+                leaf_modules[m] = True
+                # mark all ancestors as non-leaf
+                path = m.split(".")
+                key = path[0]
+                for i in range(1,len(path)):
+                    non_leaf_modules[key] = True
+                    key = key + "." + path[i]
 
-        if self.rank != 0:
-            # only 1 rank per stage for data ||
-            if self.rank == self.stage_to_rank_map[self.stage][0]:
-                file_name = cp_partition_prefix + "-" + str(self.rank)
-                torch.save(module.state_dict(), file_name)
-                os.system("sudo mv " +  file_name + " " + os.path.join(blob_store_folder, file_name))
-                print("checked rank", self.rank)
-            torch.distributed.barrier()
-        else:
-            torch.distributed.barrier()
-            complete_state_dict = module.state_dict()
+        modules = list(leaf_modules.keys())
 
-            # gather and read all pickles to form combined state_dicts
-            for i in range(self.num_stages):
-                rank = self.stage_to_rank_map[i][0]
-                if rank == 0:
-                    continue
-                file_name = cp_partition_prefix + "-" + str(rank)
-                os.system("sudo mv " + os.path.join(blob_store_folder, file_name) + " " + file_name)
-                state_dict = torch.load(file_name)
-                for key in state_dict:
-                    if key not in complete_state_dict or complete_state_dict[key] is None:
-                        complete_state_dict[key] = state_dict[key]
-                os.system("sudo rm " + file_name)
+        stage_index = 0
+        state_dict = {}
+        cp_count = 0
 
-            # for key in complete_state_dict:
-            #     print(key)
+        for name in modules:
+            module = self.ordered_modules[name]
+            if name == "" or module is None:
+                continue
+            if isinstance(module, CutPoint):
+                if len(state_dict.keys()) > 0:
+                    torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
+                    cp_count += 1
+                if cp_count >= self.cuts_per_stage:
+                    break
+                stage_index += 1
+                state_dict = {}
+            else:
+                module_state_dict = module.state_dict()
+                module_state_dict_ = OrderedDict()
+                for key, val in module_state_dict.items():
+                    module_state_dict_[name + "." + key] = val
+                state_dict.update(module_state_dict_)
 
-            torch.save(complete_state_dict, checkpoint_name)
-            print("checkpointed!!")
+        if len(state_dict.keys()) > 0 and (cp_count < self.cuts_per_stage):
+            torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
+
+        # if self.rank != 0:
+        #     # only 1 rank per stage for data ||
+        #     if self.rank == self.stage_to_rank_map[self.stage][0]:
+        #         file_name = cp_partition_prefix + "-" + str(self.rank)
+        #         torch.save(module.state_dict(), file_name)
+        #         os.system("sudo mv " +  file_name + " " + os.path.join(blob_store_folder, file_name))
+        #         print("checked rank", self.rank)
+        #     torch.distributed.barrier()
+        # else:
+        #     torch.distributed.barrier()
+        #     complete_state_dict = module.state_dict()
+
+        #     # gather and read all pickles to form combined state_dicts
+        #     for i in range(self.num_stages):
+        #         rank = self.stage_to_rank_map[i][0]
+        #         if rank == 0:
+        #             continue
+        #         file_name = cp_partition_prefix + "-" + str(rank)
+        #         os.system("sudo mv " + os.path.join(blob_store_folder, file_name) + " " + file_name)
+        #         state_dict = torch.load(file_name)
+        #         for key in state_dict:
+        #             if key not in complete_state_dict or complete_state_dict[key] is None:
+        #                 complete_state_dict[key] = state_dict[key]
+        #         os.system("sudo rm " + file_name)
+
+        #     # for key in complete_state_dict:
+        #     #     print(key)
+
+        #     torch.save(complete_state_dict, checkpoint_dir)
+        print("checkpointed!!")
 
     def set_ret_val(self, val):
         self.ret_val = val
