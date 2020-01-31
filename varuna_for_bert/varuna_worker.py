@@ -357,16 +357,16 @@ def main(args, stage_to_rank_map):
         model = BertForQuestionAnswering.from_pretrained(None, state_dict=state_dict, config=config)
         train_state = torch.load(os.path.join(blob_store_folder,"train_state.bin") )
     else:
-    if args.local_rank != 0:
-        torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
+        if args.local_rank != 0:
+            torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
-    config = BertConfig.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
-    tokenizer = BertTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
+        config = BertConfig.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
+        tokenizer = BertTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
         model = BertForQuestionAnswering.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path), config=config)
         train_state = None 
 
-    if args.local_rank == 0:
-        torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
+        if args.local_rank == 0:
+            torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
     logger.info("Training/evaluation parameters %s", args)
 
