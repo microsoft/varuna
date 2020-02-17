@@ -33,6 +33,9 @@ def parse_args():
     parser.add_argument("--nstages", type=int, required = True,
                         help="Depth of pipeline (number of stages)")
 
+    parser.add_argument("--gpus_per_stage", type=int, default = "0",
+                        help="GPUs per stage (Don't specify until necessary!!")
+
     parser.add_argument("--master_addr", default="127.0.0.1", type=str,
                         help="Master node (rank 0)'s address, should be either "
                              "the IP address or the hostname of node 0, for "
@@ -144,18 +147,29 @@ if __name__ == "__main__":
         loop_pending = False
         
         # world size in terms of number of processes
-        dist_world_size = args.ngpus_per_server * args.nservers
+        gpus_available = args.ngpus_per_server * args.nservers
+        gpus_per_stage = gpus_available // args.nstages if args.gpus_per_stage == 0 else args.gpus_per_stage
+        dist_world_size = gpus_per_stage * args.nstages
+        unused_gpus = (gpus_available - dist_world_size)
+
+        # uneven data parallelism not supported yet
+        if unused_gpus > args.ngpus_per_server:
+            raise ValueError("Wrong number of servers - too many unused GPUs")
+
         current_env["WORLD_SIZE"] = str(dist_world_size)
         print("World size is",dist_world_size)
 
         # uneven data parallelism not supported yet
         # if dist_world_size % args.nstages != 0:
         #     raise ValueError("Each stage must get equal number of GPU processes")
-        gpus_per_stage = dist_world_size // args.nstages
+        
         # print("WARNING: ", str(dist_world_size % args.nstages), "gpus going unused!!")
     
         first_rank_in_server = args.node_rank * args.ngpus_per_server
-        ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
+        if args.node_rank == args.nservers - 1:
+            ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server - unused_gpus)
+        else:
+            ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
 
         stage_to_rank_map = {}
         rank_to_stage_map = {}
@@ -209,9 +223,9 @@ if __name__ == "__main__":
             cmd.append("--rank={}".format(rank))
             cmd.append("--local_rank={}".format(local_rank))
             cmd.append("--partitions={}".format(args.nstages))
-            cmd.append("--chunks={}".format(args.chunks))
-            cmd.append("--train_batch_size={}".format(train_batch_size))
-            cmd.append("--gradient_accumulation_steps={}".format(gradient_accumulation_steps))
+            cmd.append("--chunks={}".format(args.chunks * gradient_accumulation_steps))
+            cmd.append("--train_batch_size={}".format(args.batch_size))
+            # cmd.append("--gradient_accumulation_steps={}".format(gradient_accumulation_steps))
             cmd.append("--stage_to_rank_map={}".format(stage_to_rank_map_str))
             if count > 0:
                 cmd.append("--resume")
