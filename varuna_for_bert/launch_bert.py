@@ -223,9 +223,9 @@ if __name__ == "__main__":
             cmd.append("--rank={}".format(rank))
             cmd.append("--local_rank={}".format(local_rank))
             cmd.append("--partitions={}".format(args.nstages))
-            cmd.append("--chunks={}".format(args.chunks))
-            cmd.append("--train_batch_size={}".format(train_batch_size))
-            cmd.append("--gradient_accumulation_steps={}".format(gradient_accumulation_steps))
+            cmd.append("--chunks={}".format(args.chunks * gradient_accumulation_steps))
+            cmd.append("--train_batch_size={}".format(args.batch_size))
+            # cmd.append("--gradient_accumulation_steps={}".format(gradient_accumulation_steps))
             cmd.append("--stage_to_rank_map={}".format(stage_to_rank_map_str))
             if count > 0:
                 cmd.append("--resume")

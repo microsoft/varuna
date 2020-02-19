@@ -152,7 +152,7 @@ class Varuna(Module):
     
     def forward(self, inputs):        
         # Divide a mini-batch into micro-batches.
-        batches = scatter(inputs, self.chunks)
+        batches = scatter(inputs, self.chunks, self.device)
         
         # need not pass the first argument if rank!=0
         # avoid dataloader compute in machines other than the first
@@ -472,7 +472,7 @@ class Pipeline:
             return self.average_loss
         return 0
 
-def scatter(input, chunks):
+def scatter(input, chunks, device):
     """
     Accepts input dictionary and splits into microbatches
     """
@@ -486,7 +486,7 @@ def scatter(input, chunks):
         if v_size[0] % chunks != 0:
             orig_len = v_size[0]
             v_size[0] += chunks - (v_size[0] % chunks) 
-            v_ = torch.zeros(v_size, dtype=v.dtype)
+            v_ = torch.zeros(v_size, dtype=v.dtype, device=device)
             v_[:orig_len] = v
             v_[orig_len:] = v[:(v_size[0] - orig_len)]
             v = v_

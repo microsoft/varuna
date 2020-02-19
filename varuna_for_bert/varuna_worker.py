@@ -222,8 +222,8 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map, train_state 
                     # tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
                     # tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
                     print("loss at step",global_step, "is ", loss )
-                    print("Current average pipeline time", avg_mb_time / step )
-                    print("Avg TFLOPS", (avg_tflops / step) )
+                    print("Current average pipeline time", avg_mb_time / (step+1) )
+                    print("Avg TFLOPS", (avg_tflops / (step+1)) )
                     # logging_loss = tr_loss
 
             del batch, inputs
