@@ -9,6 +9,7 @@ import time
 import pickle
 
 from collections import OrderedDict 
+import collections
 
 blob_store_folder = "~/myblobcontainer"
 
@@ -156,6 +157,7 @@ class Profiling:
         if self.pre_cp is not None:
             self.pre_cp.recv_fn = self.recv
 
+        # should be 0?
         initial_mem = torch.cuda.memory_allocated(self.device)
         print("initial mem", initial_mem)
         self.model.to(self.device)
@@ -169,7 +171,7 @@ class Profiling:
             self.model.train()
             try: 
                 torch.cuda.reset_max_memory_allocated(self.device)
-                
+                print("Pre pre mem", torch.cuda.memory_allocated())
                 # get_batch_fn should load inputs into device and return dict
                 input_mem = torch.cuda.memory_allocated()
                 inputs = get_batch_fn(batch_size)
@@ -226,6 +228,8 @@ class Profiling:
                 print("-------------------------")
                 print()
                 del inputs
+                self.fwd_inp = None; self.bwd_grad = None
+                optimizer.state = collections.defaultdict(dict) # Reset state
 
             except RuntimeError as e:
                 if 'out of memory' in str(e):
