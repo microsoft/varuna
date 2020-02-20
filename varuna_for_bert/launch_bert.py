@@ -237,7 +237,7 @@ if __name__ == "__main__":
                 cmd.append("--resume")
             cmd.extend(args.training_script_args)
 
-            print("rank",rank, cmd)
+            # print("rank",rank, cmd)
 
             process = subprocess.Popen(cmd, env=current_env)
             processes.append(process)
