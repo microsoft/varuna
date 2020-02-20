@@ -79,6 +79,12 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map, train_state 
 
     if args.rank == 0:
         tb_writer = SummaryWriter()
+    
+    data_depth = len(stage_to_rank_map[0])
+    filename = "train_reports/report-{}-{}-{}-{}_{}.csv".format(args.partitions, data_depth , args.per_gpu_train_batch_size, args.chunks, args.rank)
+    of = open(filename, "w")
+
+    of.write("MB time, TFLOPS, GPU mem, loss\n")
 
     epochs_done = minibatches_done = 0
     if train_state is not None:
@@ -248,6 +254,8 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map, train_state 
 
     if args.rank == 0:
         tb_writer.close()
+
+    of.close()
 
     return global_step, tr_loss / global_step
 
