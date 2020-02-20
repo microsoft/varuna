@@ -254,15 +254,19 @@ class PartitionedModel(Module):
 
         self.model_pruned = True
 
+    """For each partition/stage, the first rank in that stage saves state_dict 
+    of the cutpoints used by that stage to a common store. So checkpoint is sharded 
+    along cutpoints (as many checkpoint files as cutpoints)"""
     def checkpoint(self, checkpoint_dir = "model-checkpoint"):
         # only 1 rank per stage for data ||
         if self.rank != self.stage_to_rank_map[self.stage][0]:
             return
         
-        # we only want to checkpoint leaf modules
+        # we only want to checkpoint leaf modules (For ex. bert.embedding.weight and not bert.embeddings)
         leaf_modules = {}
         non_leaf_modules = {}
 
+        # this assumes that a non-leaf module is added after all it's descendants to the order (which is true so far)
         for m in self.ordered_modules:
             if (m not in leaf_modules) and (m not in non_leaf_modules):
                 leaf_modules[m] = True
@@ -298,38 +302,10 @@ class PartitionedModel(Module):
                     module_state_dict_[name + "." + key] = val
                 state_dict.update(module_state_dict_)
 
+        # last cutpoint
         if len(state_dict.keys()) > 0 and (cp_count < self.cuts_per_stage):
             torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
 
-        # if self.rank != 0:
-        #     # only 1 rank per stage for data ||
-        #     if self.rank == self.stage_to_rank_map[self.stage][0]:
-        #         file_name = cp_partition_prefix + "-" + str(self.rank)
-        #         torch.save(module.state_dict(), file_name)
-        #         os.system("sudo mv " +  file_name + " " + os.path.join(blob_store_folder, file_name))
-        #         print("checked rank", self.rank)
-        #     torch.distributed.barrier()
-        # else:
-        #     torch.distributed.barrier()
-        #     complete_state_dict = module.state_dict()
-
-        #     # gather and read all pickles to form combined state_dicts
-        #     for i in range(self.num_stages):
-        #         rank = self.stage_to_rank_map[i][0]
-        #         if rank == 0:
-        #             continue
-        #         file_name = cp_partition_prefix + "-" + str(rank)
-        #         os.system("sudo mv " + os.path.join(blob_store_folder, file_name) + " " + file_name)
-        #         state_dict = torch.load(file_name)
-        #         for key in state_dict:
-        #             if key not in complete_state_dict or complete_state_dict[key] is None:
-        #                 complete_state_dict[key] = state_dict[key]
-        #         os.system("sudo rm " + file_name)
-
-        #     # for key in complete_state_dict:
-        #     #     print(key)
-
-        #     torch.save(complete_state_dict, checkpoint_dir)
         print("checkpointed!!")
 
     def set_ret_val(self, val):
@@ -354,7 +330,6 @@ class PartitionedModel(Module):
         try:
             calc_val = self.module(*inputs, **kwargs)
             ret_val = self.ret_val if self.ret_val is not None else calc_val
-            del calc_val
         except Exception as e:
             if self.ret_val is None:
                 raise e
@@ -371,3 +346,14 @@ class PassThroughModule(Module):
 
     def forward(self,*args,**kwargs):
         return None
+
+
+def load_varuna_checkpoint(my_stage, num_stages, total_num_pstages, common_store):
+    state_dict = {}
+    stages_per_worker = total_num_pstages // num_stages
+    pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
+    print(dist.get_rank(),"rank with stage", my_stage, "reads", pstages_to_read)
+    for i in pstages_to_read:
+        state_dict_ = torch.load(os.path.join(common_store, "cp-pstage-{}".format(i)),map_location="cpu")
+        state_dict.update(state_dict_)
+    return state_dict

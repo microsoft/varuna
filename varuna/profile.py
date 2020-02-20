@@ -11,10 +11,6 @@ import pickle
 from collections import OrderedDict 
 import collections
 
-blob_store_folder = "~/myblobcontainer"
-
-cp_partition_prefix = "cp-partition"
-
 class Profiling:
 
     def __init__(self, model, device):
@@ -109,14 +105,16 @@ class Profiling:
             module = modules[name]
 
             is_used[name] = False
-            if index > (k-1) and index <= k:
+            # when the next cutpoint to come is the kth, modules are used
+            if index == k:
                 used_modules.append(name)
                 is_used[name] = True
             
+            # only need to set up two cutpoints at most
             if isinstance(module, CutPoint):    
                 if index == k:
                     attach_meta(module, index)
-                    # self.bwd_grad_shape_shape = self.input_shapes[name][0]
+                    self.bwd_grad_shape = self.input_shapes[name][0]
                 if index == k-1:
                     self.fwd_inp_shape = self.input_shapes[name][0]
                     used_modules.append(name)
@@ -142,13 +140,14 @@ class Profiling:
                     modules = modules[path[i]]._modules
                 modules[path[-1]] = None
                 modules[path[-1]] = PassThroughModule()
+                self.ordered_modules[m] = None
     
     def set_ret_val(self, val):
         self.ret_val = val
 
     def recv(self, grads=False):
-        # if grads:
-        #     return self.bwd_grad
+        if grads:
+            return self.bwd_grad
         return self.fwd_inp
 
     def profile(self, get_batch_fn,  microbatch_sizes, optimizer, filename="profile.csv"):

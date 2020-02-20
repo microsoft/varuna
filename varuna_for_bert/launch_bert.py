@@ -8,9 +8,68 @@ import math
 
 loop_pending = False
 
-
 # different for diff kinds of GPUs
 MAX_GPU_MEM = 16280000000
+
+def calculate_config(args):
+    # world size in terms of number of processes
+    gpus_available = args.ngpus_per_server * args.nservers
+    gpus_per_stage = (gpus_available // args.nstages) if args.gpus_per_stage == 0 else args.gpus_per_stage
+    dist_world_size = gpus_per_stage * args.nstages
+    assert(dist_world_size < gpus_available, "Too many gpus_per_stage!")
+    unused_gpus = (gpus_available - dist_world_size)
+
+    # one whole server is unused
+    if unused_gpus > args.ngpus_per_server:
+        raise ValueError("Wrong number of servers - too many unused GPUs")
+
+    stage_to_rank_map = {}
+    rank_to_stage_map = {}
+
+    for i in range(dist_world_size):
+        stage = i // gpus_per_stage
+        if stage not in stage_to_rank_map:
+            stage_to_rank_map[stage] = []
+        stage_to_rank_map[stage].append(i)
+        rank_to_stage_map[i] = stage
+
+    stage_to_rank_map_str = ""
+    for stage in stage_to_rank_map:
+        ranks = ",".join([str(r) for r in stage_to_rank_map[stage]])
+        stage_to_rank_map_str += (ranks + ";")
+
+    per_gpu_batch_size = args.batch_size // gpus_per_stage
+    per_gpu_micro_batch_size = math.ceil(per_gpu_batch_size / (1.0 * args.chunks))
+    gradient_accumulation_steps = 1
+    max_gradient_accumulation_steps = per_gpu_micro_batch_size // max_micro_batch_size_per_gpu
+
+    # shouldn't ceil(max_grad_acc_steps) just be the actual one we use??
+    while per_gpu_micro_batch_size > max_micro_batch_size_per_gpu and gradient_accumulation_steps <= max_gradient_accumulation_steps :
+        gradient_accumulation_steps += 1
+        per_gpu_micro_batch_size_ = per_gpu_micro_batch_size // gradient_accumulation_steps 
+        if per_gpu_micro_batch_size_ <= max_micro_batch_size_per_gpu:
+            per_gpu_micro_batch_size = per_gpu_micro_batch_size_
+            break
+
+    # for pipelining, we don't really need gradient accumalation steps - just increase the number of chunks
+    # we want to keep the micro BS same
+    args.chunks = args.chunks * gradient_accumulation_steps
+
+    first_rank_in_server = args.node_rank * args.ngpus_per_server
+    if args.node_rank == args.nservers - 1:
+        ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server - unused_gpus)
+    else:
+        ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
+
+    print("Config:")
+    print("train batch size:",args.batch_size)
+    print("partitions:", args.nstages)
+    print("chunks:", args.chunks)
+    print("data depth:", gpus_per_stage)
+    print("stage to rank map:", stage_to_rank_map_str)
+
+    return dist_world_size, stage_to_rank_map_str, ranks_in_server
+    
 
 def parse_args():
     """
@@ -34,7 +93,7 @@ def parse_args():
                         help="Depth of pipeline (number of stages)")
 
     parser.add_argument("--gpus_per_stage", type=int, default = "0",
-                        help="GPUs per stage (Don't specify until necessary!!")
+                        help="GPUs per stage (Only needed when we want to use less than ngpus_per_server * nservers)")
 
     parser.add_argument("--master_addr", default="127.0.0.1", type=str,
                         help="Master node (rank 0)'s address, should be either "
@@ -51,6 +110,10 @@ def parse_args():
 
     parser.add_argument("--chunks", required=True, type=int,
                         help="Number of micro-batches per mini-batch")
+
+    # need a better way to pass this information ?
+    parser.add_argument("--total_num_stages", required=True, type=int,
+                        help="The total number of potential stages/partitions the model is divided into")
 
     parser.add_argument("--profile", required=True, type=str,
                         help="CSV file containing memory profile of the model")
@@ -76,8 +139,8 @@ if __name__ == "__main__":
     args = parse_args()
 
     max_micro_batch_size_per_gpu = -1
-    cutpoints_per_stage = 24 // args.nstages
-    max_mem = {}
+    cutpoints_per_stage = args.total_num_stages // args.nstages
+
     with open(args.profile, 'r') as f:
         # skip line with column names
         f.readline()
@@ -91,12 +154,11 @@ if __name__ == "__main__":
             if max_mem_usage > MAX_GPU_MEM:
                 max_micro_batch_size_per_gpu = batch_size - 1
                 break
-            max_mem[batch_size] = max_mem_usage
 
     print("max_micro_batch_size_per_gpu:",max_micro_batch_size_per_gpu)
 
-    # if max_micro_batch_size_per_gpu <= 0:
-    #     ERRORR
+    if max_micro_batch_size_per_gpu <= 0:
+        raise ValueError("No micro-batch can fit for the model! Calculated max micro BS per gpu is " + str(max_micro_batch_size_per_gpu))
 
     with open('ngpus', 'w') as f:
         f.write(str(args.ngpus_per_server))
@@ -107,22 +169,20 @@ if __name__ == "__main__":
     def handler(signum,_):
         global loop_pending
         print('Signal handler called with signal', signum)
-        loop_pending = True
         with open('ngpus','r') as f:
             ngpus_per_server = int(f.read())
         with open('nservers','r') as f:
             nservers = int(f.read())
         if args.ngpus_per_server == ngpus_per_server and args.nservers == nservers:
             return
+        loop_pending = True
         if args.node_rank >= nservers:
             loop_pending = False
         args.ngpus_per_server = ngpus_per_server
         args.nservers = nservers
         for p in processes:
             p.send_signal(signal.SIGUSR1)
-        # send signal to other nodes as well
-        # if args.node_rank == 0:
-        print("\n\n==========================  NUM OF WORKERS CHANGED TO ",args.ngpus_per_server," ===========================\n\n\n")
+        print("\n\n CONFIG CHANGED TO ",args.ngpus_per_server,"GPUS, ",args.nservers, "SERVERS","\n\n\n")
 
     signal.signal(signal.SIGUSR1, handler)
 
@@ -140,72 +200,19 @@ if __name__ == "__main__":
               "your application as needed. \n"
               "*****************************************".format(current_env["OMP_NUM_THREADS"]))
 
-    count = 0
+    loop_count = 0
 
     while True:
         processes = []
         loop_pending = False
-        
-        # world size in terms of number of processes
-        gpus_available = args.ngpus_per_server * args.nservers
-        gpus_per_stage = gpus_available // args.nstages if args.gpus_per_stage == 0 else args.gpus_per_stage
-        dist_world_size = gpus_per_stage * args.nstages
-        unused_gpus = (gpus_available - dist_world_size)
 
-        # uneven data parallelism not supported yet
-        if unused_gpus > args.ngpus_per_server:
-            raise ValueError("Wrong number of servers - too many unused GPUs")
-
+        dist_world_size, stage_to_rank_map_str, ranks_in_server = calculate_config(args)
         current_env["WORLD_SIZE"] = str(dist_world_size)
         print("World size is",dist_world_size)
 
         # uneven data parallelism not supported yet
-        # if dist_world_size % args.nstages != 0:
-        #     raise ValueError("Each stage must get equal number of GPU processes")
-        
-        # print("WARNING: ", str(dist_world_size % args.nstages), "gpus going unused!!")
-    
-        first_rank_in_server = args.node_rank * args.ngpus_per_server
-        if args.node_rank == args.nservers - 1:
-            ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server - unused_gpus)
-        else:
-            ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
-
-        stage_to_rank_map = {}
-        rank_to_stage_map = {}
-
-        for i in range(dist_world_size):
-            stage = i // gpus_per_stage
-            if stage not in stage_to_rank_map:
-                stage_to_rank_map[stage] = []
-            stage_to_rank_map[stage].append(i)
-            rank_to_stage_map[i] = stage
-
-        stage_to_rank_map_str = ""
-        for stage in stage_to_rank_map:
-            ranks = ",".join([str(r) for r in stage_to_rank_map[stage]])
-            stage_to_rank_map_str += (ranks + ";")
-
-        per_gpu_batch_size = args.batch_size // gpus_per_stage
-        per_gpu_micro_batch_size = math.ceil(per_gpu_batch_size / (1.0 * args.chunks))
-        train_batch_size = args.batch_size
-        gradient_accumulation_steps = 1
-        max_gradient_accumulation_steps = per_gpu_micro_batch_size // max_micro_batch_size_per_gpu
-
-        while per_gpu_micro_batch_size > max_micro_batch_size_per_gpu and gradient_accumulation_steps <= max_gradient_accumulation_steps :
-            gradient_accumulation_steps += 1
-            per_gpu_micro_batch_size_ = per_gpu_micro_batch_size // gradient_accumulation_steps 
-            if per_gpu_micro_batch_size_ <= max_micro_batch_size_per_gpu:
-                per_gpu_micro_batch_size = per_gpu_micro_batch_size_
-                train_batch_size = per_gpu_micro_batch_size * args.chunks * gpus_per_stage
-                break
-
-        print("Config:")
-        print("grad acc steps:", gradient_accumulation_steps)
-        print("train batch size:",train_batch_size)
-        print("partitions:", args.nstages)
-        print("data depth:", gpus_per_stage)
-        print("stage to rank map:", stage_to_rank_map_str)
+        if dist_world_size % args.nstages != 0:
+            raise ValueError("Each stage must get equal number of GPU processes")
 
         for rank in ranks_in_server:
             
@@ -223,13 +230,14 @@ if __name__ == "__main__":
             cmd.append("--rank={}".format(rank))
             cmd.append("--local_rank={}".format(local_rank))
             cmd.append("--partitions={}".format(args.nstages))
-            cmd.append("--chunks={}".format(args.chunks * gradient_accumulation_steps))
+            cmd.append("--chunks={}".format(args.chunks))
             cmd.append("--train_batch_size={}".format(args.batch_size))
-            # cmd.append("--gradient_accumulation_steps={}".format(gradient_accumulation_steps))
             cmd.append("--stage_to_rank_map={}".format(stage_to_rank_map_str))
-            if count > 0:
+            if loop_count > 0:
                 cmd.append("--resume")
             cmd.extend(args.training_script_args)
+
+            print("rank",rank, cmd)
 
             process = subprocess.Popen(cmd, env=current_env)
             processes.append(process)
@@ -247,7 +255,7 @@ if __name__ == "__main__":
                 raise subprocess.CalledProcessError(returncode=process.returncode,
                                                     cmd=cmd)
 
-        count += 1
+        loop_count += 1
 
         if not loop_pending:
             print("Finished training!!")

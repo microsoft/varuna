@@ -48,7 +48,7 @@ from tensorboardX import SummaryWriter
 
 from transformers import (BertConfig, BertForQuestionAnswering, BertTokenizer)
 
-from varuna import Varuna
+from varuna import Varuna, load_varuna_checkpoint
 
 from transformers import AdamW
 
@@ -130,7 +130,7 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map, train_state 
         ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     if args.resume:
-        optimizer.load_state_dict(torch.load(os.path.join(blob_store_folder,"opt_state.bin")))
+        optimizer.load_state_dict(torch.load(os.path.join(blob_store_folder,"opt_state.bin"),map_location="cpu"))
         for state in optimizer.state.values():
             for k, v in state.items():
                 if isinstance(v, torch.Tensor):
@@ -345,17 +345,10 @@ def main(args, stage_to_rank_map):
     if args.resume:
         print("Resuming training!!")
         config = BertConfig.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
-        tokenizer = BertTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
-        state_dict = {}
-        stages_per_worker = config.num_hidden_layers // args.partitions
-        pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
-        print(args.rank, "reads", pstages_to_read)
-        for i in pstages_to_read:
-            print(args.rank,  i)
-            state_dict_ = torch.load(os.path.join(blob_store_folder, "cp-pstage-{}".format(i)))
-            state_dict.update(state_dict_)
+        tokenizer = BertTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)        
+        state_dict = load_varuna_checkpoint(my_stage, args.partitions, config.num_hidden_layers, blob_store_folder)
         model = BertForQuestionAnswering.from_pretrained(None, state_dict=state_dict, config=config)
-        train_state = torch.load(os.path.join(blob_store_folder,"train_state.bin") )
+        train_state = torch.load(os.path.join(blob_store_folder,"train_state.bin"), map_location="cpu" )
     else:
         if args.local_rank != 0:
             torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
@@ -372,7 +365,6 @@ def main(args, stage_to_rank_map):
 
     # Training
     train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False)
-
     global_step, tr_loss = train(args, train_dataset, model, tokenizer, stage_to_rank_map, train_state)
 
     total_terminate_time = time.time() - total_terminate_time

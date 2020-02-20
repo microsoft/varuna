@@ -160,7 +160,6 @@ class Varuna(Module):
         # and Varuna can take care of input dataloader explicitly
         pipeline = Pipeline(batches, self.model, self.config, self.schedule, self.optimizer)
         loss = pipeline.run()
-        del batches, pipeline
         return loss
     
     def eval(self):
@@ -455,12 +454,6 @@ class Pipeline:
             self.acts_recieve_thread.join()
         if self.grads_recieve_thread is not None:
             self.grads_recieve_thread.join()
-
-        # can we do this ????
-        # del self.grads_send_queue, self.acts_send_queue, self.acts_queue, self.grads_queue, self.recompute_queue
-        # self.grads_send_queue = self.acts_send_queue = self.acts_queue = self.grads_queue = self.recompute_queue = None
-        # self.model.set_send_fn(None)
-        # self.model.set_recv_fn(None)
 
         if self.acts_send_thread is not None:
             self.acts_send_thread.join()
