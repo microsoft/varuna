@@ -4,8 +4,14 @@ runs/
 varuna/genschedule
 genschedule
 n_stages
+ngpus
+nservers
 training_output
 train_reports
+ssh_out*
+parent_process
+args
+ssh_err*
 
 # Byte-compiled / optimized / DLL files
 *__pycache__/
