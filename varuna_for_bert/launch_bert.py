@@ -38,22 +38,25 @@ def calculate_config(args):
         ranks = ",".join([str(r) for r in stage_to_rank_map[stage]])
         stage_to_rank_map_str += (ranks + ";")
 
+    # batch size should be divisible by num of data parallel workers
     per_gpu_batch_size = args.batch_size // gpus_per_stage
-    per_gpu_micro_batch_size = math.ceil(per_gpu_batch_size / (1.0 * args.chunks))
-    gradient_accumulation_steps = 1
-    max_gradient_accumulation_steps = per_gpu_micro_batch_size // max_micro_batch_size_per_gpu
+    args.batch_size = per_gpu_batch_size * gpus_per_stage
+    
+    # per_gpu_micro_batch_size = math.ceil(per_gpu_batch_size / (1.0 * args.chunks))
+    # gradient_accumulation_steps = 1
+    # max_gradient_accumulation_steps = per_gpu_micro_batch_size // max_micro_batch_size_per_gpu
 
-    # shouldn't ceil(max_grad_acc_steps) just be the actual one we use??
-    while per_gpu_micro_batch_size > max_micro_batch_size_per_gpu and gradient_accumulation_steps <= max_gradient_accumulation_steps :
-        gradient_accumulation_steps += 1
-        per_gpu_micro_batch_size_ = per_gpu_micro_batch_size // gradient_accumulation_steps 
-        if per_gpu_micro_batch_size_ <= max_micro_batch_size_per_gpu:
-            per_gpu_micro_batch_size = per_gpu_micro_batch_size_
-            break
+    # # shouldn't ceil(max_grad_acc_steps) just be the actual one we use??
+    # while per_gpu_micro_batch_size > max_micro_batch_size_per_gpu and gradient_accumulation_steps <= max_gradient_accumulation_steps :
+    #     gradient_accumulation_steps += 1
+    #     per_gpu_micro_batch_size_ = per_gpu_micro_batch_size // gradient_accumulation_steps 
+    #     if per_gpu_micro_batch_size_ <= max_micro_batch_size_per_gpu:
+    #         per_gpu_micro_batch_size = per_gpu_micro_batch_size_
+    #         break
 
-    # for pipelining, we don't really need gradient accumalation steps - just increase the number of chunks
-    # we want to keep the micro BS same
-    args.chunks = args.chunks * gradient_accumulation_steps
+    # # for pipelining, we don't really need gradient accumalation steps - just increase the number of chunks
+    # # we want to keep the micro BS same
+    # args.chunks = args.chunks * gradient_accumulation_steps
 
     first_rank_in_server = args.node_rank * args.ngpus_per_server
     if args.node_rank == args.nservers - 1:
@@ -64,7 +67,7 @@ def calculate_config(args):
     print("Config:")
     print("train batch size:",args.batch_size)
     print("partitions:", args.nstages)
-    print("chunks:", args.chunks)
+    print("chunk_size:", args.chunk_size)
     print("data depth:", gpus_per_stage)
     print("stage to rank map:", stage_to_rank_map_str)
 
@@ -108,8 +111,8 @@ def parse_args():
     parser.add_argument("--batch_size", required=True, type=int,
                         help="Total effective batch size required")
 
-    parser.add_argument("--chunks", required=True, type=int,
-                        help="Number of micro-batches per mini-batch")
+    parser.add_argument("--chunk_size", type=int, default=-1,
+                        help="Micro-batch size per mini-batch")
 
     # need a better way to pass this information ?
     parser.add_argument("--total_num_stages", required=True, type=int,
@@ -159,6 +162,10 @@ if __name__ == "__main__":
 
     if max_micro_batch_size_per_gpu <= 0:
         raise ValueError("No micro-batch can fit for the model! Calculated max micro BS per gpu is " + str(max_micro_batch_size_per_gpu))
+
+    # for max GPU util
+    if args.chunk_size == -1:
+        args.chunk_size = max_micro_batch_size_per_gpu
 
     with open('ngpus', 'w') as f:
         f.write(str(args.ngpus_per_server))
@@ -230,7 +237,7 @@ if __name__ == "__main__":
             cmd.append("--rank={}".format(rank))
             cmd.append("--local_rank={}".format(local_rank))
             cmd.append("--partitions={}".format(args.nstages))
-            cmd.append("--chunks={}".format(args.chunks))
+            cmd.append("--chunk_size={}".format(args.chunk_size))
             cmd.append("--train_batch_size={}".format(args.batch_size))
             cmd.append("--stage_to_rank_map={}".format(stage_to_rank_map_str))
             if loop_count > 0:
