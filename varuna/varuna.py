@@ -6,8 +6,10 @@ from torch.multiprocessing import Process
 from queue import Queue
 from threading import Thread
 import math
+from apex import amp
 
 from .partitioned_model import PartitionedModel
+import gc
 
 import os
 import sys
@@ -31,7 +33,8 @@ class Varuna(Module):
                 optimizer,
                 chunk_size,
                 fp16 = False, 
-                local_rank=-1):
+                local_rank=-1,
+                device=-1):
         super().__init__()
 
         self.partitions = len(stage_to_rank_map)
@@ -52,19 +55,17 @@ class Varuna(Module):
         if self.stage == -1:
             raise ValueError("Rank " + str(self.rank) + " not found in stage to rank map!")
 
-        torch.cuda.set_device(self.local_rank)
-        self.device = torch.device("cuda", self.local_rank)
+        if device == -1:
+            device = self.local_rank
+        torch.cuda.set_device(device)
+        self.device = torch.device("cuda", device)
 
         self.optimizer = optimizer
         self.fp16 = fp16
 
-        if self.fp16:
-            from apex import amp
-
-        
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
-        self.model = PartitionedModel(model, self.rank, self.local_rank, self.local_rank, self.stage_to_rank_map)
-        self.model.initialize( dummy_inputs, from_cache=True )
+        self.model = PartitionedModel(model, self.rank, self.local_rank, device, self.stage_to_rank_map, self.fp16)
+        self.model.initialize( dummy_inputs, from_cache=False )
 
         # assert(batch_size % data_depth == 0, "Batch size not divisible by data parallel depth!")
         self.batch_size = batch_size // data_depth
@@ -87,16 +88,20 @@ class Varuna(Module):
             "device": self.device,
             "data_parallel": bool(len(self.stage_to_rank_map[self.stage]) > 1),
             "last_chunk_size": self.last_chunk_size,
+            "embedding_recv_rank": self.embedding_recv_rank,
+            "embedding_send_rank": self.embedding_send_rank
         }
 
         self.schedule = self.generate_schedule()
 
     def init_communication(self, rank_within_stage):
-        # communication only functional for even data parallelism
         
-        # per_gpu_batch_size = self.micro_batch_size
-        # self.start = rank_within_stage * per_gpu_batch_size
-        # self.end = self.start + per_gpu_batch_size - 1
+        self.embedding_recv_rank = None
+        self.embedding_send_rank = None
+        if self.stage == 0:
+            self.embedding_recv_rank = self.stage_to_rank_map[self.partitions-1][rank_within_stage]
+        if self.stage == self.partitions - 1:
+            self.embedding_send_rank = self.stage_to_rank_map[0][rank_within_stage]
 
         self.send_rank = None; self.recieve_rank = None
 
@@ -153,8 +158,8 @@ class Varuna(Module):
     def zero_grad(self):
         self.model.zero_grad()
     
-    def checkpoint(self, cpname):
-        self.model.checkpoint(cpname)
+    def checkpoint(self, cp_dir_name):
+        return self.model.checkpoint(cp_dir_name)
 
     def to(self, device):
         self.model.to(device)
@@ -174,20 +179,22 @@ class Varuna(Module):
         return schedule
                 
 
-def save_rng_states():
+def save_rng_states(device):
     """capture current CPU, GPU random number generator states to reuse while recomputing activations
     in order to ensure Referential Transparency
     """
     cpu_rng_state = torch.get_rng_state()
 
     gpu_rng_states: Optional[ByteTensor]
-    gpu_rng_states = torch.cuda.get_rng_state_all() 
+    # gpu_rng_states = torch.cuda.get_rng_state_all() 
+    gpu_rng_states = torch.cuda.get_rng_state(device)
     return (cpu_rng_state, gpu_rng_states)
 
-def restore_rng_states(rng_states):
+def restore_rng_states(rng_states, device):
     cpu_rng_state, gpu_rng_states = rng_states
     torch.set_rng_state(cpu_rng_state)
-    torch.cuda.set_rng_state_all(gpu_rng_states)        # todo: verify correctness;   batchNorm, dropouts, convlayers?
+    # torch.cuda.set_rng_state_all(gpu_rng_states)        # todo: verify correctness;   batchNorm, dropouts, convlayers?
+    torch.cuda.set_rng_state(gpu_rng_states, device)
 
 
 class Pipeline:
@@ -203,6 +210,31 @@ class Pipeline:
         self.device = config["device"]
         self.world_size = self.partitions
         self.schedule = schedule
+        # print(self.schedule)
+
+        # print(self.model)
+        # if (self.world_size>1):
+        #     if (self.stage == 0):
+        #         # print('fp16 module = ', self.model)
+        #         dist.send(self.model.module.bert.embeddings.word_embeddings.weight.cpu(), self.world_size-1)
+        #     elif (self.stage == self.world_size-1):
+        #         encoder_weights = torch.FloatTensor(self.model.module.cls.predictions.decoder.weight.size()).half()
+        #         dist.recv(encoder_weights, 0)
+        #         # mask = torch.ones(encoder_weights.size()).byte().to(self.device)
+        #         # self.model.module.model.cls.predictions.decoder.weight = self.model.module.model.cls.predictions.decoder.weight.masked_scatter(mask, encoder_weights.to(self.device))
+        #         self.model.module.cls.predictions.decoder.weight = torch.nn.Parameter(encoder_weights.to(self.device))
+
+        baseModule = self.model.module if not self.data_parallel else self.model.module.module
+
+        if self.partitions > 1:
+            if self.stage == self.partitions - 1:
+                dist.send(baseModule.cls.predictions.decoder.weight.cpu(), config["embedding_send_rank"])
+            elif self.stage == 0:
+                decoder_weights = torch.FloatTensor(baseModule.bert.embeddings.word_embeddings.weight.size())#.half()
+                dist.recv(decoder_weights, config["embedding_recv_rank"])
+                baseModule.bert.embeddings.word_embeddings.weight = torch.nn.Parameter(decoder_weights.to(self.device))
+
+
         self.fwd_inp_shape = config["fwd_inp_shape"]
         self.bwd_grad_shape = config["bwd_grad_shape"]
         
@@ -231,8 +263,6 @@ class Pipeline:
         self.loss = None
         self.average_loss = 0
 
-        # print(self.stage, "with schedule:", self.schedule)
-
     def spawn_recieve_workers(self):
         if self.stage > 0:
             self.acts_recieve_thread = Thread(target=self.acts_reciever, args=())
@@ -257,13 +287,14 @@ class Pipeline:
     
     def acts_reciever(self):
         chunks = len(self.batches)
+        dtype = torch.float16 if self.fp16 else torch.float32
         for task,index in self.schedule:
             if task == 0:
                 fwd_inp_shape = self.fwd_inp_shape
                 if index == (chunks-1) and self.last_chunk_size > 0:
                     fwd_inp_shape = list(self.fwd_inp_shape)
                     fwd_inp_shape[0] = self.last_chunk_size
-                acts_tensor = torch.ones(fwd_inp_shape, dtype=torch.float32)
+                acts_tensor = torch.ones(fwd_inp_shape, dtype=dtype)
                 # print("stage", self.stage, "expecting acts of shape", fwd_inp_shape)
                 handle = dist.irecv(acts_tensor, src=self.recieve_rank)
                 handle.wait()
@@ -272,13 +303,14 @@ class Pipeline:
     
     def grads_reciever(self):
         chunks = len(self.batches)
+        dtype = torch.float16 if self.fp16 else torch.float32
         for task,index in self.schedule:
             if task == 2:
                 bwd_grad_shape = self.bwd_grad_shape
                 if index == (chunks-1) and self.last_chunk_size > 0:
                     bwd_grad_shape = list(self.bwd_grad_shape)
                     bwd_grad_shape[0] = self.last_chunk_size
-                grads_tensor = torch.ones(bwd_grad_shape, dtype=torch.float32)
+                grads_tensor = torch.ones(bwd_grad_shape, dtype=dtype)
                 # print("stage", self.stage, "expecting grads of shape", bwd_grad_shape)
                 handle = dist.irecv(grads_tensor, src=self.send_rank)
                 handle.wait()
@@ -311,7 +343,6 @@ class Pipeline:
             del input_grads, handle
             count -= 1
         
-    
     # tells the model where to send acts and gradients
     def set_model_send_fn(self, recompute = False):
         def send(tensor, grads = False):
@@ -328,7 +359,7 @@ class Pipeline:
         if self.stage > 0:
             if recompute:
                 ctx, acts = self.recompute_queue.get()
-                restore_rng_states(ctx)
+                restore_rng_states(ctx, self.device)
             else:
                 acts = self.acts_queue.get()
         else:
@@ -357,7 +388,7 @@ class Pipeline:
 
             if grad_mode == False and self.stage > 0:
                 # if these acts are going to be recomputed
-                rng_states = save_rng_states()
+                rng_states = save_rng_states(self.device)
                 ctx = (rng_states, acts)
                 self.recompute_queue.put(ctx)
             else:
@@ -365,7 +396,6 @@ class Pipeline:
                 self.loss = output[0] if isinstance(output,tuple) else output
 
             
-        
         elif task == 1:
             torch.set_grad_enabled(True)
 
@@ -377,13 +407,14 @@ class Pipeline:
         
         else:
             if self.stage != world_size-1:
+                grads = torch.ones(self.loss.size(), dtype = torch.float32).to(self.device)
                 if self.fp16:
-                    with amp.scale_loss(self.loss, self.optimizer) as scaled_loss:
+                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=True) as scaled_loss:
                         scaled_loss.backward(grads)
+                    # self.optimizer.backward(self.loss, grads=grads)
+                    # self.loss.backward(grads)
                 else:
-                    grads = torch.ones(self.loss.size()).to(self.device)
                     self.loss.backward(grads)
-                    del grads
 
             else:
                 chunks = len(self.batches)
@@ -391,8 +422,9 @@ class Pipeline:
                 self.average_loss += self.loss.item()
 
                 if self.fp16:
-                    with amp.scale_loss(self.loss, self.optimizer) as scaled_loss:
+                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=True) as scaled_loss:
                         scaled_loss.backward()
+                    # self.optimizer.backward(self.loss)
                 else:
                     self.loss.backward()
 
@@ -427,9 +459,7 @@ class Pipeline:
             self.grads_send_thread.join()
 
         # return loss
-        if self.stage == self.world_size - 1:
-            return self.average_loss
-        return 0
+        return self.average_loss
 
 def scatter(input, chunk_size):
     """

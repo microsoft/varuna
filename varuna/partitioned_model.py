@@ -24,6 +24,7 @@ class CutPoint(Module):
         self.device = None
         self.send_fn = self.recv_fn = None
         self.stage = -1
+        self.fp16 = False
 
 
     def forward(self, *inputs, **kwargs):
@@ -32,7 +33,8 @@ class CutPoint(Module):
             return inputs[0]
 
         if len(inputs) < 0 or (len(inputs) == 1 and inputs[0] is None):
-            inputs = (torch.tensor([-1.0],requires_grad = True).to(self.device),)
+            dtype = torch.float16 if self.fp16 else torch.float32
+            inputs = (torch.tensor([-1.0],requires_grad = True, dtype=dtype).to(self.device),)
 
         if isinstance(self.cp_func, torch.autograd.Function):
             out = self.cp_func.apply(*inputs, **kwargs)            
@@ -75,7 +77,7 @@ class CutPoint(Module):
 
 class PartitionedModel(Module):
 
-    def __init__(self, module, rank, local_rank, device, stage_to_rank_map):
+    def __init__(self, module, rank, local_rank, device, stage_to_rank_map, fp16):
         super(PartitionedModel, self).__init__()
         self.module = module
         self.is_data_parallel = False
@@ -83,9 +85,10 @@ class PartitionedModel(Module):
         self.stage_to_rank_map = stage_to_rank_map
         self.rank = rank
         self.local_rank = local_rank
+        self.fp16 = fp16
         
-        torch.cuda.set_device(self.local_rank)
-        self.device = torch.device("cuda", self.local_rank)
+        torch.cuda.set_device(device)
+        self.device = torch.device("cuda", device)
 
         self.ret_val = None
         self.pre_cp = None
@@ -109,10 +112,9 @@ class PartitionedModel(Module):
         self.model_pruned = True
 
     def mark_distributed(self, process_group):
-        self.module = torch.nn.parallel.DistributedDataParallel(self.module, process_group=process_group, device_ids=[self.local_rank], find_unused_parameters=True)
+        self.module = torch.nn.parallel.DistributedDataParallel(self.module, process_group=process_group, device_ids=[self.device], find_unused_parameters=True)
         self.is_data_parallel = True
 
-    
     def dry_run(self, dummy_inputs, from_cache):
         # """ executes the forward pass of the module on dummy inputs. Sets the order in which modules are used and the total number of cutpoints declared. """
         self.ordered_modules = OrderedDict()
@@ -178,6 +180,7 @@ class PartitionedModel(Module):
             cutpoint.set_ret_val_func = self.set_ret_val
             cutpoint.stage = self.stage
             cutpoint.device = self.device
+            cutpoint.fp16 = self.fp16
             cutpoint.set_cp_func()
 
         self.cuts_per_stage = (self.num_cutpoints + 1) // self.num_stages
