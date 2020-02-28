@@ -18,13 +18,13 @@ class CutPoint(Module):
         super(CutPoint, self).__init__()
         # start with 1 and end before last stage (total num_stages - 1 )
         self.cp_index = -1
-        self.num_stages = -1
-
         self.cp_func = None
         
         self.set_ret_val_func = None
         self.device = None
         self.send_fn = self.recv_fn = None
+        self.stage = -1
+        self.fp16 = False
 
 
     def forward(self, *inputs, **kwargs):
@@ -33,7 +33,8 @@ class CutPoint(Module):
             return inputs[0]
 
         if len(inputs) < 0 or (len(inputs) == 1 and inputs[0] is None):
-            inputs = (torch.tensor([-1.0],requires_grad = True).to(self.device),)
+            dtype = torch.float16 if self.fp16 else torch.float32
+            inputs = (torch.tensor([-1.0],requires_grad = True, dtype=dtype).to(self.device),)
 
         if isinstance(self.cp_func, torch.autograd.Function):
             out = self.cp_func.apply(*inputs, **kwargs)            
@@ -52,23 +53,21 @@ class CutPoint(Module):
 
             @staticmethod
             def forward(ctx, i):
-                if is_in_next_stage:
-                    # receive inputs.
-                    inputs = self.recv_fn()
-                    return inputs
+                # recieve activations
+                if is_in_next_stage and self.recv_fn is not None:
+                    i = self.recv_fn()
+                # send activations
                 elif is_in_prev_stage:
-                    # send activations
                     self.send_fn(i)
                 return i
 
             @staticmethod
             def backward(ctx, grad_output):
-                if is_in_prev_stage:
-                    # receive gradients.
-                    gradients = self.recv_fn(grads = True)
-                    return gradients
+                # receive gradients.
+                if is_in_prev_stage and self.recv_fn is not None:
+                    grad_output = self.recv_fn(grads = True)
+                # send gradients
                 elif is_in_next_stage:
-                    # send gradients
                     self.send_fn(grad_output, grads = True)
                 return grad_output
         
@@ -78,17 +77,18 @@ class CutPoint(Module):
 
 class PartitionedModel(Module):
 
-    def __init__(self, module, rank, local_rank, device, stage_to_rank_map):
+    def __init__(self, module, rank, local_rank, device, stage_to_rank_map, fp16):
         super(PartitionedModel, self).__init__()
-        # print("Got device", device,"!!")
         self.module = module
+        self.is_data_parallel = False
         self.num_stages = len(stage_to_rank_map)
         self.stage_to_rank_map = stage_to_rank_map
         self.rank = rank
         self.local_rank = local_rank
+        self.fp16 = fp16
         
-        torch.cuda.set_device(self.local_rank)
-        self.device = torch.device("cuda", self.local_rank)
+        torch.cuda.set_device(device)
+        self.device = torch.device("cuda", device)
 
         self.ret_val = None
         self.pre_cp = None
@@ -102,22 +102,26 @@ class PartitionedModel(Module):
         else:
             raise ValueError("Rank " + self.rank + " not found in stage to rank map!")
 
-    def initialize(self, dummy_inputs):
+    def initialize(self, dummy_inputs, from_cache=False):
         # print("Initializing partitioned model!")
         start = time.time()
-        self.dry_run(dummy_inputs)
+        self.dry_run(dummy_inputs, from_cache)
         print("dry run time", time.time() - start)
         self.prep_cutpoints()
         self.remove_unused_parameters()
         self.model_pruned = True
-    
-    def dry_run(self, dummy_inputs):
+
+    def mark_distributed(self, process_group):
+        self.module = torch.nn.parallel.DistributedDataParallel(self.module, process_group=process_group, device_ids=[self.device], find_unused_parameters=True)
+        self.is_data_parallel = True
+
+    def dry_run(self, dummy_inputs, from_cache):
         # """ executes the forward pass of the module on dummy inputs. Sets the order in which modules are used and the total number of cutpoints declared. """
         self.ordered_modules = OrderedDict()
         self.input_shapes = {}
         self.num_cutpoints = 0
 
-        if self.local_rank == 0 and not (os.path.exists("_tmp_ord_mod") and os.path.exists("_tmp_inp_shapes")):
+        if self.local_rank == 0 and not (from_cache and os.path.exists("_tmp_ord_mod") and os.path.exists("_tmp_inp_shapes")):
             # store input shapes for each module (or atleast each cp)
             print("Initializing partitioned model!")
 
@@ -146,7 +150,7 @@ class PartitionedModel(Module):
 
             # actually just need the order as a list of names
             with open("_tmp_ord_mod",'wb') as f:
-                pickle.dump(self.ordered_modules,f)
+                pickle.dump(list(self.ordered_modules.keys()),f)
             with open("_tmp_inp_shapes",'wb') as f:
                 pickle.dump(self.input_shapes,f)
             dist.barrier()
@@ -176,6 +180,7 @@ class PartitionedModel(Module):
             cutpoint.set_ret_val_func = self.set_ret_val
             cutpoint.stage = self.stage
             cutpoint.device = self.device
+            cutpoint.fp16 = self.fp16
             cutpoint.set_cp_func()
 
         self.cuts_per_stage = (self.num_cutpoints + 1) // self.num_stages
@@ -232,8 +237,6 @@ class PartitionedModel(Module):
                     used_modules.append(name)
                 is_used[name] = add_flag
 
-        # print(self.rank, "uses", len(used_modules), "out of", len(self.ordered_modules))
-
         # any module that is used or has children that are used are needed
         for u in used_modules:
             path = u.split(".")
@@ -250,38 +253,63 @@ class PartitionedModel(Module):
                     modules = modules[path[i]]._modules
                 modules[path[-1]] = None
                 modules[path[-1]] = PassThroughModule()
-                self.ordered_modules[path[-1]] = None
+                self.ordered_modules[m] = None
 
         self.model_pruned = True
 
-    def checkpoint(self, checkpoint_name = "model-checkpoint"):
-        if self.rank != 0:
-            file_name = cp_partition_prefix + "-" + str(self.rank)
-            torch.save(self.module.state_dict(), file_name)
-            os.system("sudo mv " +  file_name + " " + os.path.join(blob_store_folder, file_name))
-            torch.distributed.barrier()
-        else:
-            torch.distributed.barrier()
-            complete_state_dict = self.module.state_dict()
+    """For each partition/stage, the first rank in that stage saves state_dict 
+    of the cutpoints used by that stage to a common store. So checkpoint is sharded 
+    along cutpoints (as many checkpoint files as cutpoints)"""
+    def checkpoint(self, checkpoint_dir = "model-checkpoint"):
+        # only 1 rank per stage for data ||
+        if self.rank != self.stage_to_rank_map[self.stage][0]:
+            return
+        
+        # we only want to checkpoint leaf modules (For ex. bert.embedding.weight and not bert.embeddings)
+        leaf_modules = {}
+        non_leaf_modules = {}
 
-            # gather and read all local pickles to form combined state_dicts
-            for i in range(self.num_stages):
-                for rank in self.stage_to_rank_map[i]:
-                    if rank == 0:
-                        continue
-                    file_name = cp_partition_prefix + "-" + str(rank)
-                    os.system("sudo mv " + os.path.join(blob_store_folder, file_name) + " " + file_name)
-                    state_dict = torch.load(file_name)
-                    for key in state_dict:
-                        if key not in complete_state_dict or complete_state_dict[key] is None:
-                            complete_state_dict[key] = state_dict[key]
-                    os.system("sudo rm " + file_name)
+        # this assumes that a non-leaf module is added after all it's descendants to the order (which is true so far)
+        for m in self.ordered_modules:
+            if (m not in leaf_modules) and (m not in non_leaf_modules):
+                leaf_modules[m] = True
+                # mark all ancestors as non-leaf
+                path = m.split(".")
+                key = path[0]
+                for i in range(1,len(path)):
+                    non_leaf_modules[key] = True
+                    key = key + "." + path[i]
 
-            # for key in complete_state_dict:
-            #     print(key)
+        modules = list(leaf_modules.keys())
 
-            torch.save(complete_state_dict, checkpoint_name)
-            print("checkpointed!!")
+        stage_index = 0
+        state_dict = {}
+        cp_count = 0
+
+        for name in modules:
+            module = self.ordered_modules[name]
+            if name == "" or module is None:
+                continue
+            if isinstance(module, CutPoint):
+                if len(state_dict.keys()) > 0:
+                    torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
+                    cp_count += 1
+                if cp_count >= self.cuts_per_stage:
+                    break
+                stage_index += 1
+                state_dict = {}
+            else:
+                module_state_dict = module.state_dict()
+                module_state_dict_ = OrderedDict()
+                for key, val in module_state_dict.items():
+                    module_state_dict_[name + "." + key] = val
+                state_dict.update(module_state_dict_)
+
+        # last cutpoint
+        if len(state_dict.keys()) > 0 and (cp_count < self.cuts_per_stage):
+            torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
+
+        print("checkpointed!!")
 
     def set_ret_val(self, val):
         self.ret_val = val
@@ -304,15 +332,13 @@ class PartitionedModel(Module):
     
         try:
             calc_val = self.module(*inputs, **kwargs)
-            ret_val = self.ret_val
+            ret_val = self.ret_val if self.ret_val is not None else calc_val
         except Exception as e:
             if self.ret_val is None:
                 raise e
             ret_val = self.ret_val
 
         self.ret_val = None
-        if ret_val is None:
-            return calc_val
         return ret_val 
 
 
@@ -323,3 +349,14 @@ class PassThroughModule(Module):
 
     def forward(self,*args,**kwargs):
         return None
+
+
+def load_varuna_checkpoint(my_stage, num_stages, total_num_pstages, common_store):
+    state_dict = {}
+    stages_per_worker = total_num_pstages // num_stages
+    pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
+    print(dist.get_rank(),"rank with stage", my_stage, "reads", pstages_to_read)
+    for i in pstages_to_read:
+        state_dict_ = torch.load(os.path.join(common_store, "cp-pstage-{}".format(i)),map_location="cpu")
+        state_dict.update(state_dict_)
+    return state_dict

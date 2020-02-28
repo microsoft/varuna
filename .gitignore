@@ -3,8 +3,15 @@ _tmp_ord_mod
 runs/
 varuna/genschedule
 genschedule
-training_output/
 n_stages
+ngpus
+nservers
+training_output
+train_reports
+ssh_out*
+parent_process
+args
+ssh_err*
 
 # Byte-compiled / optimized / DLL files
 *__pycache__/
