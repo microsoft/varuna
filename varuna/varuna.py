@@ -10,6 +10,7 @@ from apex import amp
 
 from .partitioned_model import PartitionedModel
 import gc
+# from hashlib import sha1
 
 import os
 import sys
@@ -356,14 +357,16 @@ class Pipeline:
 
     # tells the model how to recieve acts and gradients
     def set_model_recv_fn(self, recompute = False):
-        if self.stage > 0:
-            if recompute:
-                ctx, acts = self.recompute_queue.get()
-                restore_rng_states(ctx, self.device)
-            else:
-                acts = self.acts_queue.get()
+        if recompute:
+            ctx, acts = self.recompute_queue.get()
+            restore_rng_states(ctx, self.device)
+
+            # cpu_rng_state = torch.get_rng_state()
+            # gpu_rng_states: Optional[ByteTensor]
+            # gpu_rng_states = torch.cuda.get_rng_state(self.device)
+            # print('recompute: srngs: cpu = ', sha1(cpu_rng_state.cpu().numpy()).hexdigest(), '  gpu = ', sha1(gpu_rng_states.cpu().numpy()).hexdigest())
         else:
-            acts = None
+            acts = self.acts_queue.get() if self.stage > 0 else None
 
         def recv(grads = False):
             if grads:
@@ -382,13 +385,16 @@ class Pipeline:
         if task == 0:       
             torch.set_grad_enabled(grad_mode)
 
+            rng_states=None
+            if grad_mode == False:
+                # if these acts are going to be recomputed
+                rng_states = save_rng_states(self.device)
+
             self.set_model_send_fn(recompute = False)
             acts = self.set_model_recv_fn(recompute = False)
             output = self.model(**inputs_as_dict)
 
-            if grad_mode == False and self.stage > 0:
-                # if these acts are going to be recomputed
-                rng_states = save_rng_states(self.device)
+            if grad_mode == False:
                 ctx = (rng_states, acts)
                 self.recompute_queue.put(ctx)
             else:
@@ -422,7 +428,7 @@ class Pipeline:
                 self.average_loss += self.loss.item()
 
                 if self.fp16:
-                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=True) as scaled_loss:
+                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False) as scaled_loss:
                         scaled_loss.backward()
                     # self.optimizer.backward(self.loss)
                 else:
