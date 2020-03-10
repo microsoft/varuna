@@ -67,6 +67,7 @@ class Varuna(Module):
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
         self.model = PartitionedModel(model, self.rank, self.local_rank, device, self.stage_to_rank_map, self.fp16)
         self.model.initialize( dummy_inputs, from_cache=False )
+        self.partitioned_model = self.model
 
         # assert(batch_size % data_depth == 0, "Batch size not divisible by data parallel depth!")
         self.batch_size = batch_size // data_depth
@@ -136,7 +137,8 @@ class Varuna(Module):
                 process_groups[stage] = None
 
         if process_groups[self.stage] is not None:
-            self.model.mark_distributed(process_groups[self.stage])
+            self.partitioned_model = self.model
+            self.model = torch.nn.parallel.DistributedDataParallel(self.model, process_group=process_groups[self.stage], device_ids=[self.device], find_unused_parameters=True)    
     
     def forward(self, inputs):        
         # Divide a mini-batch into micro-batches.
@@ -160,7 +162,7 @@ class Varuna(Module):
         self.model.zero_grad()
     
     def checkpoint(self, cp_dir_name):
-        return self.model.checkpoint(cp_dir_name)
+        return self.partitioned_model.checkpoint(cp_dir_name)
 
     def to(self, device):
         self.model.to(device)
@@ -208,6 +210,7 @@ class Pipeline:
         self.data_parallel = config["data_parallel"]
 
         self.model = model
+        self.partitioned_model = self.model.module if self.data_parallel else self.model
         self.device = config["device"]
         self.world_size = self.partitions
         self.schedule = schedule
@@ -353,7 +356,7 @@ class Pipeline:
                 if not recompute:
                     self.acts_send_queue.put(tensor)
         
-        self.model.set_send_fn(send)
+        self.partitioned_model.set_send_fn(send)
 
     # tells the model how to recieve acts and gradients
     def set_model_recv_fn(self, recompute = False):
@@ -374,7 +377,7 @@ class Pipeline:
             else:
                 return acts
         
-        self.model.set_recv_fn(recv)
+        self.partitioned_model.set_recv_fn(recv)
         # because there's no peek/front method for these queues
         return acts
 
@@ -404,7 +407,6 @@ class Pipeline:
             
         elif task == 1:
             torch.set_grad_enabled(True)
-
             self.set_model_send_fn(recompute = True)
             self.set_model_recv_fn(recompute = True)
             output = self.model(**inputs_as_dict)
@@ -447,9 +449,9 @@ class Pipeline:
                     # if next task in schedule is backward  -- no recomputation
                     grad_mode=True
 
-            # For data parallel, sync only when doing last microbatch backward
+            # For data parallel, sync only when doing last microbatch fwd/bwd
             if self.data_parallel and task[1] < (len(self.batches) - 1):
-                with self.model.module.no_sync():
+                with self.model.no_sync():
                     self.worker(task[0], grad_mode, self.batches[task[1]])
             else:
                 self.worker(task[0], grad_mode, self.batches[task[1]])
