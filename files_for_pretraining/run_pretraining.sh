@@ -42,10 +42,10 @@ DATASET=hdf5_lower_case_1_seq_len_128_max_pred_20_masked_lm_prob_0.15_random_see
 BERT_PREP_WORKING_DIR='/data/PyTorch/LanguageModeling/BERT/data'
 DATA_DIR_PHASE1=${22:-$BERT_PREP_WORKING_DIR/${DATASET}/}
 BERT_CONFIG=bert_config.json
-CODEDIR=${24:-"/data/PyTorch/LanguageModeling/BERT"}
+CODEDIR=${24:-"/data/PyTorch/LanguageModeling/BERT/Varuna/files_for_pretraining"}
 init_checkpoint=${25:-"None"}
 RESULTS_DIR=$CODEDIR/results
-CHECKPOINTS_DIR=$RESULTS_DIR/checkpoints_fp16_varuna_lamb_lsuopmb
+CHECKPOINTS_DIR=$RESULTS_DIR/checkpoints_fp16_varuna_lamb_debug
 mkdir -p $CHECKPOINTS_DIR
 
 

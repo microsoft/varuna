@@ -12,6 +12,7 @@ from .partitioned_model import PartitionedModel
 
 import os
 import sys
+print("hello")
 
 Module = nn.Module
 
@@ -483,17 +484,7 @@ class Pipeline:
                 with self.model.module.no_sync():
                     loss = self.worker(task[0], grad_mode, self.batches[task[1]], task[1]==len(self.batches)-1)
             else:
-                self.worker(task[0], grad_mode, self.batches[task[1]])
-        
-        if self.acts_recieve_thread is not None:
-            self.acts_recieve_thread.join()
-        if self.grads_recieve_thread is not None:
-            self.grads_recieve_thread.join()
-
-        if self.acts_send_thread is not None:
-            self.acts_send_thread.join()
-        if self.grads_send_thread is not None:
-            self.grads_send_thread.join()
+                self.worker(task[0], grad_mode, self.batches[task[1]], task[1]==len(self.batches)-1)
 
         # return self.loss     # for run_squad.py: printing the loss just for the last step
         if self.stage == self.world_size - 1:

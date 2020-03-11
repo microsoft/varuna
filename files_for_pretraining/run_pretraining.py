@@ -453,7 +453,7 @@ def main():
     torch.manual_seed(args.seed)
 
     if (args.local_rank == args.partitions-1):
-        loss_file = open('stats/pretraining/varuna_fp16_lamb_lsuopmb_'+str(args.train_batch_size)+'_'+str(args.partitions)+'p_'+str(args.chunks)+'c_'+str(args.gradient_accumulation_steps)+'gas.txt', 'w')
+        loss_file = open('stats/pretraining/varuna_fp16_lamb_debug_'+str(args.train_batch_size)+'_'+str(args.partitions)+'p_'+str(args.chunks)+'c_'+str(args.gradient_accumulation_steps)+'gas.txt', 'w')
 
     device, args = setup_training(args)
 
