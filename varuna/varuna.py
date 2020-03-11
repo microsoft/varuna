@@ -6,6 +6,7 @@ from torch.multiprocessing import Process
 from queue import Queue
 from threading import Thread
 import math
+from apex import amp
 
 from .partitioned_model import PartitionedModel
 
@@ -57,13 +58,9 @@ class Varuna(Module):
 
         self.optimizer = optimizer
         self.fp16 = fp16
-
-        if self.fp16:
-            from apex import amp
-
         
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
-        self.model = PartitionedModel(model, self.rank, self.local_rank, self.local_rank, self.stage_to_rank_map)
+        self.model = PartitionedModel(model, self.rank, self.local_rank, self.local_rank, self.stage_to_rank_map, self.fp16)
         self.model.initialize( dummy_inputs, from_cache=True )
 
         self.micro_batch_size = int(batch_size // chunks)
@@ -79,8 +76,8 @@ class Varuna(Module):
             "fp16": self.fp16,
             "fwd_inp_shape": self.fwd_inp_shape,
             "bwd_grad_shape": self.bwd_grad_shape,
-            "recieve_ranks": self.recieve_ranks,
-            "recieve_indices": self.recieve_indices,
+            "receive_ranks": self.receive_ranks,
+            "receive_indices": self.receive_indices,
             "send_ranks": self.send_ranks,
             "send_indices": self.send_indices,
             "device": self.device,
@@ -95,8 +92,8 @@ class Varuna(Module):
         self.start = rank_within_stage * per_gpu_batch_size
         self.end = self.start + per_gpu_batch_size - 1
 
-        self.recieve_ranks = []; self.send_ranks = []
-        self.recieve_indices = []; self.send_indices = []
+        self.receive_ranks = []; self.send_ranks = []
+        self.receive_indices = []; self.send_indices = []
 
         # send ranks
         if self.stage < (self.partitions-1):
@@ -112,18 +109,18 @@ class Varuna(Module):
                 self.send_ranks.append(self.stage_to_rank_map[self.stage + 1][i])
                 start_ = end_
 
-        # recieve ranks
+        # receive ranks
         if self.stage > 0:
             depth_prev = len(self.stage_to_rank_map[self.stage - 1])
             per_gpu_batch_size_prev = math.ceil( float(self.micro_batch_size) / depth_prev )
 
-            recieve_rank_inidices = range(self.start // per_gpu_batch_size_prev, (self.end // per_gpu_batch_size_prev) + 1 )
+            receive_rank_inidices = range(self.start // per_gpu_batch_size_prev, (self.end // per_gpu_batch_size_prev) + 1 )
 
             start_ = self.start
-            for i in recieve_rank_inidices:
+            for i in receive_rank_inidices:
                 end_ = min(self.end+1, per_gpu_batch_size_prev * (i+1))
-                self.recieve_indices.append((start_ - self.start, end_ - self.start) )
-                self.recieve_ranks.append(self.stage_to_rank_map[self.stage-1][i])
+                self.receive_indices.append((start_ - self.start, end_ - self.start) )
+                self.receive_ranks.append(self.stage_to_rank_map[self.stage-1][i])
                 start_ = end_
 
         # set expected shapes of inputs and gradients for each partition
@@ -190,21 +187,22 @@ class Varuna(Module):
         return schedule
                 
 
-def save_rng_states():
+def save_rng_states(device):
     """capture current CPU, GPU random number generator states to reuse while recomputing activations
     in order to ensure Referential Transparency
     """
     cpu_rng_state = torch.get_rng_state()
 
     gpu_rng_states: Optional[ByteTensor]
-    gpu_rng_states = torch.cuda.get_rng_state_all() 
+    # gpu_rng_states = torch.cuda.get_rng_state_all() 
+    gpu_rng_states = torch.cuda.get_rng_state(device)
     return (cpu_rng_state, gpu_rng_states)
 
-def restore_rng_states(rng_states):
+def restore_rng_states(rng_states, device):
     cpu_rng_state, gpu_rng_states = rng_states
     torch.set_rng_state(cpu_rng_state)
-    torch.cuda.set_rng_state_all(gpu_rng_states)        # todo: verify correctness;   batchNorm, dropouts, convlayers?
-
+    # torch.cuda.set_rng_state_all(gpu_rng_states)        # todo: verify correctness;   batchNorm, dropouts, convlayers?
+    torch.cuda.set_rng_state(gpu_rng_states, device)
 
 class Pipeline:
     """ Pipeline parallelism for Varuna """
@@ -219,11 +217,35 @@ class Pipeline:
         self.device = config["device"]
         self.world_size = self.partitions
         self.schedule = schedule
+        # print(self.schedule)
+
+        # print(self.model)
+        # if (self.world_size>1):
+        #     if (self.stage == 0):
+        #         # print('fp16 module = ', self.model)
+        #         dist.send(self.model.module.bert.embeddings.word_embeddings.weight.cpu(), self.world_size-1)
+        #     elif (self.stage == self.world_size-1):
+        #         encoder_weights = torch.FloatTensor(self.model.module.cls.predictions.decoder.weight.size()).half()
+        #         dist.recv(encoder_weights, 0)
+        #         # mask = torch.ones(encoder_weights.size()).byte().to(self.device)
+        #         # self.model.module.model.cls.predictions.decoder.weight = self.model.module.model.cls.predictions.decoder.weight.masked_scatter(mask, encoder_weights.to(self.device))
+        #         self.model.module.cls.predictions.decoder.weight = torch.nn.Parameter(encoder_weights.to(self.device))
+
+
+        if (self.world_size>1):
+            if (self.stage == self.world_size-1):
+                dist.send(self.model.module.cls.predictions.decoder.weight.cpu(), 0)
+            elif (self.stage == 0):
+                decoder_weights = torch.FloatTensor(self.model.module.bert.embeddings.word_embeddings.weight.size()).half()
+                dist.recv(decoder_weights, self.world_size-1)
+                self.model.module.bert.embeddings.word_embeddings.weight = torch.nn.Parameter(decoder_weights.to(self.device))
+
+
         self.fwd_inp_shape = config["fwd_inp_shape"]
         self.bwd_grad_shape = config["bwd_grad_shape"]
         
-        self.recieve_ranks = config["recieve_ranks"]
-        self.recieve_indices = config["recieve_indices"]
+        self.receive_ranks = config["receive_ranks"]
+        self.receive_indices = config["receive_indices"]
         self.send_ranks = config["send_ranks"]
         self.send_indices = config["send_indices"]
 
@@ -238,8 +260,8 @@ class Pipeline:
         self.grads_queue = Queue()
         self.recompute_queue = Queue()
 
-        self.acts_recieve_thread = None
-        self.grads_recieve_thread = None
+        self.acts_receive_thread = None
+        self.grads_receive_thread = None
         self.acts_send_thread = None
         self.grads_send_thread = None
 
@@ -247,16 +269,16 @@ class Pipeline:
         self.loss = None
         self.average_loss = 0
 
-    def spawn_recieve_workers(self):
+    def spawn_receive_workers(self):
         if self.stage > 0:
-            self.acts_recieve_thread = Thread(target=self.acts_reciever, args=())
-            self.acts_recieve_thread.daemon=True
-            self.acts_recieve_thread.start()
+            self.acts_receive_thread = Thread(target=self.acts_receiver, args=())
+            self.acts_receive_thread.daemon=True
+            self.acts_receive_thread.start()
 
         if self.stage < self.world_size-1:
-            self.grads_recieve_thread = Thread(target=self.grads_reciever, args=())
-            self.grads_recieve_thread.daemon=True
-            self.grads_recieve_thread.start()
+            self.grads_receive_thread = Thread(target=self.grads_receiver, args=())
+            self.grads_receive_thread.daemon=True
+            self.grads_receive_thread.start()
     
     def spawn_send_workers(self):
         if self.stage < self.world_size-1:
@@ -269,7 +291,7 @@ class Pipeline:
             self.grads_send_thread.daemon=True
             self.grads_send_thread.start() 
     
-    def acts_reciever(self):
+    def acts_receiver(self):
         count=0
         for task,index in self.schedule:
             if task == 0:
@@ -277,11 +299,12 @@ class Pipeline:
         while count > 0:
             # copy orig shape
             fwd_inp_shape = list(self.fwd_inp_shape)
-            acts_tensor = torch.ones(self.fwd_inp_shape, dtype=torch.float32)
+            dtype = torch.float16 if self.fp16 else torch.float32
+            acts_tensor = torch.ones(self.fwd_inp_shape, dtype=dtype)
             start = 0; 
-            for rank, (s,e) in zip(self.recieve_ranks, self.recieve_indices):
+            for rank, (s,e) in zip(self.receive_ranks, self.receive_indices):
                 fwd_inp_shape[0] = e-s
-                acts_tensor_i = torch.ones(fwd_inp_shape, dtype=torch.float32)
+                acts_tensor_i = torch.ones(fwd_inp_shape, dtype=dtype)
                 handle = dist.irecv(acts_tensor_i, src=rank)
                 handle.wait()
                 end = start + fwd_inp_shape[0]
@@ -293,7 +316,7 @@ class Pipeline:
 
         del acts_tensor, acts_tensor_i
     
-    def grads_reciever(self):
+    def grads_receiver(self):
         world_size = self.world_size        # todo: get world_size instead of rank?
         count = 0
         for task,index in self.schedule:
@@ -302,11 +325,12 @@ class Pipeline:
         while count > 0:
             # copy orig shape
             grad_shape = list(self.bwd_grad_shape)
-            grads_tensor = torch.ones(grad_shape, dtype=torch.float32)
+            dtype = torch.float16 if self.fp16 else torch.float32
+            grads_tensor = torch.ones(grad_shape, dtype=dtype)
             start = 0; 
             for rank, (s,e) in zip(self.send_ranks, self.send_indices):
                 grad_shape[0] = e-s
-                grads_tensor_i = torch.ones(grad_shape, dtype=torch.float32)
+                grads_tensor_i = torch.ones(grad_shape, dtype=dtype)
                 # print("stage", self.stage, "expecting grads of shape", grad_shape)
                 handle = dist.irecv(grads_tensor_i, src=rank)
                 handle.wait()
@@ -339,7 +363,7 @@ class Pipeline:
                 count += 1
         while count > 0:
             input_grads = self.grads_send_queue.get()
-            for rank, (s,e) in zip(self.recieve_ranks, self.recieve_indices):
+            for rank, (s,e) in zip(self.receive_ranks, self.receive_indices):
                 handle = dist.isend(input_grads[s:e].cpu(), dst=rank)
                 handle.wait()
             del input_grads, handle
@@ -357,16 +381,21 @@ class Pipeline:
         
         self.model.set_send_fn(send)
 
-    # tells the model how to recieve acts and gradients
+    # tells the model how to receive acts and gradients
     def set_model_recv_fn(self, recompute = False):
-        if self.stage > 0:
-            if recompute:
-                ctx, acts = self.recompute_queue.get()
-                restore_rng_states(ctx)
+        if recompute:
+            ctx, acts = self.recompute_queue.get()
+            restore_rng_states(ctx, self.device)
+
+            cpu_rng_state = torch.get_rng_state()
+            gpu_rng_states: Optional[ByteTensor]
+            gpu_rng_states = torch.cuda.get_rng_state(self.device)
+            # print('recompute: srngs: cpu = ', sha1(cpu_rng_state.cpu().numpy()).hexdigest(), '  gpu = ', sha1(gpu_rng_states.cpu().numpy()).hexdigest())
+        else:
+            if self.stage==0:
+                acts = None
             else:
                 acts = self.acts_queue.get()
-        else:
-            acts = None
 
         def recv(grads = False):
             if grads:
@@ -378,20 +407,25 @@ class Pipeline:
         # because there's no peek/front method for these queues
         return acts
 
-    def worker(self, task, grad_mode, inputs_as_dict):
+
+    def worker(self, task, grad_mode, inputs_as_dict, lastub):
         """ Main body of worker loop """
         world_size = self.world_size
 
         if task == 0:       
             torch.set_grad_enabled(grad_mode)
 
+            rng_states=None
+            if grad_mode == False:
+                # if these acts are going to be recomputed
+                rng_states = save_rng_states(self.device)
+
             self.set_model_send_fn(recompute = False)
             acts = self.set_model_recv_fn(recompute = False)
             output = self.model(**inputs_as_dict)
 
-            if grad_mode == False and self.stage > 0:
+            if grad_mode == False:
                 # if these acts are going to be recomputed
-                rng_states = save_rng_states()
                 ctx = (rng_states, acts)
                 self.recompute_queue.put(ctx)
             else:
@@ -412,10 +446,11 @@ class Pipeline:
         else:
             if self.stage != world_size-1:
                 if self.fp16:
-                    with amp.scale_loss(self.loss, self.optimizer) as scaled_loss:
+                    grads = torch.ones(self.loss.size(), dtype = torch.float32).to(self.device)
+                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_microbatch=lastub) as scaled_loss:
                         scaled_loss.backward(grads)
                 else:
-                    grads = torch.ones(self.loss.size()).to(self.device)
+                    grads = torch.ones(self.loss.size(), dtype = torch.float32).to(self.device)
                     self.loss.backward(grads)
                     del grads
 
@@ -425,7 +460,7 @@ class Pipeline:
                 self.average_loss += self.loss.item()
 
                 if self.fp16:
-                    with amp.scale_loss(self.loss, self.optimizer) as scaled_loss:
+                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_microbatch=lastub) as scaled_loss:
                         scaled_loss.backward()
                 else:
                     self.loss.backward()
@@ -434,7 +469,7 @@ class Pipeline:
             self.loss = None
         
     def run(self):
-        self.spawn_recieve_workers()
+        self.spawn_receive_workers()
 
         for index, task in enumerate(self.schedule):
             grad_mode = False
@@ -446,7 +481,7 @@ class Pipeline:
             # For data parallel, sync only when doing last microbatch backward
             if self.data_parallel and task[1] < (len(self.batches) - 1):
                 with self.model.module.no_sync():
-                    self.worker(task[0], grad_mode, self.batches[task[1]])
+                    loss = self.worker(task[0], grad_mode, self.batches[task[1]], task[1]==len(self.batches)-1)
             else:
                 self.worker(task[0], grad_mode, self.batches[task[1]])
         
@@ -460,10 +495,10 @@ class Pipeline:
         if self.grads_send_thread is not None:
             self.grads_send_thread.join()
 
-        # return loss
+        # return self.loss     # for run_squad.py: printing the loss just for the last step
         if self.stage == self.world_size - 1:
             return self.average_loss
-        return 0
+        return self.average_loss
 
 def scatter(input, chunks, device):
     """

@@ -12,7 +12,10 @@ ssh_out*
 parent_process
 args
 ssh_err*
-
+mpu/
+old_partitioned_model*
+varuna_for_finetuning*
+varuna
 # Byte-compiled / optimized / DLL files
 *__pycache__/
 *.py[cod]
@@ -39,3 +42,5 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
+varuna/varuna_pretraining_megatron_not_converging.py
+varuna/varuna_pretraining_sansdataparallel.py
