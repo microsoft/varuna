@@ -172,7 +172,6 @@ class Varuna(Module):
         print(chunks,"chunks")
         c_schedule = os.popen(os.path.join(os.path.dirname(os.path.abspath(__file__)),'genschedule ')+str(self.partitions)+' '+str(chunks)+' '+str(self.stage)).read()
         schedule = list()
-
         steps = c_schedule.split(';')
         steps = steps[:-1]
         for step in steps:
@@ -214,6 +213,7 @@ class Pipeline:
         self.device = config["device"]
         self.world_size = self.partitions
         self.schedule = schedule
+        self.fp16 = config["fp16"]
         # print(self.schedule)
 
         # print(self.model)
@@ -234,7 +234,9 @@ class Pipeline:
             if self.stage == self.partitions - 1:
                 dist.send(baseModule.cls.predictions.decoder.weight.cpu(), config["embedding_send_rank"])
             elif self.stage == 0:
-                decoder_weights = torch.FloatTensor(baseModule.bert.embeddings.word_embeddings.weight.size())#.half()
+                decoder_weights = torch.FloatTensor(baseModule.bert.embeddings.word_embeddings.weight.size())
+                if self.fp16:
+                    decoder_weights = decoder_weights.half()
                 dist.recv(decoder_weights, config["embedding_recv_rank"])
                 baseModule.bert.embeddings.word_embeddings.weight = torch.nn.Parameter(decoder_weights.to(self.device))
 
