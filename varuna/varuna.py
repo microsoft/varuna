@@ -14,8 +14,11 @@ import gc
 
 import os
 import sys
+import time
 
 Module = nn.Module
+
+TASK = ["fwd", "rec", "bwd"]
 
 class Varuna(Module):
     """
@@ -89,6 +92,7 @@ class Varuna(Module):
             "send_rank": self.send_rank,
             "device": self.device,
             "data_parallel": bool(len(self.stage_to_rank_map[self.stage]) > 1),
+            "make_logfile": bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
             "last_chunk_size": self.last_chunk_size,
             "embedding_recv_rank": self.embedding_recv_rank,
             "embedding_send_rank": self.embedding_send_rank
@@ -214,6 +218,7 @@ class Pipeline:
         self.world_size = self.partitions
         self.schedule = schedule
         self.fp16 = config["fp16"]
+
         # print(self.schedule)
 
         # print(self.model)
@@ -243,6 +248,16 @@ class Pipeline:
 
         self.fwd_inp_shape = config["fwd_inp_shape"]
         self.bwd_grad_shape = config["bwd_grad_shape"]
+
+        self.make_logfile = config["make_logfile"]
+        if self.make_logfile:
+            microBS = self.fwd_inp_shape[0] if self.bwd_grad_shape is None else self.bwd_grad_shape[0]
+            logfilename = "vauna_logs-mBS" + str(microBS) + "-stage" + str(self.stage) + "of" + str(self.partitions)
+            if os.path.isfile(logfilename):
+                self.logfile = open(logfilename,"a")
+                self.logfile.write("resume\n")
+            else:
+                self.logfile = open(logfilename,"w")
         
         self.recieve_rank = config["recieve_rank"]
         self.send_rank = config["send_rank"]
@@ -452,11 +467,22 @@ class Pipeline:
                     grad_mode=True
 
             # For data parallel, sync only when doing last microbatch fwd/bwd
+            task_time = time.time()
             if self.data_parallel and task[1] < (len(self.batches) - 1):
                 with self.model.no_sync():
                     self.worker(task[0], grad_mode, self.batches[task[1]])
             else:
                 self.worker(task[0], grad_mode, self.batches[task[1]])
+                if self.make_logfile:
+                    self.logfile.write("SYNC! ")
+
+            task_time = time.time() - task_time
+            
+            if self.make_logfile:
+                self.logfile.write("{} {} {}\n".format(TASK[task[0]],task[1], str(task_time)))
+
+        if self.make_logfile:
+            self.logfile.write("\n\nBATCH END\n\n")
         
         if self.acts_recieve_thread is not None:
             self.acts_recieve_thread.join()
