@@ -7,6 +7,7 @@ from queue import Queue
 from threading import Thread
 import math
 from apex import amp
+import time 
 
 from .partitioned_model import PartitionedModel
 import gc
@@ -167,6 +168,32 @@ class Varuna(Module):
     
     def checkpoint(self, cp_dir_name):
         return self.partitioned_model.checkpoint(cp_dir_name)
+
+    def checkpoint_optimizer(self, optimizer, parameter_names, cp_dir_name):
+        cp_time = time.time()
+        sd = None
+        if self.stage != 0 and self.rank == self.stage_to_rank_map[self.stage][0]:
+            new_state = dict()
+            for key in optimizer.state:
+                new_state[parameter_names[key]] = optimizer.state[key]
+            torch.save(new_state, os.path.join(cp_dir_name,"opt-state-" + str(self.stage)))
+        torch.distributed.barrier()
+        if self.stage == 0 and self.rank == self.stage_to_rank_map[0][0]:
+            sd = optimizer.state_dict()
+            new_state = dict()
+            for key in optimizer.state:
+                new_state[parameter_names[key]] = optimizer.state[key]
+            for stage in range(1,self.partitions):
+                state_filename = os.path.join(cp_dir_name,"opt-state-" + str(stage))
+                state_ = torch.load(state_filename)
+                new_state.update(state_)
+                os.remove(state_filename)
+            sd["state"] = new_state
+            # torch.save(sd, os.path.join(cp_dir_name,"opt-state"))
+        torch.distributed.barrier()
+        cp_time = time.time() - cp_time
+        print("Opt ckpt time", cp_time)
+        return sd
 
     def to(self, device):
         self.model.to(device)
