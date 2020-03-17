@@ -7,6 +7,7 @@ from queue import Queue
 from threading import Thread
 import math
 from apex import amp
+import time 
 
 from .partitioned_model import PartitionedModel
 import gc
@@ -14,8 +15,11 @@ import gc
 
 import os
 import sys
+import time
 
 Module = nn.Module
+
+TASK = ["fwd", "rec", "bwd"]
 
 class Varuna(Module):
     """
@@ -89,6 +93,7 @@ class Varuna(Module):
             "send_rank": self.send_rank,
             "device": self.device,
             "data_parallel": bool(len(self.stage_to_rank_map[self.stage]) > 1),
+            "make_logfile": bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
             "last_chunk_size": self.last_chunk_size,
             "embedding_recv_rank": self.embedding_recv_rank,
             "embedding_send_rank": self.embedding_send_rank
@@ -164,6 +169,32 @@ class Varuna(Module):
     def checkpoint(self, cp_dir_name):
         return self.partitioned_model.checkpoint(cp_dir_name)
 
+    def checkpoint_optimizer(self, optimizer, parameter_names, cp_dir_name):
+        cp_time = time.time()
+        sd = None
+        if self.stage != 0 and self.rank == self.stage_to_rank_map[self.stage][0]:
+            new_state = dict()
+            for key in optimizer.state:
+                new_state[parameter_names[key]] = optimizer.state[key]
+            torch.save(new_state, os.path.join(cp_dir_name,"opt-state-" + str(self.stage)))
+        torch.distributed.barrier()
+        if self.stage == 0 and self.rank == self.stage_to_rank_map[0][0]:
+            sd = optimizer.state_dict()
+            new_state = dict()
+            for key in optimizer.state:
+                new_state[parameter_names[key]] = optimizer.state[key]
+            for stage in range(1,self.partitions):
+                state_filename = os.path.join(cp_dir_name,"opt-state-" + str(stage))
+                state_ = torch.load(state_filename)
+                new_state.update(state_)
+                os.remove(state_filename)
+            sd["state"] = new_state
+            # torch.save(sd, os.path.join(cp_dir_name,"opt-state"))
+        torch.distributed.barrier()
+        cp_time = time.time() - cp_time
+        print("Opt ckpt time", cp_time)
+        return sd
+
     def to(self, device):
         self.model.to(device)
     
@@ -214,6 +245,16 @@ class Pipeline:
         self.world_size = self.partitions
         self.schedule = schedule
         self.fp16 = config["fp16"]
+
+        self.fwd_inp_shape = config["fwd_inp_shape"]
+        self.bwd_grad_shape = config["bwd_grad_shape"]
+
+
+        self.make_logfile = config["make_logfile"]
+        if self.make_logfile:
+            microBS = self.fwd_inp_shape[0] if self.bwd_grad_shape is None else self.bwd_grad_shape[0]
+            logfilename = "varuna_logs-mBS" + str(microBS) + "-stage" + str(self.stage) + "of" + str(self.partitions)
+            self.logfile = open(logfilename,"a")
         # print(self.schedule)
 
         # print(self.model)
@@ -232,18 +273,23 @@ class Pipeline:
 
         if self.partitions > 1:
             if self.stage == self.partitions - 1:
+                embed_comm_time = time.time()
                 dist.send(baseModule.cls.predictions.decoder.weight.cpu(), config["embedding_send_rank"])
+                embed_comm_time = time.time() - embed_comm_time
+                if self.make_logfile:
+                    self.logfile.write("embed comm " + str(embed_comm_time) + "\n")
             elif self.stage == 0:
+                embed_comm_time = time.time()
                 decoder_weights = torch.FloatTensor(baseModule.bert.embeddings.word_embeddings.weight.size())
                 if self.fp16:
                     decoder_weights = decoder_weights.half()
                 dist.recv(decoder_weights, config["embedding_recv_rank"])
                 baseModule.bert.embeddings.word_embeddings.weight = torch.nn.Parameter(decoder_weights.to(self.device))
+                embed_comm_time = time.time() - embed_comm_time
+                if self.make_logfile:
+                    self.logfile.write("embed comm " + str(embed_comm_time) + "\n")
 
 
-        self.fwd_inp_shape = config["fwd_inp_shape"]
-        self.bwd_grad_shape = config["bwd_grad_shape"]
-        
         self.recieve_rank = config["recieve_rank"]
         self.send_rank = config["send_rank"]
 
@@ -375,7 +421,12 @@ class Pipeline:
 
         def recv(grads = False):
             if grads:
-                return self.grads_queue.get()
+                recv_time = time.time()
+                g = self.grads_queue.get()
+                recv_time = time.time() - recv_time
+                if self.make_logfile:   
+                    self.logfile.write("rcv grads " + str(recv_time) + "\n")
+                return g
             else:
                 return acts
         
@@ -396,7 +447,11 @@ class Pipeline:
                 rng_states = save_rng_states(self.device)
 
             self.set_model_send_fn(recompute = False)
+            recv_time = time.time()
             acts = self.set_model_recv_fn(recompute = False)
+            recv_time = time.time() - recv_time
+            if self.make_logfile:
+                self.logfile.write("rcv acts " + str(recv_time) + "\n")
             output = self.model(**inputs_as_dict)
 
             if grad_mode == False:
@@ -452,12 +507,23 @@ class Pipeline:
                     grad_mode=True
 
             # For data parallel, sync only when doing last microbatch fwd/bwd
+            task_time = time.time()
             if self.data_parallel and task[1] < (len(self.batches) - 1):
                 with self.model.no_sync():
                     self.worker(task[0], grad_mode, self.batches[task[1]])
             else:
                 self.worker(task[0], grad_mode, self.batches[task[1]])
-        
+                if self.make_logfile:
+                    self.logfile.write("SYNC! ")
+
+            task_time = time.time() - task_time
+            
+            if self.make_logfile:
+                self.logfile.write("{} {} {}\n".format(TASK[task[0]],task[1], str(task_time)))
+
+        if self.make_logfile:
+            self.logfile.write("\n\nBATCH END\n\n")
+            self.logfile.close()        
         if self.acts_recieve_thread is not None:
             self.acts_recieve_thread.join()
         if self.grads_recieve_thread is not None:
@@ -487,3 +553,4 @@ def scatter(input, chunk_size):
             microbatches[i][k]=value
     
     return microbatches
+

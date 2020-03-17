@@ -25,7 +25,7 @@ class CutPoint(Module):
         self.send_fn = self.recv_fn = None
         self.stage = -1
         self.fp16 = False
-
+        # self.logfile = None
 
     def forward(self, *inputs, **kwargs):
         # not set by ModelParallel, pass through as is
@@ -55,7 +55,9 @@ class CutPoint(Module):
             def forward(ctx, i):
                 # recieve activations
                 if is_in_next_stage and self.recv_fn is not None:
+                    # recv_time = time.time()
                     i = self.recv_fn()
+                    # recv_time = time.time() - recv_time
                 # send activations
                 elif is_in_prev_stage:
                     self.send_fn(i)
@@ -65,7 +67,10 @@ class CutPoint(Module):
             def backward(ctx, grad_output):
                 # receive gradients.
                 if is_in_prev_stage and self.recv_fn is not None:
+                    # recv_time = time.time()
                     grad_output = self.recv_fn(grads = True)
+                    # recv_time = time.time() - recv_time
+                    # self.logfile.write("rcv grads " + str(recv_time) + "\n")
                 # send gradients
                 elif is_in_next_stage:
                     self.send_fn(grad_output, grads = True)
@@ -101,6 +106,8 @@ class PartitionedModel(Module):
                 break
         else:
             raise ValueError("Rank " + self.rank + " not found in stage to rank map!")
+
+        # self.logfile = open("wait_logs" + str(self.rank),"w")
 
     def initialize(self, dummy_inputs, from_cache=False):
         # print("Initializing partitioned model!")
@@ -178,6 +185,7 @@ class PartitionedModel(Module):
             cutpoint.stage = self.stage
             cutpoint.device = self.device
             cutpoint.fp16 = self.fp16
+            # cutpoint.logfile = self.logfile
             cutpoint.set_cp_func()
 
         self.cuts_per_stage = (self.num_cutpoints + 1) // self.num_stages
@@ -334,7 +342,7 @@ class PartitionedModel(Module):
             if self.ret_val is None:
                 raise e
             ret_val = self.ret_val
-
+        # self.logfile.flush()
         self.ret_val = None
         return ret_val 
 
