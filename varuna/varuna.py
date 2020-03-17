@@ -246,6 +246,18 @@ class Pipeline:
         self.schedule = schedule
         self.fp16 = config["fp16"]
 
+<<<<<<< HEAD
+=======
+        self.fwd_inp_shape = config["fwd_inp_shape"]
+        self.bwd_grad_shape = config["bwd_grad_shape"]
+
+
+        self.make_logfile = config["make_logfile"]
+        if self.make_logfile:
+            microBS = self.fwd_inp_shape[0] if self.bwd_grad_shape is None else self.bwd_grad_shape[0]
+            logfilename = "varuna_logs-mBS" + str(microBS) + "-stage" + str(self.stage) + "of" + str(self.partitions)
+            self.logfile = open(logfilename,"a")
+>>>>>>> b007d1ec32d2f452c94bad745e36656a4bf5e6b3
         # print(self.schedule)
 
         # print(self.model)
@@ -264,15 +276,24 @@ class Pipeline:
 
         if self.partitions > 1:
             if self.stage == self.partitions - 1:
+                embed_comm_time = time.time()
                 dist.send(baseModule.cls.predictions.decoder.weight.cpu(), config["embedding_send_rank"])
+                embed_comm_time = time.time() - embed_comm_time
+                if self.make_logfile:
+                    self.logfile.write("embed comm " + str(embed_comm_time) + "\n")
             elif self.stage == 0:
+                embed_comm_time = time.time()
                 decoder_weights = torch.FloatTensor(baseModule.bert.embeddings.word_embeddings.weight.size())
                 if self.fp16:
                     decoder_weights = decoder_weights.half()
                 dist.recv(decoder_weights, config["embedding_recv_rank"])
                 baseModule.bert.embeddings.word_embeddings.weight = torch.nn.Parameter(decoder_weights.to(self.device))
+                embed_comm_time = time.time() - embed_comm_time
+                if self.make_logfile:
+                    self.logfile.write("embed comm " + str(embed_comm_time) + "\n")
 
 
+<<<<<<< HEAD
         self.fwd_inp_shape = config["fwd_inp_shape"]
         self.bwd_grad_shape = config["bwd_grad_shape"]
 
@@ -286,6 +307,8 @@ class Pipeline:
             else:
                 self.logfile = open(logfilename,"w")
         
+=======
+>>>>>>> b007d1ec32d2f452c94bad745e36656a4bf5e6b3
         self.recieve_rank = config["recieve_rank"]
         self.send_rank = config["send_rank"]
 
@@ -417,7 +440,12 @@ class Pipeline:
 
         def recv(grads = False):
             if grads:
-                return self.grads_queue.get()
+                recv_time = time.time()
+                g = self.grads_queue.get()
+                recv_time = time.time() - recv_time
+                if self.make_logfile:   
+                    self.logfile.write("rcv grads " + str(recv_time) + "\n")
+                return g
             else:
                 return acts
         
@@ -438,7 +466,11 @@ class Pipeline:
                 rng_states = save_rng_states(self.device)
 
             self.set_model_send_fn(recompute = False)
+            recv_time = time.time()
             acts = self.set_model_recv_fn(recompute = False)
+            recv_time = time.time() - recv_time
+            if self.make_logfile:
+                self.logfile.write("rcv acts " + str(recv_time) + "\n")
             output = self.model(**inputs_as_dict)
 
             if grad_mode == False:
@@ -510,7 +542,11 @@ class Pipeline:
 
         if self.make_logfile:
             self.logfile.write("\n\nBATCH END\n\n")
+<<<<<<< HEAD
         
+=======
+            self.logfile.close()        
+>>>>>>> b007d1ec32d2f452c94bad745e36656a4bf5e6b3
         if self.acts_recieve_thread is not None:
             self.acts_recieve_thread.join()
         if self.grads_recieve_thread is not None:
@@ -540,3 +576,4 @@ def scatter(input, chunk_size):
             microbatches[i][k]=value
     
     return microbatches
+
