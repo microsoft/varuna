@@ -246,8 +246,6 @@ class Pipeline:
         self.schedule = schedule
         self.fp16 = config["fp16"]
 
-<<<<<<< HEAD
-=======
         self.fwd_inp_shape = config["fwd_inp_shape"]
         self.bwd_grad_shape = config["bwd_grad_shape"]
 
@@ -257,7 +255,6 @@ class Pipeline:
             microBS = self.fwd_inp_shape[0] if self.bwd_grad_shape is None else self.bwd_grad_shape[0]
             logfilename = "varuna_logs-mBS" + str(microBS) + "-stage" + str(self.stage) + "of" + str(self.partitions)
             self.logfile = open(logfilename,"a")
->>>>>>> b007d1ec32d2f452c94bad745e36656a4bf5e6b3
         # print(self.schedule)
 
         # print(self.model)
@@ -293,22 +290,6 @@ class Pipeline:
                     self.logfile.write("embed comm " + str(embed_comm_time) + "\n")
 
 
-<<<<<<< HEAD
-        self.fwd_inp_shape = config["fwd_inp_shape"]
-        self.bwd_grad_shape = config["bwd_grad_shape"]
-
-        self.make_logfile = config["make_logfile"]
-        if self.make_logfile:
-            microBS = self.fwd_inp_shape[0] if self.bwd_grad_shape is None else self.bwd_grad_shape[0]
-            logfilename = "vauna_logs-mBS" + str(microBS) + "-stage" + str(self.stage) + "of" + str(self.partitions)
-            if os.path.isfile(logfilename):
-                self.logfile = open(logfilename,"a")
-                self.logfile.write("resume\n")
-            else:
-                self.logfile = open(logfilename,"w")
-        
-=======
->>>>>>> b007d1ec32d2f452c94bad745e36656a4bf5e6b3
         self.recieve_rank = config["recieve_rank"]
         self.send_rank = config["send_rank"]
 
@@ -542,11 +523,7 @@ class Pipeline:
 
         if self.make_logfile:
             self.logfile.write("\n\nBATCH END\n\n")
-<<<<<<< HEAD
-        
-=======
             self.logfile.close()        
->>>>>>> b007d1ec32d2f452c94bad745e36656a4bf5e6b3
         if self.acts_recieve_thread is not None:
             self.acts_recieve_thread.join()
         if self.grads_recieve_thread is not None:
