@@ -72,7 +72,7 @@ void GenSchedule::Generate() {
   num_bubbles.assign(pipeline_depth_, 0);
 
   int time = 0;
-  for (time = 0; time < 2000; ++time) {
+  for (time = 0; time < 3000; ++time) {
     std::vector<int> mini_batches;
     std::vector<char> queue_ids;
     bool all_queues_empty = true;
@@ -161,7 +161,7 @@ void GenSchedule::Generate() {
 
 int main(int argc, char** argv) {
   if (argc < 3) {
-    printf("Usage: gen-schedule <pipeline-depth> <num_micro_batches>");
+    printf("Usage: gen-schedule <pipeline-depth> <num_micro_batches> <device_rank>");
     return -1;
   }
   int pipeline_depth = atoi(argv[1]);
