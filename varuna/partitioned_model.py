@@ -25,7 +25,6 @@ class CutPoint(Module):
         self.send_fn = self.recv_fn = None
         self.stage = -1
         self.fp16 = False
-        # self.logfile = None
 
     def forward(self, *inputs, **kwargs):
         # not set by ModelParallel, pass through as is
@@ -85,7 +84,6 @@ class PartitionedModel(Module):
     def __init__(self, module, rank, local_rank, device, stage_to_rank_map, fp16):
         super(PartitionedModel, self).__init__()
         self.module = module
-        self.is_data_parallel = False
         self.num_stages = len(stage_to_rank_map)
         self.stage_to_rank_map = stage_to_rank_map
         self.rank = rank
@@ -185,7 +183,6 @@ class PartitionedModel(Module):
             cutpoint.stage = self.stage
             cutpoint.device = self.device
             cutpoint.fp16 = self.fp16
-            # cutpoint.logfile = self.logfile
             cutpoint.set_cp_func()
 
         self.cuts_per_stage = (self.num_cutpoints + 1) // self.num_stages

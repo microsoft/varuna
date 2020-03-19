@@ -116,7 +116,7 @@ class Varuna(Module):
         if self.stage < (self.partitions-1):
             self.send_rank = self.stage_to_rank_map[self.stage + 1][rank_within_stage]
 
-        # recieve ranks
+        # receive ranks
         if self.stage > 0:
             self.recieve_rank = self.stage_to_rank_map[self.stage - 1][rank_within_stage]
 
@@ -228,7 +228,10 @@ def restore_rng_states(rng_states, device):
     torch.set_rng_state(cpu_rng_state)
     # torch.cuda.set_rng_state_all(gpu_rng_states)        # todo: verify correctness;   batchNorm, dropouts, convlayers?
     torch.cuda.set_rng_state(gpu_rng_states, device)
+<<<<<<< HEAD
 
+=======
+>>>>>>> 966340ffefddb6989aad5982d3d91194271cc3ed
 
 class Pipeline:
     """ Pipeline parallelism for Varuna """
@@ -305,8 +308,8 @@ class Pipeline:
         self.grads_queue = Queue()
         self.recompute_queue = Queue()
 
-        self.acts_recieve_thread = None
-        self.grads_recieve_thread = None
+        self.acts_receive_thread = None
+        self.grads_receive_thread = None
         self.acts_send_thread = None
         self.grads_send_thread = None
 
@@ -314,11 +317,11 @@ class Pipeline:
         self.loss = None
         self.average_loss = 0
 
-    def spawn_recieve_workers(self):
+    def spawn_receive_workers(self):
         if self.stage > 0:
-            self.acts_recieve_thread = Thread(target=self.acts_reciever, args=())
-            self.acts_recieve_thread.daemon=True
-            self.acts_recieve_thread.start()
+            self.acts_receive_thread = Thread(target=self.acts_receiver, args=())
+            self.acts_receive_thread.daemon=True
+            self.acts_receive_thread.start()
 
         if self.stage < self.partitions-1:
             self.grads_recieve_thread = Thread(target=self.grads_reciever, args=())
@@ -405,7 +408,7 @@ class Pipeline:
         
         self.partitioned_model.set_send_fn(send)
 
-    # tells the model how to recieve acts and gradients
+    # tells the model how to receive acts and gradients
     def set_model_recv_fn(self, recompute = False):
         if recompute:
             ctx, acts = self.recompute_queue.get()
@@ -433,7 +436,8 @@ class Pipeline:
         # because there's no peek/front method for these queues
         return acts
 
-    def worker(self, task, grad_mode, inputs_as_dict):
+
+    def worker(self, task, grad_mode, inputs_as_dict, lastub):
         """ Main body of worker loop """
 
         if task == 0:       
@@ -453,6 +457,7 @@ class Pipeline:
             output = self.model(**inputs_as_dict)
 
             if grad_mode == False:
+                # if these acts are going to be recomputed
                 ctx = (rng_states, acts)
                 self.recompute_queue.put(ctx)
             else:
@@ -474,7 +479,7 @@ class Pipeline:
                 if self.fp16:
                     # if dist.get_rank() == 1:
                     #     print("SIZE",self.loss[0][0][0])
-                    with amp.scale_loss(self.loss, self.optimizer) as scaled_loss:
+                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_microbatch=lastub, last_partition=False) as scaled_loss:
                         scaled_loss.backward(grads)
                         if dist.get_rank() == 1:
                             baseModule = self.model.module if not self.data_parallel else self.model.module.module
@@ -490,7 +495,7 @@ class Pipeline:
                 self.average_loss += self.loss.item()
 
                 if self.fp16:
-                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_partition=False) as scaled_loss:
+                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_microbatch=lastub) as scaled_loss:
                         scaled_loss.backward()
                     # self.optimizer.backward(self.loss)
                 else:
@@ -500,7 +505,7 @@ class Pipeline:
             self.loss = None
         
     def run(self):
-        self.spawn_recieve_workers()
+        self.spawn_receive_workers()
 
         for index, task in enumerate(self.schedule):
             grad_mode = False
@@ -513,9 +518,9 @@ class Pipeline:
             task_time = time.time()
             if self.data_parallel and task[1] < (len(self.batches) - 1):
                 with self.model.no_sync():
-                    self.worker(task[0], grad_mode, self.batches[task[1]])
+                    self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
             else:
-                self.worker(task[0], grad_mode, self.batches[task[1]])
+                self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
                 if self.make_logfile:
                     self.logfile.write("SYNC! ")
 
