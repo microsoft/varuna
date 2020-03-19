@@ -89,7 +89,7 @@ class Varuna(Module):
             "fp16": self.fp16,
             "fwd_inp_shape": self.fwd_inp_shape,
             "bwd_grad_shape": self.bwd_grad_shape,
-            "recieve_rank": self.recieve_rank,
+            "receive_rank": self.receive_rank,
             "send_rank": self.send_rank,
             "device": self.device,
             "data_parallel": bool(len(self.stage_to_rank_map[self.stage]) > 1),
@@ -110,7 +110,7 @@ class Varuna(Module):
         if self.stage == self.partitions - 1:
             self.embedding_send_rank = self.stage_to_rank_map[0][rank_within_stage]
 
-        self.send_rank = None; self.recieve_rank = None
+        self.send_rank = None; self.receive_rank = None
 
         # send ranks
         if self.stage < (self.partitions-1):
@@ -118,7 +118,7 @@ class Varuna(Module):
 
         # receive ranks
         if self.stage > 0:
-            self.recieve_rank = self.stage_to_rank_map[self.stage - 1][rank_within_stage]
+            self.receive_rank = self.stage_to_rank_map[self.stage - 1][rank_within_stage]
 
         # set expected shapes of inputs and gradients for each partition
         self.fwd_inp_shape = self.bwd_grad_shape = None
@@ -228,10 +228,6 @@ def restore_rng_states(rng_states, device):
     torch.set_rng_state(cpu_rng_state)
     # torch.cuda.set_rng_state_all(gpu_rng_states)        # todo: verify correctness;   batchNorm, dropouts, convlayers?
     torch.cuda.set_rng_state(gpu_rng_states, device)
-<<<<<<< HEAD
-
-=======
->>>>>>> 966340ffefddb6989aad5982d3d91194271cc3ed
 
 class Pipeline:
     """ Pipeline parallelism for Varuna """
@@ -292,7 +288,7 @@ class Pipeline:
                     self.logfile.write("embed comm " + str(embed_comm_time) + "\n")
 
 
-        self.recieve_rank = config["recieve_rank"]
+        self.receive_rank = config["receive_rank"]
         self.send_rank = config["send_rank"]
 
         self.last_chunk_size = config["last_chunk_size"]
@@ -324,9 +320,9 @@ class Pipeline:
             self.acts_receive_thread.start()
 
         if self.stage < self.partitions-1:
-            self.grads_recieve_thread = Thread(target=self.grads_reciever, args=())
-            self.grads_recieve_thread.daemon=True
-            self.grads_recieve_thread.start()
+            self.grads_receive_thread = Thread(target=self.grads_receiver, args=())
+            self.grads_receive_thread.daemon=True
+            self.grads_receive_thread.start()
     
     def spawn_send_workers(self):
         if self.stage < self.partitions-1:
@@ -339,7 +335,7 @@ class Pipeline:
             self.grads_send_thread.daemon=True
             self.grads_send_thread.start() 
     
-    def acts_reciever(self):
+    def acts_receiver(self):
         chunks = len(self.batches)
         dtype = torch.float16 if self.fp16 else torch.float32
         for task,index in self.schedule:
@@ -350,12 +346,12 @@ class Pipeline:
                     fwd_inp_shape[0] = self.last_chunk_size
                 acts_tensor = torch.ones(fwd_inp_shape, dtype=dtype)
                 # print("stage", self.stage, "expecting acts of shape", fwd_inp_shape)
-                handle = dist.irecv(acts_tensor, src=self.recieve_rank)
+                handle = dist.irecv(acts_tensor, src=self.receive_rank)
                 handle.wait()
                 self.acts_queue.put(acts_tensor.to(self.device))
         del acts_tensor
     
-    def grads_reciever(self):
+    def grads_receiver(self):
         chunks = len(self.batches)
         dtype = torch.float16 if self.fp16 else torch.float32
         for task,index in self.schedule:
@@ -392,7 +388,7 @@ class Pipeline:
         while count > 0:
             input_grads = self.grads_send_queue.get()
             # print("stage", self.stage, "sending grads of shape", input_grads.size())
-            handle = dist.isend(input_grads.cpu(), dst=self.recieve_rank)
+            handle = dist.isend(input_grads.cpu(), dst=self.receive_rank)
             handle.wait()
             del input_grads, handle
             count -= 1
@@ -481,9 +477,6 @@ class Pipeline:
                     #     print("SIZE",self.loss[0][0][0])
                     with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_microbatch=lastub, last_partition=False) as scaled_loss:
                         scaled_loss.backward(grads)
-                        if dist.get_rank() == 1:
-                            baseModule = self.model.module if not self.data_parallel else self.model.module.module
-                            baseModule.bert.encoder.layer[7].attention.self.query.weight.grad[0][0] = float('inf')
                     # self.optimizer.backward(self.loss, grads=grads)
                     # self.loss.backward(grads)
                 else:
@@ -532,10 +525,10 @@ class Pipeline:
         if self.make_logfile:
             self.logfile.write("\n\nBATCH END\n\n")
             self.logfile.close()        
-        if self.acts_recieve_thread is not None:
-            self.acts_recieve_thread.join()
-        if self.grads_recieve_thread is not None:
-            self.grads_recieve_thread.join()
+        if self.acts_receive_thread is not None:
+            self.acts_receive_thread.join()
+        if self.grads_receive_thread is not None:
+            self.grads_receive_thread.join()
 
         if self.acts_send_thread is not None:
             self.acts_send_thread.join()
