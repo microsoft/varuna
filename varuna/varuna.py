@@ -242,7 +242,6 @@ class Pipeline:
         self.model = model
         self.partitioned_model = self.model.module if self.data_parallel else self.model
         self.device = config["device"]
-        self.world_size = self.partitions
         self.schedule = schedule
         self.fp16 = config["fp16"]
 
@@ -321,13 +320,13 @@ class Pipeline:
             self.acts_recieve_thread.daemon=True
             self.acts_recieve_thread.start()
 
-        if self.stage < self.world_size-1:
+        if self.stage < self.partitions-1:
             self.grads_recieve_thread = Thread(target=self.grads_reciever, args=())
             self.grads_recieve_thread.daemon=True
             self.grads_recieve_thread.start()
     
     def spawn_send_workers(self):
-        if self.stage < self.world_size-1:
+        if self.stage < self.partitions-1:
             self.acts_send_thread = Thread(target=self.acts_sender, args=())
             self.acts_send_thread.daemon=True
             self.acts_send_thread.start()
@@ -436,7 +435,6 @@ class Pipeline:
 
     def worker(self, task, grad_mode, inputs_as_dict):
         """ Main body of worker loop """
-        world_size = self.world_size
 
         if task == 0:       
             torch.set_grad_enabled(grad_mode)
@@ -471,11 +469,16 @@ class Pipeline:
             self.loss = output[0] if isinstance(output,tuple) else output
         
         else:
-            if self.stage != world_size-1:
+            if self.stage != self.partitions-1:
                 grads = torch.ones(self.loss.size(), dtype = torch.float32).to(self.device)
                 if self.fp16:
-                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=True) as scaled_loss:
+                    # if dist.get_rank() == 1:
+                    #     print("SIZE",self.loss[0][0][0])
+                    with amp.scale_loss(self.loss, self.optimizer) as scaled_loss:
                         scaled_loss.backward(grads)
+                        if dist.get_rank() == 1:
+                            baseModule = self.model.module if not self.data_parallel else self.model.module.module
+                            baseModule.bert.encoder.layer[7].attention.self.query.weight.grad[0][0] = float('inf')
                     # self.optimizer.backward(self.loss, grads=grads)
                     # self.loss.backward(grads)
                 else:
@@ -487,7 +490,7 @@ class Pipeline:
                 self.average_loss += self.loss.item()
 
                 if self.fp16:
-                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False) as scaled_loss:
+                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_partition=False) as scaled_loss:
                         scaled_loss.backward()
                     # self.optimizer.backward(self.loss)
                 else:
