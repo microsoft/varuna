@@ -119,7 +119,7 @@ class Varuna(Module):
         if self.stage < (self.partitions-1):
             self.send_rank = self.stage_to_rank_map[self.stage + 1][rank_within_stage]
 
-        # recieve ranks
+        # receive ranks
         if self.stage > 0:
             self.receive_rank = self.stage_to_rank_map[self.stage - 1][rank_within_stage]
 
@@ -316,8 +316,8 @@ class Pipeline:
         self.grads_queue = Queue()
         self.recompute_queue = Queue()
 
-        self.acts_recieve_thread = None
-        self.grads_recieve_thread = None
+        self.acts_receive_thread = None
+        self.grads_receive_thread = None
         self.acts_send_thread = None
         self.grads_send_thread = None
 
@@ -325,11 +325,11 @@ class Pipeline:
         self.loss = None
         self.average_loss = 0
 
-    def spawn_recieve_workers(self):
+    def spawn_receive_workers(self):
         if self.stage > 0:
-            self.acts_recieve_thread = Thread(target=self.acts_reciever, args=())
-            self.acts_recieve_thread.daemon=True
-            self.acts_recieve_thread.start()
+            self.acts_receive_thread = Thread(target=self.acts_receiver, args=())
+            self.acts_receive_thread.daemon=True
+            self.acts_receive_thread.start()
 
         if self.stage < self.partitions-1:
             self.grads_receive_thread = Thread(target=self.grads_receiver, args=())
@@ -353,7 +353,7 @@ class Pipeline:
             handle.wait()
             count -= 1
     
-    def acts_reciever(self):
+    def acts_receiver(self):
         chunks = len(self.batches)
         dtype = torch.float16 if self.fp16 else torch.float32
         recv_handles = Queue()
@@ -365,7 +365,7 @@ class Pipeline:
                     fwd_inp_shape[0] = self.last_chunk_size
                 acts_tensor = torch.ones(fwd_inp_shape, dtype=dtype)
                 # print("stage", self.stage, "expecting acts of shape", fwd_inp_shape)
-                handle = dist.irecv(acts_tensor, src=self.recieve_rank)
+                handle = dist.irecv(acts_tensor, src=self.receive_rank)
                 # recv_handles.put(handle)
                 handle.wait()
                 self.acts_queue.put(acts_tensor.to(self.device))
@@ -374,7 +374,7 @@ class Pipeline:
             handle.wait()
         del acts_tensor
     
-    def grads_reciever(self):
+    def grads_receiver(self):
         chunks = len(self.batches)
         dtype = torch.float16 if self.fp16 else torch.float32
         recv_handles = Queue()
@@ -436,7 +436,7 @@ class Pipeline:
         while count > 0:
             input_grads = self.grads_send_queue.get()
             # print("stage", self.stage, "sending grads of shape", input_grads.size())
-            handle = dist.isend(input_grads.cpu(), dst=self.recieve_rank)
+            handle = dist.isend(input_grads.cpu(), dst=self.receive_rank)
             send_handles.put(handle)
             # handle.wait()
             del input_grads, handle
@@ -457,7 +457,7 @@ class Pipeline:
         
         self.partitioned_model.set_send_fn(send)
 
-    # tells the model how to recieve acts and gradients
+    # tells the model how to receive acts and gradients
     def set_model_recv_fn(self, recompute = False):
         if recompute:
             ctx, acts = self.recompute_queue.get()
@@ -551,7 +551,7 @@ class Pipeline:
             self.loss = None
         
     def run(self):
-        self.spawn_recieve_workers()
+        self.spawn_receive_workers()
 
         for index, task in enumerate(self.schedule):
             grad_mode = False
