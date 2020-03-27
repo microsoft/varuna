@@ -80,7 +80,7 @@ def create_pretraining_dataset(input_file, max_pred_length, shared_list, args, m
         train_dataloader = DataLoader(train_data, batch_size=(args.train_batch_size // num_replicas), sampler=train_sampler, shuffle = False, drop_last = True, pin_memory=True, num_workers=4)
     else:
         train_sampler = SequentialSampler(train_data)
-    train_dataloader = DataLoader(train_data, sampler=train_sampler,
+        train_dataloader = DataLoader(train_data, sampler=train_sampler,
                                   batch_size=args.train_batch_size, num_workers=4,
                                     pin_memory=True, shuffle = False, drop_last = True)
 
