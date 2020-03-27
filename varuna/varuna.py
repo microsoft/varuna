@@ -521,7 +521,7 @@ class Pipeline:
             # For data parallel, sync only when doing last microbatch fwd/bwd
             # and for fp16, directly just all reduce optimizer master param grads
             task_time = time.time()
-            if (self.data_parallel and task[1] < (len(self.batches) - 1)) or  self.fp16:
+            if self.data_parallel and (task[1] < (len(self.batches) - 1) or  self.fp16):
                 with self.model.no_sync():
                     self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
             else:
