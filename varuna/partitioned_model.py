@@ -26,7 +26,6 @@ class CutPoint(Module):
         self.stage = -1
         self.fp16 = False
 
-
     def forward(self, *inputs, **kwargs):
         # not set by ModelParallel, pass through as is
         if self.cp_func is None:
@@ -55,7 +54,9 @@ class CutPoint(Module):
             def forward(ctx, i):
                 # recieve activations
                 if is_in_next_stage and self.recv_fn is not None:
+                    # recv_time = time.time()
                     i = self.recv_fn()
+                    # recv_time = time.time() - recv_time
                 # send activations
                 elif is_in_prev_stage:
                     self.send_fn(i)
@@ -65,7 +66,10 @@ class CutPoint(Module):
             def backward(ctx, grad_output):
                 # receive gradients.
                 if is_in_prev_stage and self.recv_fn is not None:
+                    # recv_time = time.time()
                     grad_output = self.recv_fn(grads = True)
+                    # recv_time = time.time() - recv_time
+                    # self.logfile.write("rcv grads " + str(recv_time) + "\n")
                 # send gradients
                 elif is_in_next_stage:
                     self.send_fn(grad_output, grads = True)
@@ -101,6 +105,8 @@ class PartitionedModel(Module):
                 break
         else:
             raise ValueError("Rank " + self.rank + " not found in stage to rank map!")
+
+        # self.logfile = open("wait_logs" + str(self.rank),"w")
 
     def initialize(self, dummy_inputs, from_cache=False):
         # print("Initializing partitioned model!")
@@ -334,7 +340,7 @@ class PartitionedModel(Module):
             if self.ret_val is None:
                 raise e
             ret_val = self.ret_val
-
+        # self.logfile.flush()
         self.ret_val = None
         return ret_val 
 
@@ -352,7 +358,6 @@ def load_varuna_checkpoint(my_stage, num_stages, total_num_pstages, common_store
     state_dict = {}
     stages_per_worker = total_num_pstages // num_stages
     pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
-    print(dist.get_rank(),"rank with stage", my_stage, "reads", pstages_to_read)
     for i in pstages_to_read:
         state_dict_ = torch.load(os.path.join(common_store, "cp-pstage-{}".format(i)),map_location="cpu")
         state_dict.update(state_dict_)

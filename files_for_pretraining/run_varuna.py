@@ -23,25 +23,17 @@ def calculate_config(args):
     if unused_gpus > args.ngpus_per_server:
         raise ValueError("Wrong number of servers - too many unused GPUs")
 
-    if args.stage_to_rank_map == "":
-        stage_to_rank_map = {}
-        rank_to_stage_map = {}
+    stage_to_rank_map = {}
+    rank_to_stage_map = {}
 
-        for i in range(dist_world_size):
-            stage = i // gpus_per_stage
-            if stage not in stage_to_rank_map:
-                stage_to_rank_map[stage] = []
-            stage_to_rank_map[stage].append(i)
-            rank_to_stage_map[i] = stage
-        #for i in range(args.nstages):
-        #    stage_to_rank_map[i]= range(i,dist_world_size,args.nstages)
-
-        stage_to_rank_map_str = ""
-        for stage in stage_to_rank_map:
-            ranks = ",".join([str(r) for r in stage_to_rank_map[stage]])
-            stage_to_rank_map_str += (ranks + ";")
-    else:
-        stage_to_rank_map_str = args.stage_to_rank_map
+    for i in range(args.nstages):
+        stage_to_rank_map[i]= range(i,dist_world_size,args.nstages)
+#    for i in range(0,dist_world_size,gpus_per_stage):
+#        stage_to_rank_map[int(i//gpus_per_stage)] = range(i,i+gpus_per_stage)
+    stage_to_rank_map_str = ""
+    for stage in stage_to_rank_map:
+        ranks = ",".join([str(r) for r in stage_to_rank_map[stage]])
+        stage_to_rank_map_str += (ranks + ";")
 
     # batch size should be divisible by num of data parallel workers
     per_gpu_batch_size = args.batch_size // gpus_per_stage
@@ -109,8 +101,6 @@ def parse_args():
     
     parser.add_argument("--chunk_size", type=int, default=-1,
                         help="Micro-batch size per mini-batch")
-
-    parser.add_argument("--stage_to_rank_map", type=str,default="")
 
     # need a better way to pass this information ?
     parser.add_argument("--total_num_stages", required=True, type=int,
@@ -273,9 +263,9 @@ if __name__ == "__main__":
                 raise subprocess.CalledProcessError(returncode=process.returncode,
                                                     cmd=cmd)
 
-        os.system("rm worker_process")
         loop_count += 1
 
         if not loop_pending:
             print("Finished training!!")
             break
+

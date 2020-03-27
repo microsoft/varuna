@@ -37,6 +37,7 @@ from torch.utils.data.distributed import DistributedSampler
 import math
 from apex import amp
 import multiprocessing
+from collections import defaultdict
 
 from tokenization import BertTokenizer
 from modeling import BertForPreTraining, BertConfig
@@ -271,11 +272,8 @@ def setup_training(args):
     args.n_gpu = 1
     torch.cuda.set_device(args.device)
     device = torch.device("cuda", args.device)
-    # os.environ['MASTER_ADDR'] = '127.0.0.1'
-    # os.environ['MASTER_PORT'] = '29500'
     connect_timeout = datetime.timedelta(minutes=10)
     world_size = len(args.stage_to_rank_map.split(";")[0].split(",")) * args.partitions
-    print(world_size)
     torch.distributed.init_process_group(backend='gloo', timeout=connect_timeout, world_size=world_size, rank=args.rank)
     # '''
     '''
@@ -337,12 +335,12 @@ def prepare_model_and_optimizer(args, device):
         if not args.init_checkpoint:
             checkpoint = torch.load(os.path.join(args.output_dir, "ckpt_{}.pt".format(global_step)), map_location="cpu")
             model_cp_dir = os.path.join(args.output_dir, "model_ckpt_{}".format(global_step))
-            print("looaaddingg varuna ckpt", global_step)
+            print("loading varuna ckpt", global_step)
             model_state_dict = load_varuna_checkpoint(args.stage, args.partitions, config.num_hidden_layers, model_cp_dir)
         else:
             checkpoint = torch.load(args.init_checkpoint, map_location="cpu")
 
-        model.load_state_dict(model_state_dict, strict=False)
+        model.load_state_dict(model_state_dict, strict = False)
         if args.phase2:
             global_step -= args.phase1_end_step
         if is_main_process():
@@ -361,6 +359,12 @@ def prepare_model_and_optimizer(args, device):
     lr_scheduler = PolyWarmUpScheduler(optimizer, 
                                        warmup=args.warmup_proportion, 
                                        total_steps=args.max_steps)
+    
+    # this map from optimizer parameters to their names is to checkpoint opt state
+    parameter_names = dict()
+    for n,p in model.named_parameters():
+        parameter_names[p] = n
+    
     if args.fp16:
 
         if args.loss_scale == 0:# and args.rank == args.partitions-1:
@@ -368,6 +372,19 @@ def prepare_model_and_optimizer(args, device):
             amp._amp_state.loss_scalers[0]._loss_scale = 2**20
         else:
             model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale=8.0)
+
+        # need to check if parameter_names map works for new fp16 model params
+        for n,p in model.named_parameters():
+            assert parameter_names[p] == n, "this is wrong"
+
+        # creating new fp32 params for mixed precision optimizer
+        # and mapping these parameters to their names
+        optimizer._amp_lazy_init()
+        fp16_model_params = optimizer._amp_stash.all_fp16_params
+        fp32_master_params = optimizer._amp_stash.all_fp32_from_fp16_params
+        for p_model, p_master in zip(fp16_model_params, fp32_master_params):
+            parameter_names[p_master] = parameter_names.pop(p_model)
+        # parameter_names = parameter_names_
 
     if args.resume_from_checkpoint:
         if args.phase2 or args.init_checkpoint:
@@ -380,31 +397,46 @@ def prepare_model_and_optimizer(args, device):
                 checkpoint['optimizer']['param_groups'][iter]['t_total'] = args.max_steps
                 checkpoint['optimizer']['param_groups'][iter]['warmup'] = args.warmup_proportion
                 checkpoint['optimizer']['param_groups'][iter]['lr'] = args.learning_rate
-        optimizer.load_state_dict(checkpoint['optimizer'])  # , strict=False)
+        
+        amp.load_state_dict(checkpoint['amp'])
+        # reload optimizer state
+        opt_dict = checkpoint['optimizer']
+        opt_cp_dir = os.path.join(args.output_dir, "opt_ckpt_{}".format(global_step))
+        optimizer.load_state_dict(opt_dict)  # , strict=False)
+        optimizer.state = defaultdict(dict)
+        opt_state = {}
+        state_filenames = [f for f in os.listdir(opt_cp_dir) if "opt-state-" in f]
+        if len(state_filenames) == args.partitions:
+            opt_state = torch.load(os.path.join(opt_cp_dir,"opt-state-{}".format(args.stage)))
+        else:
+            for f in state_filenames:
+                state_ = torch.load(os.path.join(opt_cp_dir,f),map_location='cpu')
+                opt_state.update(state_)
+        success = 0
+        for p in amp.master_params(optimizer):
+            name = parameter_names[p]
+            if name in opt_state:
+                optimizer.state[p] = opt_state[name]
+                success += 1
+        print(success, "resume success")
+
+        # Restore AMP master parameters          
+        if args.fp16:
+            # optimizer._lazy_init_maybe_master_weights()
+            # optimizer._amp_stash.lazy_init_called = True
+            # optimizer.load_state_dict(checkpoint['optimizer'])
+            assert optimizer._amp_stash.lazy_init_called, "should already be true!" 
+            master_params = torch.load(os.path.join(opt_cp_dir,"opt-fp32-params-{}".format(args.stage)))
+            for param, saved_param in zip(amp.master_params(optimizer), master_params):
+                param.data.copy_(saved_param.data)
+
         for state in optimizer.state.values():
             for k, v in state.items():
                 if isinstance(v, torch.Tensor):
                     state[k] = v.to(args.device)
 
-        # Restore AMP master parameters          
-        if args.fp16:
-            optimizer._lazy_init_maybe_master_weights()
-            optimizer._amp_stash.lazy_init_called = True
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            for param, saved_param in zip(amp.master_params(optimizer), checkpoint['master params']):
-                param.data.copy_(saved_param.data)
 
-    '''     # not running data parallel
-    if args.local_rank != -1:
-        if not args.allreduce_post_accumulation:
-            model = DDP(model, message_size=250000000, gradient_predivide_factor=torch.distributed.get_world_size())
-        else:
-            flat_dist_call([param.data for param in model.parameters()], torch.distributed.broadcast, (0,) )
-    elif args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
-    # '''
-
-    return model, optimizer, lr_scheduler, checkpoint, global_step
+    return model, optimizer, lr_scheduler, checkpoint, global_step, parameter_names
 
 def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
 
@@ -467,10 +499,6 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
 
 def main():
 
-    # won't work ansync
-    with open("worker_process","a" if os.path.isfile("worker_process") else "w") as f:
-        f.write(" " + str(os.getpid()) + " ")
-
     def handler(signum,_):
         global TERMINATE_TRAINING
         print(args.rank, 'signal handler called with signal', signum)
@@ -498,9 +526,10 @@ def main():
                 args.stage = stage
                 break
 
-    print('stage_to_rank_map = ', stage_to_rank_map, ', args.stage = ', args.stage)
-    if args.rank == stage_to_rank_map[3][-1]:
-        loss_filename = 'stats/pretraining1/varuna_asyncsend_'+("fp16" if args.fp16 else "fp32") +"_"+str(args.learning_rate)+"_"+str(args.train_batch_size)+'_'+str(args.partitions)+'p_'+str(data_depth)+'dp_'+str(args.chunk_size)+'csize_'+str(args.stage) + '.txt'
+    device, args = setup_training(args)
+
+    if args.stage == args.partitions - 1:
+        loss_filename = 'stats/varuna_lamb_'+("fp16" if args.fp16 else "fp32") +"_"+str(args.learning_rate)+"_"+str(args.train_batch_size)+'_'+str(args.partitions)+'p_'+str(data_depth)+'dp_'+str(args.chunk_size)+'csize_'+str(args.rank) + '.txt'
         if os.path.isfile(loss_filename):
             if args.resume_from_checkpoint:
                 loss_file = open(loss_filename, 'a')
@@ -509,12 +538,10 @@ def main():
                 raise RuntimeError("File ({}) already exists.".format(loss_filename))
         else:
             loss_file = open(loss_filename, 'w')
-            # loss_file.write("MB time, total train time, TFLOPS, Max GPU mem, Curr GPU mem, Opt state mem, loss\n")
-
-    device, args = setup_training(args)
+            loss_file.write("MB time, total train time, TFLOPS, Max GPU mem, Curr GPU mem, Opt state mem, loss scale, loss\n")
 
     # Prepare optimizer
-    model, optimizer, lr_scheduler, checkpoint, global_step = prepare_model_and_optimizer(args, device)
+    model, optimizer, lr_scheduler, checkpoint, global_step, parameter_names = prepare_model_and_optimizer(args, device)
 
     if is_main_process():
         print("SEED {}".format(args.seed))
@@ -586,7 +613,6 @@ def main():
                                             pin_memory=True, shuffle = False, drop_last = True)
 
             dummy_input = dict()
-            # '''
             dummy_train_dataloader = DataLoader(train_data, sampler=SequentialSampler(train_data), batch_size=1, num_workers=1, pin_memory=False)
             train_iter = tqdm(dummy_train_dataloader, desc="Iteration")
             for step, batch in enumerate(train_iter):
@@ -602,9 +628,7 @@ def main():
             del train_iter
             del dummy_train_dataloader
 
-            print(args.rank, "has initial memory", torch.cuda.memory_allocated(args.device))
             model = Varuna(model, stage_to_rank_map, dummy_input, args.train_batch_size, optimizer, args.chunk_size, args.fp16, local_rank=args.local_rank, device=args.device)
-            print(args.rank, "model memory", torch.cuda.memory_allocated(args.device))
             model.train()
             # '''
 
@@ -622,14 +646,12 @@ def main():
                     data_file = files[(f_id*torch.distributed.get_world_size()+torch.distributed.get_rank())%num_files]
                 # '''
                 data_file = files[f_id%num_files]
-
                 logger.info("file no %s file %s" % (f_id, previous_file))
-
                 previous_file = data_file
-
                 dataset_future = pool.submit(create_pretraining_dataset, data_file, args.max_predictions_per_seq, shared_file_list, args, my_stage_ranks)
-
                 train_iter = tqdm(train_dataloader, desc="Iteration") if is_main_process() else train_dataloader
+
+
                 for step, batch in enumerate(train_iter):
                     training_steps += 1
                     batch = [t.to(device) for t in batch]
@@ -644,7 +666,6 @@ def main():
 
                     torch.cuda.reset_max_memory_allocated(args.device)
                     pre_pipeline_mem = torch.cuda.memory_allocated(args.device)
-                    
                     minibatch_time = time.time()
                     loss = model(inputs)
                     minibatch_time = time.time() - minibatch_time
@@ -652,29 +673,7 @@ def main():
                     tflops = tflops / (args.partitions * data_depth)        # scale by # gpus
                     avg_mb_time += minibatch_time
                     avg_tflops += tflops
-                    # '''
-
-                    '''
-                    loss = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask,
-                                    masked_lm_labels=masked_lm_labels, next_sentence_label=next_sentence_labels,
-                                    checkpoint_activations=args.checkpoint_activations)
-                    if args.n_gpu > 1:
-                        loss = loss.mean()  # mean() to average on multi-gpu.
-
-                    # do we want this segement of code?
-                    divisor = args.gradient_accumulation_steps
-                    if args.gradient_accumulation_steps > 1:
-                        if not args.allreduce_post_accumulation:
-                            # this division was merged into predivision
-                            loss = loss / args.gradient_accumulation_steps
-                            divisor = 1.0
-                    if args.fp16:
-                        with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
-                            scaled_loss.backward()
-                    else:
-                        loss.backward()
-                    average_loss += loss.item()
-                    # '''
+                    
                     average_loss += loss      # comment this for running without Varuna
                     divisor = args.gradient_accumulation_steps  # args.chunks
 
@@ -685,41 +684,44 @@ def main():
                         max_mem = torch.cuda.max_memory_allocated(args.device)
                         curr_mem = torch.cuda.memory_allocated(args.device)
                         opt_state_mem = curr_mem - pre_pipeline_mem
-                        # print(args.rank, "After", curr_mem)
 
                     if global_step >= args.max_steps:
                         last_num_steps = int(training_steps / args.gradient_accumulation_steps) % args.log_freq
                         last_num_steps = args.log_freq if last_num_steps == 0 else last_num_steps
                         average_loss = torch.tensor(average_loss, dtype=torch.float32).cuda()       # comment this for varuna - maybe not, commenting this is what is causing error at the end of epoch
                         average_loss = average_loss / (last_num_steps * divisor)
-                        # if (torch.distributed.is_initialized()):
-                        #     average_loss /= torch.distributed.get_world_size()
-                        #     torch.distributed.all_reduce(average_loss)
                         if is_main_process():
                             logger.info("Total Steps:{} Final Loss = {}".format(training_steps / args.gradient_accumulation_steps, average_loss.item()))
                     elif training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
-                        # if is_main_process():       # comment this for varuna
-                        if args.rank == stage_to_rank_map[args.partitions-1][-1]:
+                        if args.stage == args.partitions - 1:
                             print("Step:{} Average Loss = {} Step Loss = {} LR {}".format(global_step, average_loss / (
                                         args.log_freq * divisor), loss * args.gradient_accumulation_steps / divisor,
                                         optimizer.param_groups[0]['lr']))
-                        if args.rank == stage_to_rank_map[3][-1]:
-                            if global_step%10==0:
+                        if args.stage == args.partitions - 1:
+                            if global_step%20==0:
                                 loss_file.flush()
                             total_train_time = time.time() - train_start_time
-                            # loss_file.write("{}, {}, {}, {}, {}, {}, {}\n".format(minibatch_time, total_train_time, tflops, max_mem, curr_mem, opt_state_mem, average_loss))
-                            loss_file.write(str(average_loss)+', ')
+                            loss_scale = _amp_state.loss_scalers[0].loss_scale()
+                            loss_file.write("{}, {}, {}, {}, {}, {}, {}, {}\n".format(minibatch_time, total_train_time, tflops, max_mem, curr_mem, opt_state_mem, loss_scale, average_loss))
 
                         average_loss = 0 
 
                     if global_step >= args.max_steps or TERMINATE_TRAINING or training_steps % (
                             args.num_steps_per_checkpoint * args.gradient_accumulation_steps) == 0:
-                        # Save a trained model
+                            # Save a trained model
                         model_cp_dir = os.path.join(args.output_dir, "model_ckpt_{}".format(global_step))
+                        opt_cp_dir = os.path.join(args.output_dir, "opt_ckpt_{}".format(global_step))
                         if args.local_rank == 0 and not os.path.exists(model_cp_dir):
                             os.makedirs(model_cp_dir)
+                        if args.local_rank == 0 and not os.path.exists(opt_cp_dir):
+                            os.makedirs(opt_cp_dir)
                         torch.distributed.barrier()
                         model.checkpoint(model_cp_dir)
+                        model.checkpoint_optimizer(optimizer, parameter_names, opt_cp_dir)
+                        if args.rank == stage_to_rank_map[args.stage][0]:
+                            master_params = list(amp.master_params(optimizer))
+                            # assert len(master_params) == 398,"NO! got {} master params".format(len(master_params))
+                            torch.save(master_params, os.path.join(opt_cp_dir,"opt-fp32-params-{}".format(args.stage)))
                         torch.distributed.barrier()
                         if args.rank == 0:
                             # assert model_state_dict is not None, "Wrong checkpointing!!"
@@ -728,10 +730,13 @@ def main():
                             else:
                                 output_save_file = os.path.join(args.output_dir, "ckpt_{}.pt".format(global_step + args.phase1_end_step))
                             if args.do_train:
-                                torch.save({'optimizer': optimizer.state_dict(),
+                                opt_state_dict = optimizer.state_dict()
+                                opt_state_dict["state"] = {}
+                                torch.save({'optimizer': opt_state_dict,
                                             # 'model': model_state_dict,
-                                            'master params': list(amp.master_params(optimizer)),
-                                            'files': [f_id] + files}, output_save_file)
+                                            # 'master params': list(amp.master_params(optimizer)),
+                                            'files': [f_id] + files,
+                                            'amp': amp.state_dict()}, output_save_file)
 
                                 most_recent_ckpts_paths.append(output_save_file)
                                 most_recent_model_ckpts_paths.append(model_cp_dir)
@@ -740,14 +745,10 @@ def main():
                                     os.remove(ckpt_to_be_removed)
                                     # os.rmdir(most_recent_model_ckpts_paths.pop(0))
 
-                    # if global_step == 1500:
-                    #     os.system("bash signal_remote.sh 4 4")
-                    
-                    if global_step >= args.max_steps or TERMINATE_TRAINING:
-                        del train_dataloader
-                        return args
 
-                    
+                    if global_step >= args.max_steps or TERMINATE_TRAINING:
+                            del train_dataloader
+                            return args
 
                 del train_dataloader
                 # thread.join()
@@ -756,7 +757,7 @@ def main():
                 train_dataloader, data_file = dataset_future.result(timeout=None)
 
             epoch += 1
-    if args.rank == stage_to_rank_map[3][-1]:
+    if args.stage == args.partitions - 1:
         loss_file.close()
 
 
@@ -765,5 +766,3 @@ if __name__ == "__main__":
     args = main()
     if is_main_process():
         print("Total time taken {}".format(time.time() - now))
-
-

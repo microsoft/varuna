@@ -1,9 +1,28 @@
+# coding=utf-8
+# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
+# Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+""" Finetuning Bert for question-answering on SQuAD."""
+
+from __future__ import absolute_import, division, print_function
 
 import argparse
 import logging
 import os
 import random
 import glob
+import signal
 
 import torch.distributed as dist
 from torch.multiprocessing import Process
@@ -22,20 +41,22 @@ np.random.seed(42)
 import random 
 random.seed(42)
 
-from torch.utils.data import (DataLoader, TensorDataset, DistributedSampler)
+from torch.utils.data import (DataLoader, TensorDataset)
 from tqdm import tqdm, trange
 
 from tensorboardX import SummaryWriter
 
 from transformers import (BertConfig, BertForQuestionAnswering, BertTokenizer)
 
-from varuna import Profiling
+from varuna import Varuna
 
-from transformers import AdamW
+from transformers import AdamW, WarmupLinearSchedule
 
 from utils_squad import (read_squad_examples, convert_examples_to_features,
                          RawResult, write_predictions)
 
+TERMINATE_TRAINING = False
+total_terminate_time = 0
 
 logger = logging.getLogger(__name__)
 
@@ -44,33 +65,40 @@ def set_seed(args):
     np.random.seed(42)
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
+    if args.n_gpu > 0:
+        torch.cuda.manual_seed_all(42)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     
 
-def profile(args, train_dataset, model, stage_num, filename, profiler):
-    
-    def get_batch(size, cpu=False):
-        dummy_inp = train_dataset[:size]
-        if not cpu:
-            dummy_inp = tuple(t.to(args.device) for t in dummy_inp)
-        inputs = {  'input_ids':       dummy_inp[0],
-                    'attention_mask':  dummy_inp[1], 
-                    'token_type_ids': dummy_inp[2],
-                    'start_positions': dummy_inp[3], 
-                    'end_positions':   dummy_inp[4]}
-        return inputs 
+def to_list(tensor):
+    return tensor.detach().cpu().tolist()
 
-    profiler.initialize(get_batch(1, cpu=True), stage_num=stage_num, from_cache=True)
+def train(args, train_dataset, model, tokenizer, train_state = None):
 
-    # Prepare optimizer
+    start = time.time()
+
+    epochs_done = minibatches_done = 0
+    if train_state is not None:
+        epochs_done = train_state["epoch"]
+        minibatches_done = train_state["minibatches_done"]
+
+    if args.rank == 0:
+        tb_writer = SummaryWriter()
+
+    args.train_batch_size = args.per_gpu_train_batch_size
+    train_dataloader = DataLoader(train_dataset, batch_size=args.train_batch_size)
+
+    t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
+
+    # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
         {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
         ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+    scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
 
     if args.fp16:
         try:
@@ -79,16 +107,97 @@ def profile(args, train_dataset, model, stage_num, filename, profiler):
             raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
         model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
 
-    set_seed(args)
-    profile = profiler.profile(get_batch, range(1,100), optimizer, filename)
-    return profile
-                    
+    # Train!
+    if args.rank == 0:
+        logger.info("***** Running training *****")
+        logger.info("  Num examples = %d", len(train_dataset))
+        logger.info("  Num Epochs = %d", args.num_train_epochs)
+        logger.info("  Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
+        logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
+                    args.train_batch_size * args.gradient_accumulation_steps * (torch.distributed.get_world_size()))
+        logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
+        logger.info("  Total optimization steps = %d", t_total)
+
+    global_step = 0
+    tr_loss, logging_loss = 0.0, 0.0
+    model.zero_grad()
+    train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.rank != 0, initial = epochs_done)
+    set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
+
+    stage_to_rank_map = {}
+    for i in range(args.partitions):
+        stage_to_rank_map[i] = [i]
+
+    dummy_inp = train_dataset[:1]
+    inputs = {  'input_ids':       dummy_inp[0],
+                'attention_mask':  dummy_inp[1], 
+                'start_positions': dummy_inp[3], 
+                'end_positions':   dummy_inp[4]}
+    inputs['token_type_ids'] = dummy_inp[2]    
+
+    model = Varuna(model, args.partitions, inputs, args.train_batch_size, optimizer, chunks=args.chunks, local_rank=args.local_rank)
+    model.to(args.device)
+
+    print("Init model & training states time", time.time() - start)
+
+    for epoch in train_iterator:
+        epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.rank != 0)
+        for step, batch in enumerate(epoch_iterator):
+
+            if step < minibatches_done:
+                step += 1
+                continue
+                
+            model.train()
+            batch = tuple(t.to(args.device) for t in batch)
+            inputs = {'input_ids':       batch[0],
+                      'attention_mask':  batch[1], 
+                      'token_type_ids':  batch[2],  
+                      'start_positions': batch[3], 
+                      'end_positions':   batch[4]}
+            
+            loss = model(inputs)
+
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                optimizer.step()
+                # scheduler.step()  # Update learning rate schedule
+                model.zero_grad()
+                global_step += 1
+
+                if args.rank == (args.partitions - 1) and args.logging_steps > 0 and global_step % args.logging_steps == 0:
+                    # Log metrics
+                    if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
+                        results = evaluate(args, model, tokenizer)
+                        for key, value in results.items():
+                            tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
+                    # tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
+                    # tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
+                    print("loss at step",global_step, "is ", loss )
+                    # logging_loss = tr_loss
+
+            if TERMINATE_TRAINING:
+                start = time.time()
+                model.checkpoint(os.path.join(args.output_dir,"pytorch_model.bin"))
+                print("Checkpoint time", time.time() - start)
+                train_state = { "epoch": epoch, "minibatches_done": step }
+                torch.save(train_state, os.path.join(args.output_dir,"train_state.bin") )
+                break
+
+        if TERMINATE_TRAINING:
+            break
+
+    if args.rank == 0:
+        tb_writer.close()
+
+    return global_step, tr_loss / global_step
 
 
 def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False):
+    if args.rank != 0 and not evaluate:
+        torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
 
     # Load data features from cache or dataset file
-    input_file = args.train_file
+    input_file = args.predict_file if evaluate else args.train_file
     cached_features_file = os.path.join(os.path.dirname(input_file), 'cached_{}_{}_{}'.format(
         'dev' if evaluate else 'train',
         list(filter(None, args.model_name_or_path.split('/'))).pop(),
@@ -107,8 +216,12 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
                                                 doc_stride=args.doc_stride,
                                                 max_query_length=args.max_query_length,
                                                 is_training=not evaluate)
-        logger.info("Saving features into cached file %s", cached_features_file)
-        torch.save(features, cached_features_file)
+        if args.rank == 0:
+            logger.info("Saving features into cached file %s", cached_features_file)
+            torch.save(features, cached_features_file)
+
+    if args.rank == 0 and not evaluate:
+        torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
 
     # Convert to Tensors and build dataset
     all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
@@ -134,32 +247,67 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
 
 def main(args):
 
+    global total_terminate_time
+
+    rank = args.rank
+    size = args.partitions
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
         raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(args.output_dir))
 
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
-    # torch.cuda.set_device(args.local_rank)
+    if args.local_rank == 0 and not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+
+    # Setup CUDA, GPU & distributed training
+    if args.local_rank == -1 or args.no_cuda:
+        device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+        args.n_gpu = torch.cuda.device_count()
+    else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device("cuda", args.local_rank)
+        args.n_gpu = 1
     args.device = device
 
     # Setup logging
     logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                         datefmt = '%m/%d/%Y %H:%M:%S',
-                        level = logging.INFO)
+                        level = logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
+    logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
+                    args.local_rank, device, args.n_gpu, bool(True), args.fp16)
 
     # Set seed
     set_seed(args)
 
+    # Load pretrained model and tokenizer
+    if args.rank != 0:
+        torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
+
+    train_state = None
+    start = time.time()
     config = BertConfig.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
     tokenizer = BertTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
-    model = BertForQuestionAnswering.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path), config=config)
+    if args.resume:
+        model = BertForQuestionAnswering.from_pretrained(args.output_dir, config=config)
+        train_state = torch.load(os.path.join(args.output_dir,"train_state.bin") )
+    else:
+        model = BertForQuestionAnswering.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path), config=config)
+
+    if args.rank == 0:
+        torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
+    print("Model/config load time", time.time() - start)
 
     logger.info("Training/evaluation parameters %s", args)
 
     # Training
+    start = time.time()
     train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False)
-    profiler = Profiling(model, args.device)
-    profile_gen = profile(args, train_dataset, model, args.stage_num, "profile-{}.csv".format(args.stage_num), profiler)
+    print("Data load time", time.time() - start)
+
+    global_step, tr_loss = train(args, train_dataset, model, tokenizer, train_state)
+
+    total_terminate_time = time.time() - total_terminate_time
+    print("Total terminate time", total_terminate_time)
+    logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
 
 
@@ -205,6 +353,8 @@ if __name__ == "__main__":
     parser.add_argument("--do_lower_case", action='store_true',
                         help="Set this flag if you are using an uncased model.")
 
+    parser.add_argument("--per_gpu_train_batch_size", default=8, type=int,
+                        help="Batch size per GPU/CPU for training.")
     parser.add_argument("--learning_rate", default=5e-5, type=float,
                         help="The initial learning rate for Adam.")
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
@@ -213,6 +363,8 @@ if __name__ == "__main__":
                         help="Weight deay if we apply some.")
     parser.add_argument("--adam_epsilon", default=1e-8, type=float,
                         help="Epsilon for Adam optimizer.")
+    parser.add_argument("--num_train_epochs", default=3.0, type=float,
+                        help="Total number of training epochs to perform.")
     parser.add_argument("--warmup_steps", default=0, type=int,
                         help="Linear warmup over warmup_steps.")
     parser.add_argument("--verbose_logging", action='store_true',
@@ -232,6 +384,8 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=42,
                         help="random seed for initialization")
 
+    parser.add_argument("--local_rank", type=int, default=-1,
+                        help="local_rank for distributed training on gpus")
     parser.add_argument('--fp16', action='store_true',
                         help="Whether to use 16-bit (mixed) precision (through NVIDIA apex) instead of 32-bit")
     parser.add_argument('--fp16_opt_level', type=str, default='O1',
@@ -239,8 +393,22 @@ if __name__ == "__main__":
                              "See details at https://nvidia.github.io/apex/amp.html")
 
 
-    parser.add_argument('--stage_num', type=int, default=1, help='Which stage to profile')
-
+    parser.add_argument('--resume', action='store_true', help="whether to resume training from checkpoint")
+    parser.add_argument('--chunks', type=int, default=1, help="Number of micro-batches per mini-batch")
+    parser.add_argument('--partitions', type=int, default=3, help='Number of devices over which the model is split')
+    parser.add_argument('--rank', type=int, default=0, help='Partition index')
     args = parser.parse_args()
+
+    def handler(signum,_):
+        global TERMINATE_TRAINING, total_terminate_time
+        print(args.rank, 'signal handler called with signal', signum)
+        TERMINATE_TRAINING = True
+        total_terminate_time = time.time()
+
+    signal.signal(signal.SIGUSR1, handler)
+    
+
+    connect_timeout = datetime.timedelta(minutes=6)
+    dist.init_process_group('gloo', timeout=connect_timeout)
 
     main(args)
