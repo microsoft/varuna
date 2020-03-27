@@ -7,7 +7,9 @@ from queue import Queue
 from threading import Thread
 import math
 from apex import amp
-import time 
+import time
+from apex.amp import _amp_state
+import amp_C, apex_C
 
 from .partitioned_model import PartitionedModel
 import gc
@@ -92,8 +94,9 @@ class Varuna(Module):
             "receive_rank": self.receive_rank,
             "send_rank": self.send_rank,
             "device": self.device,
-            "data_parallel": bool(len(self.stage_to_rank_map[self.stage]) > 1),
-            "make_logfile": bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
+            "data_depth": len(self.stage_to_rank_map[self.stage]),
+            "dp_process_group": self.process_group, 
+            "make_logfile": False, #bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
             "last_chunk_size": self.last_chunk_size,
             "embedding_recv_rank": self.embedding_recv_rank,
             "embedding_send_rank": self.embedding_send_rank
@@ -133,6 +136,7 @@ class Varuna(Module):
 
     def init_distributed(self):
         # create same process groups on all ranks
+        self.process_group = None
         process_groups = {}
         for stage in range(self.partitions):
             ranks = self.stage_to_rank_map[stage]
@@ -144,7 +148,8 @@ class Varuna(Module):
         if process_groups[self.stage] is not None:
             self.partitioned_model = self.model
             self.model = torch.nn.parallel.DistributedDataParallel(self.model, process_group=process_groups[self.stage], device_ids=[self.device], find_unused_parameters=True)    
-    
+            self.process_group = process_groups[self.stage]
+
     def forward(self, inputs):        
         # Divide a mini-batch into micro-batches.
         batches = scatter(inputs, self.micro_batch_size)
@@ -171,29 +176,33 @@ class Varuna(Module):
 
     def checkpoint_optimizer(self, optimizer, parameter_names, cp_dir_name):
         cp_time = time.time()
-        sd = None
-        if self.stage != 0 and self.rank == self.stage_to_rank_map[self.stage][0]:
+        # sd = None
+
+        # one worker from each partition
+        if self.rank == self.stage_to_rank_map[self.stage][0]:
             new_state = dict()
+            # store state by param names instead of actual parameters
             for key in optimizer.state:
                 new_state[parameter_names[key]] = optimizer.state[key]
             torch.save(new_state, os.path.join(cp_dir_name,"opt-state-" + str(self.stage)))
         torch.distributed.barrier()
-        if self.stage == 0 and self.rank == self.stage_to_rank_map[0][0]:
-            sd = optimizer.state_dict()
-            new_state = dict()
-            for key in optimizer.state:
-                new_state[parameter_names[key]] = optimizer.state[key]
-            for stage in range(1,self.partitions):
-                state_filename = os.path.join(cp_dir_name,"opt-state-" + str(stage))
-                state_ = torch.load(state_filename)
-                new_state.update(state_)
-                os.remove(state_filename)
-            sd["state"] = new_state
-            # torch.save(sd, os.path.join(cp_dir_name,"opt-state"))
-        torch.distributed.barrier()
+
+        # if self.stage == 0 and self.rank == self.stage_to_rank_map[0][0]:
+        #     sd = optimizer.state_dict()
+        #     new_state = dict()
+        #     for key in optimizer.state:
+        #         new_state[parameter_names[key]] = optimizer.state[key]
+        #     for stage in range(1,self.partitions):
+        #         state_filename = os.path.join(cp_dir_name,"opt-state-" + str(stage))
+        #         state_ = torch.load(state_filename)
+        #         new_state.update(state_)
+        #         os.remove(state_filename)
+        #     sd["state"] = new_state
+        #     # torch.save(sd, os.path.join(cp_dir_name,"opt-state"))
+        # torch.distributed.barrier()
         cp_time = time.time() - cp_time
         print("Opt ckpt time", cp_time)
-        return sd
+        # return sd
 
     def to(self, device):
         self.model.to(device)
@@ -236,7 +245,9 @@ class Pipeline:
         self.batches = batches
         self.partitions = config["partitions"]
         self.stage = config["stage"]
-        self.data_parallel = config["data_parallel"]
+        self.data_depth = config["data_depth"]
+        self.data_parallel = bool(self.data_depth > 1)
+        self.process_group = config["dp_process_group"]
 
         self.model = model
         self.partitioned_model = self.model.module if self.data_parallel else self.model
@@ -473,12 +484,8 @@ class Pipeline:
             if self.stage != self.partitions-1:
                 grads = torch.ones(self.loss.size(), dtype = torch.float32).to(self.device)
                 if self.fp16:
-                    # if dist.get_rank() == 1:
-                    #     print("SIZE",self.loss[0][0][0])
                     with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_microbatch=lastub, last_partition=False) as scaled_loss:
                         scaled_loss.backward(grads)
-                    # self.optimizer.backward(self.loss, grads=grads)
-                    # self.loss.backward(grads)
                 else:
                     self.loss.backward(grads)
 
@@ -490,6 +497,10 @@ class Pipeline:
                 if self.fp16:
                     with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_microbatch=lastub) as scaled_loss:
                         scaled_loss.backward()
+                        # if lastub:
+                        #     for p in self.optimizer.state:
+                        #         assert p.grad is None,"why is the optimizer getting grads"
+
                     # self.optimizer.backward(self.loss)
                 else:
                     self.loss.backward()
@@ -508,8 +519,9 @@ class Pipeline:
                     grad_mode=True
 
             # For data parallel, sync only when doing last microbatch fwd/bwd
+            # and for fp16, directly just all reduce optimizer master param grads
             task_time = time.time()
-            if self.data_parallel and task[1] < (len(self.batches) - 1):
+            if (self.data_parallel and task[1] < (len(self.batches) - 1)) or  self.fp16:
                 with self.model.no_sync():
                     self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
             else:
@@ -521,6 +533,9 @@ class Pipeline:
             
             if self.make_logfile:
                 self.logfile.write("{} {} {}\n".format(TASK[task[0]],task[1], str(task_time)))
+        
+        if self.fp16 and self.data_parallel:
+            self.all_reduce_opt_grads()
 
         if self.make_logfile:
             self.logfile.write("\n\nBATCH END\n\n")
@@ -537,6 +552,27 @@ class Pipeline:
 
         # return loss
         return self.average_loss
+
+    def all_reduce_opt_grads(self):
+        # 1. allocate an uninitialized buffer for flattened gradient
+        scaler = _amp_state.loss_scalers[0]
+        master_grads = [p.grad for p in amp.master_params(self.optimizer) if p.grad is not None]
+        flat_grad_size = sum(p.numel() for p in master_grads)
+        flat_raw = torch.empty(flat_grad_size, device=self.device, dtype=torch.float32)
+        # 2. combine unflattening and predivision of unscaled 'raw' gradient
+        allreduced_views = apex_C.unflatten(flat_raw, master_grads)
+        overflow_buf = torch.cuda.IntTensor([0]) # not checking for overflow manually
+        amp_C.multi_tensor_scale(65536,
+            overflow_buf,
+            [master_grads, allreduced_views],
+            scaler.loss_scale() / self.data_depth)
+        # 3. sum gradient across ranks. Because of the predivision, this averages the gradient
+        torch.distributed.all_reduce(flat_raw, group=self.process_group)
+        # 4. combine unscaling and unflattening of allreduced gradient
+        amp_C.multi_tensor_scale(65536,
+            overflow_buf,
+            [allreduced_views, master_grads],
+            1./scaler.loss_scale())
 
 def scatter(input, chunk_size):
     """

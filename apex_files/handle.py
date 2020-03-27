@@ -20,7 +20,8 @@ def scale_loss(loss,
                model=None,
                delay_unscale=False,
                delay_overflow_check=False,
-               last_microbatch=False):#,
+               last_microbatch=False,
+               last_partition=True):#,
             #    sync_step=False):
     """
     On context manager entrance, creates ``scaled_loss = (loss.float())*current loss scale``.
@@ -116,7 +117,7 @@ def scale_loss(loss,
                     optimizer._prepare_amp_backward()
 
     # yield (loss.float())*loss_scale
-    if torch.distributed.get_rank()==torch.distributed.get_world_size()-1:
+    if last_partition:
         # print(torch.distributed.get_rank(), ': handle.py: last gpu. scaling loss')
         yield (loss.float())*loss_scale
     else:
@@ -124,7 +125,6 @@ def scale_loss(loss,
         yield loss.float()
 
     if delay_unscale:
-        print('delay unscale is true')
         for optimizer in optimizers:
             optimizer._amp_stash.params_have_scaled_gradients = True
     else:
