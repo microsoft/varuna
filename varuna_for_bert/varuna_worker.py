@@ -86,15 +86,14 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map, train_state 
         minibatches_done = train_state["minibatches_done"]
     
     data_depth = len(stage_to_rank_map[0])
-    total_batch_size = args.train_batch_size * args.gradient_accumulation_steps
     
     if args.report_name == "":
-        args.report_name = "train_reports/report-{}-{}-{}-{}_{}.csv".format(args.partitions, data_depth , total_batch_size, args.chunks, args.rank)
+        args.report_name = "train_reports/report-{}-{}-{}-{}_{}.csv".format(args.partitions, data_depth , args.train_batch_size, args.chunk_size, args.rank)
 
     
     if os.path.exists(args.report_name) and args.resume:
         of = open(args.report_name, "a")
-        of.write("morphed to {}-{}-{}\n".format(args.partitions, data_depth, total_batch_size))
+        of.write("morphed to {}-{}-{}\n".format(args.partitions, data_depth, args.train_batch_size))
     else:
         of = open(args.report_name, "w")
         of.write("MB time, TFLOPS, Max GPU mem, Curr GPU mem, loss\n")
@@ -152,7 +151,7 @@ def train(args, train_dataset, model, tokenizer, stage_to_rank_map, train_state 
                 'end_positions':   dummy_inp[4]}
     inputs['token_type_ids'] = dummy_inp[2]    
 
-    model = Varuna(model, stage_to_rank_map, inputs, args.train_batch_size, optimizer, chunks=args.chunks, local_rank=args.local_rank)
+    model = Varuna(model, stage_to_rank_map, inputs, args.train_batch_size, optimizer, chunk_size=args.chunk_size, local_rank=args.local_rank)
 
     # Train!
     if args.rank == 0:
@@ -457,7 +456,7 @@ if __name__ == "__main__":
                              "See details at https://nvidia.github.io/apex/amp.html")
 
 
-    parser.add_argument('--chunks', type=int, default=1, help="Number of micro-batches per mini-batch")
+    parser.add_argument('--chunk_size', type=int, default=1, help="Micro batch size for each mini batch")
     parser.add_argument('--partitions', type=int, default=3, help='Number of devices over which the model is split')
     parser.add_argument('--stage_to_rank_map',type=str, default="",help="How GPU processes are divided among partitions")
     parser.add_argument('--rank', type=int, default=0, help='Partition index')

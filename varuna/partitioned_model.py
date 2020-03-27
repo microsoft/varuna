@@ -26,7 +26,6 @@ class CutPoint(Module):
         self.stage = -1
         self.fp16 = False
 
-
     def forward(self, *inputs, **kwargs):
         # not set by ModelParallel, pass through as is
         if self.cp_func is None:
@@ -86,8 +85,8 @@ class PartitionedModel(Module):
         self.local_rank = local_rank
         self.fp16 = fp16
         
-        torch.cuda.set_device(self.local_rank)
-        self.device = torch.device("cuda", self.local_rank)
+        torch.cuda.set_device(device)
+        self.device = torch.device("cuda", device)
 
         self.ret_val = None
         self.pre_cp = None
@@ -101,6 +100,7 @@ class PartitionedModel(Module):
         else:
             raise ValueError("Rank " + self.rank + " not found in stage to rank map!")
 
+
     def initialize(self, dummy_inputs, from_cache=False):
         # print("Initializing partitioned model!")
         start = time.time()
@@ -110,11 +110,7 @@ class PartitionedModel(Module):
         self.remove_unused_parameters()
         self.model_pruned = True
 
-    def mark_distributed(self, process_group):
-        self.module = torch.nn.parallel.DistributedDataParallel(self.module, process_group=process_group, device_ids=[self.local_rank], find_unused_parameters=True)
-        self.is_data_parallel = True
 
-    
     def dry_run(self, dummy_inputs, from_cache):
         # """ executes the forward pass of the module on dummy inputs. Sets the order in which modules are used and the total number of cutpoints declared. """
         self.ordered_modules = OrderedDict()
@@ -337,7 +333,6 @@ class PartitionedModel(Module):
             if self.ret_val is None:
                 raise e
             ret_val = self.ret_val
-
         self.ret_val = None
         return ret_val 
 
@@ -355,7 +350,6 @@ def load_varuna_checkpoint(my_stage, num_stages, total_num_pstages, common_store
     state_dict = {}
     stages_per_worker = total_num_pstages // num_stages
     pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
-    print(dist.get_rank(),"rank with stage", my_stage, "reads", pstages_to_read)
     for i in pstages_to_read:
         state_dict_ = torch.load(os.path.join(common_store, "cp-pstage-{}".format(i)),map_location="cpu")
         state_dict.update(state_dict_)
