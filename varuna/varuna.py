@@ -485,7 +485,7 @@ class Pipeline:
         # because there's no peek/front method for these queues
         return acts
 
-    def worker(self, task, grad_mode, inputs_as_dict):
+    def worker(self, task, grad_mode, inputs_as_dict, lastub):
         """ Main body of worker loop """
 
         if task == 0:       
@@ -537,7 +537,7 @@ class Pipeline:
                 self.average_loss += self.loss.item()
 
                 if self.fp16:
-                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False) as scaled_loss:
+                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_microbatch=lastub, last_partition=True) as scaled_loss:
                         scaled_loss.backward()
                         # if lastub:
                         #     for p in self.optimizer.state:
@@ -563,13 +563,14 @@ class Pipeline:
             # For data parallel, sync only when doing last microbatch fwd/bwd
             # and for fp16, directly just all reduce optimizer master param grads
             task_time = time.time()
-            if (self.data_parallel and task[1] < (len(self.batches) - 1)) or  self.fp16:
-                with self.model.no_sync():
-                    self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
-            else:
-                self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
-                if self.make_logfile:
-                    self.logfile.write("SYNC! ")
+            # if (self.data_parallel and task[1] < (len(self.batches) - 1)) or  self.fp16:
+            #     with self.model.no_sync():
+            #         self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
+            # else:
+            #     self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
+            #     if self.make_logfile:
+            #         self.logfile.write("SYNC! ")
+            self.worker(task[0], grad_mode, self.batches[task[1]], task[1]==len(self.batches)-1)
 
             task_time = time.time() - task_time
             
