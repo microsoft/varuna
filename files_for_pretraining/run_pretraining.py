@@ -33,14 +33,14 @@ import os
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, Dataset
-# from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data.distributed import DistributedSampler
 import math
 from apex import amp
 import multiprocessing
 
 from tokenization import BertTokenizer
 from modeling import BertForPreTraining, BertConfig
-from apex.optimizers import FusedLAMB, FusedAdam
+from apex.optimizers import FusedLAMB
 from schedulers import PolyWarmUpScheduler
 
 from file_utils import PYTORCH_PRETRAINED_BERT_CACHE
@@ -51,11 +51,14 @@ from apex.parallel.distributed import flat_dist_call
 import amp_C
 import apex_C
 from apex.amp import _amp_state
+import signal
 
 from concurrent.futures import ProcessPoolExecutor
 
-from varuna import Varuna
+from varuna import Varuna, load_varuna_checkpoint
 import datetime
+
+TERMINATE_TRAINING = False
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
@@ -63,16 +66,23 @@ logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message
 logger = logging.getLogger(__name__)
 
 
-def create_pretraining_dataset(input_file, max_pred_length, shared_list, args):
+def create_pretraining_dataset(input_file, max_pred_length, shared_list, args, my_stage_ranks):
 
     train_data = pretraining_dataset(input_file=input_file, max_pred_length=max_pred_length)
-    train_sampler = RandomSampler(train_data)
-    # train_dataloader = DataLoader(train_data, sampler=train_sampler,
-    #                               batch_size=args.train_batch_size * args.n_gpu, num_workers=4,
-    #                               pin_memory=True)
-    train_dataloader = DataLoader(train_data, sampler=train_sampler,
-                                  batch_size=args.train_batch_size, num_workers=4,
-                                  pin_memory=True, drop_last=True)
+
+    # Each stage divides data according to it's depth
+    if len(my_stage_ranks) > 1:
+        num_replicas = len(my_stage_ranks)
+        rank_within_stage = my_stage_ranks.index(args.rank)
+        print(args.rank, "has stage with ranks", my_stage_ranks,"; index", rank_within_stage)
+        train_sampler = DistributedSampler(train_data, num_replicas=num_replicas, rank=rank_within_stage, shuffle=False)
+        train_dataloader = DataLoader(train_data, batch_size=(args.train_batch_size // num_replicas), sampler=train_sampler, shuffle = False, drop_last = True, pin_memory=True, num_workers=4)
+    else:
+        train_sampler = SequentialSampler(train_data)
+        train_dataloader = DataLoader(train_data, sampler=train_sampler,
+                                    batch_size=args.train_batch_size, num_workers=4,
+                                    pin_memory=True, shuffle = False, drop_last = True)
+
     return train_dataloader, input_file
 
 class pretraining_dataset(Dataset):
@@ -95,6 +105,8 @@ class pretraining_dataset(Dataset):
         [input_ids, input_mask, segment_ids, masked_lm_positions, masked_lm_ids, next_sentence_labels] = [
             torch.from_numpy(input[index].astype(np.int64)) if indice < 5 else torch.from_numpy(
                 np.asarray(input[index].astype(np.int64))) for indice, input in enumerate(self.inputs)]
+
+        # print("getting index ", index, masked_lm_positions)
 
         masked_lm_labels = torch.ones(input_ids.shape, dtype=torch.long) * -1
         index = self.max_pred_length
@@ -123,10 +135,6 @@ def parse_arguments():
                         type=str,
                         required=True,
                         help="The BERT model config")
-
-    parser.add_argument("--bert_model", default="bert-large-uncased", type=str,
-                        help="Bert pre-trained model selected in the list: bert-base-uncased, "
-                             "bert-large-uncased, bert-base-cased, bert-base-multilingual, bert-base-chinese.")
 
     parser.add_argument("--output_dir",
                         default=None,
@@ -175,6 +183,10 @@ def parse_arguments():
                         type=int,
                         default=-1,
                         help="local_rank for distributed training on gpus")
+    parser.add_argument("--device",
+                        type=int,
+                        default=-1, 
+                        help="GPU number to use for compute")
     parser.add_argument('--seed',
                         type=int,
                         default=42,
@@ -207,7 +219,7 @@ def parse_arguments():
                         help="Step to resume training from.")
     parser.add_argument('--num_steps_per_checkpoint',
                         type=int,
-                        default=100,
+                        default=5,
                         help="Number of update steps until a model checkpoint is saved to disk.")
     parser.add_argument('--phase2',
                         default=False,
@@ -230,10 +242,10 @@ def parse_arguments():
                         action='store_true',
                         help="Whether to run training.")
     # arguments for Varuna
-    parser.add_argument('--chunks',
+    parser.add_argument('--chunk_size',
                         type=int,
                         default=1,
-                        help="Number of micro-batches per mini-batch")
+                        help="Micro batch size per per mini-batch")
     parser.add_argument('--partitions',
                         type=int,
                         default=1,
@@ -242,6 +254,10 @@ def parse_arguments():
                         type=int,
                         default=0,
                         help="Partition index")
+    parser.add_argument("--stage_to_rank_map",
+                        type=str,
+                        default="",
+                        help="Stage to rank map for pipeline")
     args = parser.parse_args()
     return args
 
@@ -250,13 +266,17 @@ def setup_training(args):
     assert (torch.cuda.is_available())
 
     # '''
+    if args.device == -1:
+        args.device = args.local_rank
     args.n_gpu = 1
-    torch.cuda.set_device(args.local_rank)
-    device = torch.device("cuda", args.local_rank)
-    os.environ['MASTER_ADDR'] = '127.0.0.1'
-    os.environ['MASTER_PORT'] = '29503'
-    connect_timeout = datetime.timedelta(minutes=1)
-    torch.distributed.init_process_group(backend='gloo', timeout=connect_timeout, world_size=args.partitions, rank=args.local_rank)
+    torch.cuda.set_device(args.device)
+    device = torch.device("cuda", args.device)
+    # os.environ['MASTER_ADDR'] = '127.0.0.1'
+    # os.environ['MASTER_PORT'] = '29500'
+    connect_timeout = datetime.timedelta(minutes=10)
+    world_size = len(args.stage_to_rank_map.split(";")[0].split(",")) * args.partitions
+    print(world_size)
+    torch.distributed.init_process_group(backend='gloo', timeout=connect_timeout, world_size=world_size, rank=args.rank)
     # '''
     '''
     if args.local_rank == -1:
@@ -316,10 +336,13 @@ def prepare_model_and_optimizer(args, device):
 
         if not args.init_checkpoint:
             checkpoint = torch.load(os.path.join(args.output_dir, "ckpt_{}.pt".format(global_step)), map_location="cpu")
+            model_cp_dir = os.path.join(args.output_dir, "model_ckpt_{}".format(global_step))
+            print("looaaddingg varuna ckpt", global_step)
+            model_state_dict = load_varuna_checkpoint(args.stage, args.partitions, config.num_hidden_layers, model_cp_dir)
         else:
             checkpoint = torch.load(args.init_checkpoint, map_location="cpu")
 
-        model.load_state_dict(checkpoint['model'], strict=False)
+        model.load_state_dict(model_state_dict, strict=False)
         if args.phase2:
             global_step -= args.phase1_end_step
         if is_main_process():
@@ -335,7 +358,6 @@ def prepare_model_and_optimizer(args, device):
 
     optimizer = FusedLAMB(optimizer_grouped_parameters, 
                           lr=args.learning_rate)
-    # optimizer = torch.optim.SGD(optimizer_grouped_parameters, lr=args.learning_rate)
     lr_scheduler = PolyWarmUpScheduler(optimizer, 
                                        warmup=args.warmup_proportion, 
                                        total_steps=args.max_steps)
@@ -346,11 +368,6 @@ def prepare_model_and_optimizer(args, device):
             amp._amp_state.loss_scalers[0]._loss_scale = 2**20
         else:
             model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale=8.0)
-        #     amp._amp_state.loss_scalers[0]._loss_scale = 2**3
-        # if args.rank == args.partitions-1:
-        #     amp._amp_state.loss_scalers[0]._loss_scale = 2**20
-        # else:
-        #     amp._amp_state.loss_scalers[0]._loss_scale = 1
 
     if args.resume_from_checkpoint:
         if args.phase2 or args.init_checkpoint:
@@ -364,6 +381,10 @@ def prepare_model_and_optimizer(args, device):
                 checkpoint['optimizer']['param_groups'][iter]['warmup'] = args.warmup_proportion
                 checkpoint['optimizer']['param_groups'][iter]['lr'] = args.learning_rate
         optimizer.load_state_dict(checkpoint['optimizer'])  # , strict=False)
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(args.device)
 
         # Restore AMP master parameters          
         if args.fp16:
@@ -446,14 +467,49 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
 
 def main():
 
+    # won't work ansync
+    with open("worker_process","a" if os.path.isfile("worker_process") else "w") as f:
+        f.write(" " + str(os.getpid()) + " ")
+
+    def handler(signum,_):
+        global TERMINATE_TRAINING
+        print(args.rank, 'signal handler called with signal', signum)
+        TERMINATE_TRAINING = True
+    
+    signal.signal(signal.SIGUSR1, handler) 
+
     args = parse_arguments()
     random.seed(args.seed)
     np.random.seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
     torch.manual_seed(args.seed)
 
-    if (args.local_rank == args.partitions-1):
-        loss_file = open('stats/pretraining/varuna_fp16_lamb_debug_'+str(args.train_batch_size)+'_'+str(args.partitions)+'p_'+str(args.chunks)+'c_'+str(args.gradient_accumulation_steps)+'gas.txt', 'w')
+    # parse stage_to_rank_map
+    stage_to_rank_map = args.stage_to_rank_map
+    stage_ranks = stage_to_rank_map.split(";", args.partitions)
+    stage_to_rank_map = {}
+    for i in range(args.partitions):
+        ranks = stage_ranks[i].split(",")
+        stage_to_rank_map[i] = [int(r) for r in ranks]
+    data_depth = len(ranks)
+
+    for stage in stage_to_rank_map:
+        for rank in stage_to_rank_map[stage]:
+            if rank == args.rank:
+                args.stage = stage
+                break
+
+    print('stage_to_rank_map = ', stage_to_rank_map, ', args.stage = ', args.stage)
+    if args.rank == stage_to_rank_map[3][-1]:
+        loss_filename = 'stats/pretraining1/varuna_asyncsend_'+("fp16" if args.fp16 else "fp32") +"_"+str(args.learning_rate)+"_"+str(args.train_batch_size)+'_'+str(args.partitions)+'p_'+str(data_depth)+'dp_'+str(args.chunk_size)+'csize_'+str(args.stage) + '.txt'
+        if os.path.isfile(loss_filename):
+            if args.resume_from_checkpoint:
+                loss_file = open(loss_filename, 'a')
+                loss_file.write("resuming\n")
+            else:
+                raise RuntimeError("File ({}) already exists.".format(loss_filename))
+        else:
+            loss_file = open(loss_filename, 'w')
+            # loss_file.write("MB time, total train time, TFLOPS, Max GPU mem, Curr GPU mem, Opt state mem, loss\n")
 
     device, args = setup_training(args)
 
@@ -473,28 +529,15 @@ def main():
 
         # model.train()       # comment this for Varuna
         most_recent_ckpts_paths = []
+        most_recent_model_ckpts_paths = []
         average_loss = 0.0  # averaged loss every args.log_freq steps
         epoch = 0
         training_steps = 0
+        avg_mb_time = 0
+        avg_tflops = 0
+        train_start_time = time.time()
 
         pool = ProcessPoolExecutor(1)
-
-        # placeholder for Varuna init()
-        # '''
-        # parse stage_to_rank_map
-        stage_to_rank_map = "0;1;2;3"
-        stage_ranks = stage_to_rank_map.split(";", args.partitions)
-        stage_to_rank_map = {}
-        for i in range(args.partitions):
-            ranks = stage_ranks[i].split(",")
-            stage_to_rank_map[i] = [int(r) for r in ranks]
-
-        print('stage_to_rank_map = ', stage_to_rank_map)
-        dummy_input = dict()
-        model = Varuna(model, stage_to_rank_map, dummy_input, args.train_batch_size, optimizer, args.fp16, chunks=args.chunks)
-        model.train()
-        # model.eval()
-        # '''
 
         # Note: We loop infinitely over epochs, termination is handled via iteration count
         while True:
@@ -504,7 +547,7 @@ def main():
                          os.path.isfile(os.path.join(args.input_dir, f)) and 'training' in f]
                 files.sort()
                 num_files = len(files)
-                # random.shuffle(files)
+                random.shuffle(files)
                 f_start_id = 0
             else:
                 f_start_id = checkpoint['files'][0]
@@ -527,13 +570,27 @@ def main():
             previous_file = data_file
 
             train_data = pretraining_dataset(data_file, args.max_predictions_per_seq)
-            train_sampler = RandomSampler(train_data)
 
-            '''
+            my_stage_ranks = stage_to_rank_map[args.stage]
+
+            if len(my_stage_ranks) > 1:
+                num_replicas = len(my_stage_ranks)
+                rank_within_stage = my_stage_ranks.index(args.rank)
+                # print(args.rank, "has stage with ranks", my_stage_ranks,"; index", rank_within_stage)
+                train_sampler = DistributedSampler(train_data, num_replicas=num_replicas, rank=rank_within_stage, shuffle=False)
+                train_dataloader = DataLoader(train_data, batch_size=(args.train_batch_size // num_replicas), sampler=train_sampler, shuffle = False, drop_last = True, pin_memory=True, num_workers=4)
+            else:
+                train_sampler = SequentialSampler(train_data)
+                train_dataloader = DataLoader(train_data, sampler=train_sampler,
+                                            batch_size=args.train_batch_size, num_workers=4,
+                                            pin_memory=True, shuffle = False, drop_last = True)
+
             dummy_input = dict()
-            dummy_train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=1, num_workers=1, pin_memory=False)
+            # '''
+            dummy_train_dataloader = DataLoader(train_data, sampler=SequentialSampler(train_data), batch_size=1, num_workers=1, pin_memory=False)
             train_iter = tqdm(dummy_train_dataloader, desc="Iteration")
             for step, batch in enumerate(train_iter):
+            # batch = train_data[:1]
                 batch = [t.to(device) for t in batch]
                 input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
                 dummy_input['input_ids'] = input_ids
@@ -544,33 +601,13 @@ def main():
                 break
             del train_iter
             del dummy_train_dataloader
-            # '''
 
-            # train_dataloader = DataLoader(train_data, sampler=train_sampler,
-            #                               batch_size=args.train_batch_size * args.n_gpu, num_workers=4,
-            #                               pin_memory=True)
-            train_dataloader = DataLoader(train_data, sampler=train_sampler,
-                                          batch_size=args.train_batch_size, num_workers=4,
-                                          pin_memory=True, drop_last=True)
-            # shared_file_list["0"] = (train_dataloader, data_file)     # commented in the original code itself
-
-            # Varuna placeholder
-            '''
-            # parse stage_to_rank_map
-            stage_to_rank_map = "0;1;2;3"
-            stage_ranks = stage_to_rank_map.split(";", args.partitions)
-            stage_to_rank_map = {}
-            for i in range(args.partitions):
-                ranks = stage_ranks[i].split(",")
-                stage_to_rank_map[i] = [int(r) for r in ranks]
-
-            print('stage_to_rank_map = ', stage_to_rank_map)
-            model = Varuna(model, stage_to_rank_map, dummy_input, args.train_batch_size, optimizer, args.fp16, chunks=args.chunks)
+            print(args.rank, "has initial memory", torch.cuda.memory_allocated(args.device))
+            model = Varuna(model, stage_to_rank_map, dummy_input, args.train_batch_size, optimizer, args.chunk_size, args.fp16, local_rank=args.local_rank, device=args.device)
+            print(args.rank, "model memory", torch.cuda.memory_allocated(args.device))
             model.train()
-            # model.eval()
             # '''
-            
-            
+
             overflow_buf = None
             if args.allreduce_post_accumulation:
                 overflow_buf = torch.cuda.IntTensor([0])
@@ -590,11 +627,10 @@ def main():
 
                 previous_file = data_file
 
-                dataset_future = pool.submit(create_pretraining_dataset, data_file, args.max_predictions_per_seq, shared_file_list, args)
+                dataset_future = pool.submit(create_pretraining_dataset, data_file, args.max_predictions_per_seq, shared_file_list, args, my_stage_ranks)
 
                 train_iter = tqdm(train_dataloader, desc="Iteration") if is_main_process() else train_dataloader
                 for step, batch in enumerate(train_iter):
-
                     training_steps += 1
                     batch = [t.to(device) for t in batch]
                     input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
@@ -605,7 +641,17 @@ def main():
                     inputs['attention_mask'] = input_mask
                     inputs['masked_lm_labels'] = masked_lm_labels
                     inputs['next_sentence_label'] = next_sentence_labels
+
+                    torch.cuda.reset_max_memory_allocated(args.device)
+                    pre_pipeline_mem = torch.cuda.memory_allocated(args.device)
+                    
+                    minibatch_time = time.time()
                     loss = model(inputs)
+                    minibatch_time = time.time() - minibatch_time
+                    tflops = 1.33 * (args.train_batch_size / minibatch_time)     # TFLOPS ~ 1.33 * examples per sec
+                    tflops = tflops / (args.partitions * data_depth)        # scale by # gpus
+                    avg_mb_time += minibatch_time
+                    avg_tflops += tflops
                     # '''
 
                     '''
@@ -630,11 +676,16 @@ def main():
                     average_loss += loss.item()
                     # '''
                     average_loss += loss      # comment this for running without Varuna
-                    divisor = 1.0 #args.gradient_accumulation_steps  # args.chunks
+                    divisor = args.gradient_accumulation_steps  # args.chunks
 
                     if training_steps % args.gradient_accumulation_steps == 0:
                         lr_scheduler.step()  # learning rate warmup
+                        # print(args.rank, "before optimizer step",torch.cuda.memory_allocated(args.device))
                         global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
+                        max_mem = torch.cuda.max_memory_allocated(args.device)
+                        curr_mem = torch.cuda.memory_allocated(args.device)
+                        opt_state_mem = curr_mem - pre_pipeline_mem
+                        # print(args.rank, "After", curr_mem)
 
                     if global_step >= args.max_steps:
                         last_num_steps = int(training_steps / args.gradient_accumulation_steps) % args.log_freq
@@ -648,46 +699,55 @@ def main():
                             logger.info("Total Steps:{} Final Loss = {}".format(training_steps / args.gradient_accumulation_steps, average_loss.item()))
                     elif training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
                         # if is_main_process():       # comment this for varuna
-                        if args.local_rank == args.partitions-1:
+                        if args.rank == stage_to_rank_map[args.partitions-1][-1]:
                             print("Step:{} Average Loss = {} Step Loss = {} LR {}".format(global_step, average_loss / (
-                                        args.log_freq * divisor),
-                                                                                            loss * args.gradient_accumulation_steps / divisor,
-                                                                                            optimizer.param_groups[0][
-                                                                                                'lr']))
-                            if global_step%50==0:
+                                        args.log_freq * divisor), loss * args.gradient_accumulation_steps / divisor,
+                                        optimizer.param_groups[0]['lr']))
+                        if args.rank == stage_to_rank_map[3][-1]:
+                            if global_step%10==0:
                                 loss_file.flush()
+                            total_train_time = time.time() - train_start_time
+                            # loss_file.write("{}, {}, {}, {}, {}, {}, {}\n".format(minibatch_time, total_train_time, tflops, max_mem, curr_mem, opt_state_mem, average_loss))
                             loss_file.write(str(average_loss)+', ')
-                        # else:
-                        #     print("0: LR {}".format(optimizer.param_groups[0]['lr']))
 
-                        average_loss = 0
+                        average_loss = 0 
 
-                    if global_step >= args.max_steps or training_steps % (
+                    if global_step >= args.max_steps or TERMINATE_TRAINING or training_steps % (
                             args.num_steps_per_checkpoint * args.gradient_accumulation_steps) == 0:
-                        if is_main_process():
-                            # Save a trained model
-                            logger.info("** ** * Saving fine - tuned model ** ** * ")
-                            model_to_save = model.module if hasattr(model,
-                                                                    'module') else model  # Only save the model it-self
+                        # Save a trained model
+                        model_cp_dir = os.path.join(args.output_dir, "model_ckpt_{}".format(global_step))
+                        if args.local_rank == 0 and not os.path.exists(model_cp_dir):
+                            os.makedirs(model_cp_dir)
+                        torch.distributed.barrier()
+                        model.checkpoint(model_cp_dir)
+                        torch.distributed.barrier()
+                        if args.rank == 0:
+                            # assert model_state_dict is not None, "Wrong checkpointing!!"
                             if args.resume_step < 0 or not args.phase2:
                                 output_save_file = os.path.join(args.output_dir, "ckpt_{}.pt".format(global_step))
                             else:
                                 output_save_file = os.path.join(args.output_dir, "ckpt_{}.pt".format(global_step + args.phase1_end_step))
                             if args.do_train:
-                                torch.save({'model': model_to_save.state_dict(),
-                                            'optimizer': optimizer.state_dict(),
+                                torch.save({'optimizer': optimizer.state_dict(),
+                                            # 'model': model_state_dict,
                                             'master params': list(amp.master_params(optimizer)),
                                             'files': [f_id] + files}, output_save_file)
 
                                 most_recent_ckpts_paths.append(output_save_file)
+                                most_recent_model_ckpts_paths.append(model_cp_dir)
                                 if len(most_recent_ckpts_paths) > 3:
                                     ckpt_to_be_removed = most_recent_ckpts_paths.pop(0)
                                     os.remove(ckpt_to_be_removed)
+                                    # os.rmdir(most_recent_model_ckpts_paths.pop(0))
 
-                        if global_step >= args.max_steps:
-                            del train_dataloader
-                            # thread.join()
-                            return args
+                    # if global_step == 1500:
+                    #     os.system("bash signal_remote.sh 4 4")
+                    
+                    if global_step >= args.max_steps or TERMINATE_TRAINING:
+                        del train_dataloader
+                        return args
+
+                    
 
                 del train_dataloader
                 # thread.join()
@@ -696,7 +756,7 @@ def main():
                 train_dataloader, data_file = dataset_future.result(timeout=None)
 
             epoch += 1
-    if args.rank==args.partitions-1:
+    if args.rank == stage_to_rank_map[3][-1]:
         loss_file.close()
 
 
@@ -705,3 +765,5 @@ if __name__ == "__main__":
     args = main()
     if is_main_process():
         print("Total time taken {}".format(time.time() - now))
+
+

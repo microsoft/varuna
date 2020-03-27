@@ -80,14 +80,15 @@ class PartitionedModel(Module):
     def __init__(self, module, rank, local_rank, device, stage_to_rank_map, fp16):
         super(PartitionedModel, self).__init__()
         self.module = module
+        self.is_data_parallel = False
         self.num_stages = len(stage_to_rank_map)
         self.stage_to_rank_map = stage_to_rank_map
         self.rank = rank
         self.local_rank = local_rank
         self.fp16 = fp16
         
-        torch.cuda.set_device(self.local_rank)
-        self.device = torch.device("cuda", self.local_rank)
+        torch.cuda.set_device(device)
+        self.device = torch.device("cuda", device)
 
         self.ret_val = None
         self.pre_cp = None
@@ -110,11 +111,7 @@ class PartitionedModel(Module):
         self.remove_unused_parameters()
         self.model_pruned = True
 
-    def mark_distributed(self, process_group):
-        self.module = torch.nn.parallel.DistributedDataParallel(self.module, process_group=process_group, device_ids=[self.local_rank], find_unused_parameters=True)
-        self.is_data_parallel = True
 
-    
     def dry_run(self, dummy_inputs, from_cache):
         # """ executes the forward pass of the module on dummy inputs. Sets the order in which modules are used and the total number of cutpoints declared. """
         self.ordered_modules = OrderedDict()

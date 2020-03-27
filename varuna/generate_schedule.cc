@@ -72,7 +72,7 @@ void GenSchedule::Generate() {
   num_bubbles.assign(pipeline_depth_, 0);
 
   int time = 0;
-  for (time = 0; time < 3000; ++time) {
+  for (time = 0; time < 5000; ++time) {
     std::vector<int> mini_batches;
     std::vector<char> queue_ids;
     bool all_queues_empty = true;
