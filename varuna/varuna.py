@@ -347,51 +347,16 @@ class Pipeline:
             self.grads_send_thread.daemon=True
             self.grads_send_thread.start() 
     
-    def acts_handle_wait(self, handles, count):
+    def handle_wait(self, handles, count):
         while count>0:
             handle = handles.get()
-            # print(self.stage, len(self.batches)-count, 'acts_handle_wait')
             handle.wait()
-            # print(self.stage, len(self.batches)-count, 'acts_handle_waited')
             count -= 1
-    
-    def grads_handle_wait(self, handles, count):
-        while count>0:
-            handle = handles.get()
-            # print(self.stage, len(self.batches)-count, 'grads_handle_wait')
-            handle.wait()
-            # print(self.stage, len(self.batches)-count, 'grads_handle_waited')
-            count -= 1
-    
-    # merge later with handle_wait()
-    def acts_recv_handle_wait(self, handles, count):
-        for task,index in self.schedule:
-            if task == 0:
-                handle, tensor = handles.get()
-                print(self.stage, index, 'acts_recv_handle_wait')
-                handle.wait()
-                print(self.stage, index, 'acts_recv_handle_waited')
-                self.acts_queue.put(tensor.to(self.device))
-                count -= 1
-            
-    def grads_recv_handle_wait(self, handles, count):
-        for task,index in self.schedule:
-            if task == 2:
-                handle, tensor = handles.get()
-                print(self.stage, index, 'grads_recv_handle_wait')
-                handle.wait()
-                print(self.stage, index, 'grads_recv_handle_waited')
-                self.grads_queue.put(tensor.to(self.device))
-                count -= 1
     
     def acts_receiver(self):
         chunks = len(self.batches)
         dtype = torch.float16 if self.fp16 else torch.float32
         recv_handles = Queue()
-
-        # wait_handler = Thread(target=self.acts_recv_handle_wait, args=(recv_handles, chunks))
-        # wait_handler.daemon=True
-        # wait_handler.start()
 
         for task,index in self.schedule:
             if task == 0:
@@ -403,27 +368,20 @@ class Pipeline:
                 # print("stage", self.stage, "expecting acts of shape", fwd_inp_shape)
                 handle = dist.irecv(acts_tensor, src=self.receive_rank)
                 recv_handles.put((handle, acts_tensor))
-                if recv_handles.qsize()>1:
+                if recv_handles.qsize()>10:
                     handle, tensor = recv_handles.get()
                     handle.wait()
                     self.acts_queue.put(tensor.to(self.device))
-                # handle.wait()
-                # self.acts_queue.put(acts_tensor.to(self.device))
         while not recv_handles.empty():
             handle, tensor = recv_handles.get()
             handle.wait()
             self.acts_queue.put(tensor.to(self.device))
-        # wait_handler.join()
         del acts_tensor
     
     def grads_receiver(self):
         chunks = len(self.batches)
         dtype = torch.float16 if self.fp16 else torch.float32
         recv_handles = Queue()
-
-        # wait_handler = Thread(target=self.grads_recv_handle_wait, args=(recv_handles, chunks))
-        # wait_handler.daemon=True
-        # wait_handler.start()
 
         for task,index in self.schedule:
             if task == 2:
@@ -435,28 +393,26 @@ class Pipeline:
                 # print("stage", self.stage, "expecting grads of shape", bwd_grad_shape)
                 handle = dist.irecv(grads_tensor, src=self.send_rank)
                 recv_handles.put((handle, grads_tensor))
-                if recv_handles.qsize()>1:
+                if recv_handles.qsize()>10:
                     handle, tensor = recv_handles.get()
                     handle.wait()
                     self.grads_queue.put(tensor.to(self.device))
-                # handle.wait()
-                # self.grads_queue.put(grads_tensor.to(self.device))
         while not recv_handles.empty():
             handle, tensor = recv_handles.get()
             handle.wait()
             self.grads_queue.put(tensor.to(self.device))
-        # wait_handler.join()
         del grads_tensor
 
     def acts_sender(self):
-        count = 0#len(self.batches)
+        count = 0
         for task,index in self.schedule:
             if task == 0:
                 count += 1
+        # count = len(self.batches)   # worsens performance if used instead of for loop. Why?
 
         send_handles = Queue()
 
-        wait_handler = Thread(target=self.acts_handle_wait, args=(send_handles, count))
+        wait_handler = Thread(target=self.handle_wait, args=(send_handles, count))
         wait_handler.daemon=True
         wait_handler.start()
         
@@ -465,24 +421,19 @@ class Pipeline:
             # print("stage", self.stage, "sending acts of shape", output_acts.size())
             handle = dist.isend(output_acts.cpu(), dst=self.send_rank)
             send_handles.put(handle)
-            # handle.wait()
-            # del output_acts, handle
             count -= 1
-        # pull waiting functionality in another thread? Might save meagre memory, but will thread overhead
-        # while not send_handles.empty():
-        #     handle = send_handles.get()
-        #     handle.wait()
         wait_handler.join()
 
     def grads_sender(self):
-        count = 0#len(self.batches)
+        count = 0
         for task,index in self.schedule:
             if task == 2:
                 count += 1
+        # count = len(self.batches)   # worsens performance if used instead of for loop. Why?
         
         send_handles = Queue()
 
-        wait_handler = Thread(target=self.grads_handle_wait, args=(send_handles, count))
+        wait_handler = Thread(target=self.handle_wait, args=(send_handles, count))
         wait_handler.daemon=True
         wait_handler.start()
 
@@ -491,12 +442,7 @@ class Pipeline:
             # print("stage", self.stage, "sending grads of shape", input_grads.size())
             handle = dist.isend(input_grads.cpu(), dst=self.receive_rank)
             send_handles.put(handle)
-            # handle.wait()
-            # del input_grads, handle
             count -= 1
-        # while not send_handles.empty():
-        #     handle = send_handles.get()
-        #     handle.wait()
         wait_handler.join()
         
     # tells the model where to send acts and gradients
@@ -619,10 +565,6 @@ class Pipeline:
             # For data parallel, sync only when doing last microbatch fwd/bwd
             # and for fp16, directly just all reduce optimizer master param grads
             task_time = time.time()
-            # if task[0]==2:
-            #     print(self.stage, 'backward', task[1])
-            # elif task[0]==0:
-            #     print(self.stage, 'forward', task[1])
             if self.data_parallel and (task[1] < (len(self.batches) - 1) or  self.fp16):
                 with self.model.no_sync():
                     self.worker(task[0], grad_mode, self.batches[task[1]], task[1]==len(self.batches)-1)
@@ -635,44 +577,6 @@ class Pipeline:
             
             if self.make_logfile:
                 self.logfile.write("{} {} {}\n".format(TASK[task[0]],task[1], str(task_time)))
-        # '''
-
-        # dynamic schedule - run forward if gradients for backward are not ready yet
-        '''
-        schedule = [s for s in enumerate(self.schedule)]
-        i=0
-        count_fwd = 0
-        while (i<len(schedule)):
-            grad_mode = False
-            index, task = schedule[i]
-            # if (task[0]==1 and count_fwd<len(self.batches) and self.grads_queue.empty()):
-            if (task[0]==1 and count_fwd<len(self.batches) and not self.acts_queue.empty()):
-                j=i
-                while (j<len(schedule)):
-                    if (schedule[j][1][0]==0):
-                        index, task = schedule[j]
-                        schedule.insert(i, schedule[j])
-                        del schedule[j+1]
-                        break
-                    j+=1
-            if (task[0]==0):
-                count_fwd+=1
-                if (self.schedule[index+1][0]==2):      # if next task in schedule is backward  -- no recomputation
-                    grad_mode=True
-
-            task_time = time.time()
-            if task[0]==2:
-                print(self.stage, 'backward', task[1])
-            if self.data_parallel and (task[1] < (len(self.batches) - 1) or  self.fp16):
-                with self.model.no_sync():
-                    self.worker(task[0], grad_mode, self.batches[task[1]], task[1]==len(self.batches)-1)
-            else:
-                self.worker(task[0], grad_mode, self.batches[task[1]], task[1]==len(self.batches)-1)
-                if self.make_logfile:
-                    self.logfile.write("SYNC! ")
-
-            task_time = time.time() - task_time
-            i+=1
         # '''
 
         if self.fp16 and self.data_parallel:
@@ -698,7 +602,6 @@ class Pipeline:
         # 1. allocate an uninitialized buffer for flattened gradient
         scaler = _amp_state.loss_scalers[0]
         master_grads = [p.grad for p in amp.master_params(self.optimizer) if p.grad is not None]
-        print('varuna.py: all_reduce_opt_grads(): len(master_grads) = ', len(master_grads))
         flat_grad_size = sum(p.numel() for p in master_grads)
         flat_raw = torch.empty(flat_grad_size, device=self.device, dtype=torch.float32)
         # 2. combine unflattening and predivision of unscaled 'raw' gradient
