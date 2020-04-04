@@ -15,8 +15,9 @@ def calculate_config(args):
     # world size in terms of number of processes
     gpus_available = args.ngpus_per_server * args.nservers
     gpus_per_stage = (gpus_available // args.nstages) if args.gpus_per_stage == 0 else args.gpus_per_stage
-    dist_world_size = gpus_per_stage * args.nstages
-    assert(dist_world_size < gpus_available, "Too many gpus_per_stage!")
+    args.gpus_per_stage = gpus_per_stage
+    dist_world_size = args.gpus_per_stage * args.nstages
+    assert dist_world_size <= gpus_available, "Too many gpus_per_stage - {}!".format(args.gpus_per_stage)
     unused_gpus = (gpus_available - dist_world_size)
 
     # one whole server is unused
@@ -178,16 +179,22 @@ if __name__ == "__main__":
             ngpus_per_server = int(f.read())
         with open('nservers','r') as f:
             nservers = int(f.read())
-        if args.ngpus_per_server == ngpus_per_server and args.nservers == nservers:
+        with open('nstages','r') as f:
+            nstages = int(f.read())
+        with open('gpus_per_stage','r') as f:
+            gpus_per_stage = int(f.read())
+        if args.ngpus_per_server == ngpus_per_server and args.nservers == nservers and args.nstages == nstages and args.gpus_per_stage == gpus_per_stage:
             return
         loop_pending = True
         if args.node_rank >= nservers:
             loop_pending = False
         args.ngpus_per_server = ngpus_per_server
         args.nservers = nservers
+        args.gpus_per_stage = gpus_per_stage
+        args.nstages = nstages
         for p in processes:
             p.send_signal(signal.SIGUSR1)
-        print("\n\n CONFIG CHANGED TO ",args.ngpus_per_server,"GPUS, ",args.nservers, "SERVERS","\n\n\n")
+        print("\n\n CONFIG CHANGED TO ",args.nstages, "x",args.gpus_per_stage,"!!\n\n\n")
 
     signal.signal(signal.SIGUSR1, handler)
 

@@ -69,6 +69,7 @@ class Varuna(Module):
 
         self.optimizer = optimizer
         self.fp16 = fp16
+        self.overflow = False
 
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
         self.model = PartitionedModel(model, self.rank, self.local_rank, device, self.stage_to_rank_map, self.fp16)
@@ -103,6 +104,7 @@ class Varuna(Module):
         }
 
         self.schedule = self.generate_schedule()
+        self.step = 0
 
     def init_communication(self, rank_within_stage):
         
@@ -128,11 +130,9 @@ class Varuna(Module):
         if self.stage > 0:
             self.fwd_inp_shape = self.model.forward_input_shapes[0]
             self.fwd_inp_shape[0] = self.micro_batch_size
-            # print("Varuna fwd inp shape ", self.fwd_inp_shape)
         if self.stage < (self.partitions-1):
             self.bwd_grad_shape = self.model.backward_grad_shapes[0]
             self.bwd_grad_shape[0] = self.micro_batch_size
-            # print("Varuna bwd grad shape", self.bwd_grad_shape)
 
     def init_distributed(self):
         # create same process groups on all ranks
@@ -145,7 +145,7 @@ class Varuna(Module):
             else:
                 process_groups[stage] = None
 
-        if process_groups[self.stage] is not None:
+        if not self.fp16 and process_groups[self.stage] is not None:
             self.partitioned_model = self.model
             self.model = torch.nn.parallel.DistributedDataParallel(self.model, process_group=process_groups[self.stage], device_ids=[self.device], find_unused_parameters=True)    
             self.process_group = process_groups[self.stage]
@@ -158,8 +158,11 @@ class Varuna(Module):
         # avoid dataloader compute in machines other than the first
         # ask the model writer to pass the input batch generating dataloader function to Varuna::__init__
         # and Varuna can take care of input dataloader explicitly
+        self.config["make_logfile"] = self.config["make_logfile"] and (self.step < 10)
         pipeline = Pipeline(batches, self.model, self.config, self.schedule, self.optimizer)
-        loss = pipeline.run()
+        loss, overflow = pipeline.run()
+        self.overflow = overflow
+        self.step += 1
         return loss
     
     def eval(self):
@@ -174,42 +177,57 @@ class Varuna(Module):
     def checkpoint(self, cp_dir_name):
         return self.partitioned_model.checkpoint(cp_dir_name)
 
-    def checkpoint_optimizer(self, optimizer, parameter_names, cp_dir_name):
+    def checkpoint_optimizer(self, optimizer, parameter_to_name, param_name_to_pstage, cp_dir_name):
         cp_time = time.time()
-        # sd = None
 
         # one worker from each partition
         if self.rank == self.stage_to_rank_map[self.stage][0]:
-            new_state = dict()
+            cuts_per_stage = self.partitioned_model.cuts_per_stage
+            # save param states for each cutpoint separately
+            pstages = range(cuts_per_stage * self.stage, (self.stage+1)* cuts_per_stage)
+            pstage_state_dicts = dict()
+            for i in pstages:
+                pstage_state_dicts[i] = dict()
+
             # store state by param names instead of actual parameters
             for key in optimizer.state:
-                new_state[parameter_names[key]] = optimizer.state[key]
-            torch.save(new_state, os.path.join(cp_dir_name,"opt-state-" + str(self.stage)))
-        torch.distributed.barrier()
+                param_name = parameter_to_name[key]
+                assert param_name in param_name_to_pstage, "param {} not found in rank {}".format(param_name,dist.get_rank())
+                pstage = param_name_to_pstage[param_name]
+                pstage_state_dicts[pstage][param_name] = optimizer.state[key]
+            for i in pstages:
+                torch.save(pstage_state_dicts[i], os.path.join(cp_dir_name,"opt-state-" + str(i)))
 
-        # if self.stage == 0 and self.rank == self.stage_to_rank_map[0][0]:
-        #     sd = optimizer.state_dict()
-        #     new_state = dict()
-        #     for key in optimizer.state:
-        #         new_state[parameter_names[key]] = optimizer.state[key]
-        #     for stage in range(1,self.partitions):
-        #         state_filename = os.path.join(cp_dir_name,"opt-state-" + str(stage))
-        #         state_ = torch.load(state_filename)
-        #         new_state.update(state_)
-        #         os.remove(state_filename)
-        #     sd["state"] = new_state
-        #     # torch.save(sd, os.path.join(cp_dir_name,"opt-state"))
-        # torch.distributed.barrier()
+            # also store optimizer master params for mixed precision training
+            if self.fp16:
+
+                pstage_state_dicts = dict()
+                for i in pstages:
+                    pstage_state_dicts[i] = dict()
+
+                count = 0
+                for p in amp.master_params(optimizer):
+                    param_name = parameter_to_name[p]
+                    # not a part of the worker's stage
+                    if param_name not in param_name_to_pstage:
+                        continue
+                    pstage = param_name_to_pstage[param_name]
+                    if pstage not in pstages:
+                        continue
+                    pstage_state_dicts[pstage][param_name] = p
+                    count += 1
+                for i in pstages:
+                    torch.save(pstage_state_dicts[i], os.path.join(cp_dir_name,"opt-fp32-params-" + str(i)))
+            
+        torch.distributed.barrier()
         cp_time = time.time() - cp_time
         print("Opt ckpt time", cp_time)
-        # return sd
 
     def to(self, device):
         self.model.to(device)
     
     def generate_schedule(self):
         chunks = math.ceil(self.batch_size / self.micro_batch_size)
-        print(chunks,"chunks")
         c_schedule = os.popen(os.path.join(os.path.dirname(os.path.abspath(__file__)),'genschedule ')+str(self.partitions)+' '+str(chunks)+' '+str(self.stage)).read()
         schedule = list()
         steps = c_schedule.split(';')
@@ -278,7 +296,7 @@ class Pipeline:
         #         # self.model.module.model.cls.predictions.decoder.weight = self.model.module.model.cls.predictions.decoder.weight.masked_scatter(mask, encoder_weights.to(self.device))
         #         self.model.module.cls.predictions.decoder.weight = torch.nn.Parameter(encoder_weights.to(self.device))
 
-        baseModule = self.model.module if not self.data_parallel else self.model.module.module
+        baseModule = self.model.module if (self.fp16 or not self.data_parallel) else self.model.module.module
 
         if self.partitions > 1:
             if self.stage == self.partitions - 1:
@@ -360,7 +378,6 @@ class Pipeline:
                 handle = dist.irecv(acts_tensor, src=self.receive_rank)
                 handle.wait()
                 self.acts_queue.put(acts_tensor.to(self.device))
-        del acts_tensor
     
     def grads_receiver(self):
         chunks = len(self.batches)
@@ -376,7 +393,6 @@ class Pipeline:
                 handle = dist.irecv(grads_tensor, src=self.send_rank)
                 handle.wait()
                 self.grads_queue.put(grads_tensor.to(self.device))
-        del grads_tensor
 
     def acts_sender(self):
         count = 0
@@ -484,7 +500,7 @@ class Pipeline:
             if self.stage != self.partitions-1:
                 grads = torch.ones(self.loss.size(), dtype = torch.float32).to(self.device)
                 if self.fp16:
-                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_microbatch=lastub, last_partition=False) as scaled_loss:
+                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=self.data_parallel, last_microbatch=lastub, last_partition=False) as scaled_loss:
                         scaled_loss.backward(grads)
                 else:
                     self.loss.backward(grads)
@@ -495,7 +511,7 @@ class Pipeline:
                 self.average_loss += self.loss.item()
 
                 if self.fp16:
-                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_microbatch=lastub) as scaled_loss:
+                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=self.data_parallel, last_microbatch=lastub) as scaled_loss:
                         scaled_loss.backward()
                         # if lastub:
                         #     for p in self.optimizer.state:
@@ -534,8 +550,9 @@ class Pipeline:
             if self.make_logfile:
                 self.logfile.write("{} {} {}\n".format(TASK[task[0]],task[1], str(task_time)))
         
+        overflow = False
         if self.fp16 and self.data_parallel:
-            self.all_reduce_opt_grads()
+            overflow = self.all_reduce_opt_grads()
 
         if self.make_logfile:
             self.logfile.write("\n\nBATCH END\n\n")
@@ -551,7 +568,7 @@ class Pipeline:
             self.grads_send_thread.join()
 
         # return loss
-        return self.average_loss
+        return self.average_loss, overflow
 
     def all_reduce_opt_grads(self):
         # 1. allocate an uninitialized buffer for flattened gradient
@@ -561,18 +578,35 @@ class Pipeline:
         flat_raw = torch.empty(flat_grad_size, device=self.device, dtype=torch.float32)
         # 2. combine unflattening and predivision of unscaled 'raw' gradient
         allreduced_views = apex_C.unflatten(flat_raw, master_grads)
-        overflow_buf = torch.cuda.IntTensor([0]) # not checking for overflow manually
+        overflow_buf = torch.cuda.IntTensor([0]) 
         amp_C.multi_tensor_scale(65536,
             overflow_buf,
             [master_grads, allreduced_views],
             scaler.loss_scale() / self.data_depth)
         # 3. sum gradient across ranks. Because of the predivision, this averages the gradient
+        allred_time = time.time()
         torch.distributed.all_reduce(flat_raw, group=self.process_group)
+        torch.cuda.synchronize()
+        allred_time = time.time() - allred_time
+        if self.make_logfile:
+            self.logfile.write("SYNC! all_reduce {} {}\n".format(flat_grad_size,allred_time))
         # 4. combine unscaling and unflattening of allreduced gradient
+        overflow_buf.zero_()
         amp_C.multi_tensor_scale(65536,
             overflow_buf,
             [allreduced_views, master_grads],
             1./scaler.loss_scale())
+        scaler = _amp_state.loss_scalers[0]
+        old_overflow_buf = scaler._overflow_buf
+        scaler._overflow_buf = overflow_buf
+        had_overflow = scaler.update_scale_custom(True)
+        scaler._overfloat_buf = old_overflow_buf
+        if had_overflow:
+            print(("Rank {} :: Gradient overflow.  Skipping step, "  +
+                    "reducing loss scale to {}").format(
+                    torch.distributed.get_rank(),
+                    scaler.loss_scale()))
+        return had_overflow
 
 def scatter(input, chunk_size):
     """
@@ -592,3 +626,25 @@ def scatter(input, chunk_size):
     return microbatches
 
 
+def load_varuna_optimizer(optimizer, my_stage, num_stages, total_num_pstages, parameter_names, common_store, fp16=False):
+    stages_per_worker = total_num_pstages // num_stages
+    pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
+    # reload state
+    opt_state = {}
+    for i in pstages_to_read:
+        state_ = torch.load(os.path.join(common_store,"opt-state-{}".format(i)),map_location='cpu')
+        opt_state.update(state_)
+    for p in amp.master_params(optimizer):
+        name = parameter_names[p]
+        if name in opt_state:
+            optimizer.state[p] = opt_state[name]
+    # reload master params
+    if fp16:
+        saved_master_params = dict()
+        for i in pstages_to_read:
+            params_ = torch.load(os.path.join(common_store, "opt-fp32-params-{}".format(i)),map_location="cpu")
+            saved_master_params.update(params_)
+        for p in amp.master_params(optimizer):
+            name = parameter_names[p]
+            if name in saved_master_params:
+                p.data.copy_(saved_master_params[name].data)
