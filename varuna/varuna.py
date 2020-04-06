@@ -73,7 +73,7 @@ class Varuna(Module):
 
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
         self.model = PartitionedModel(model, self.rank, self.local_rank, device, self.stage_to_rank_map, self.fp16)
-        self.model.initialize( dummy_inputs, from_cache=False )
+        self.model.initialize( dummy_inputs, from_cache=True )
         self.partitioned_model = self.model
 
         # assert(batch_size % data_depth == 0, "Batch size not divisible by data parallel depth!")
@@ -97,7 +97,7 @@ class Varuna(Module):
             "device": self.device,
             "data_depth": len(self.stage_to_rank_map[self.stage]),
             "dp_process_group": self.process_group, 
-            "make_logfile": bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
+            "make_logfile": False, #bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
             "last_chunk_size": self.last_chunk_size,
             "embedding_recv_rank": self.embedding_recv_rank,
             "embedding_send_rank": self.embedding_send_rank
@@ -148,7 +148,8 @@ class Varuna(Module):
         if not self.fp16 and process_groups[self.stage] is not None:
             self.partitioned_model = self.model
             self.model = torch.nn.parallel.DistributedDataParallel(self.model, process_group=process_groups[self.stage], device_ids=[self.device], find_unused_parameters=True)    
-            self.process_group = process_groups[self.stage]
+            
+        self.process_group = process_groups[self.stage]
 
     def forward(self, inputs):        
         # Divide a mini-batch into micro-batches.
@@ -205,7 +206,6 @@ class Varuna(Module):
                 for i in pstages:
                     pstage_state_dicts[i] = dict()
 
-                count = 0
                 for p in amp.master_params(optimizer):
                     param_name = parameter_to_name[p]
                     # not a part of the worker's stage
@@ -215,7 +215,6 @@ class Varuna(Module):
                     if pstage not in pstages:
                         continue
                     pstage_state_dicts[pstage][param_name] = p
-                    count += 1
                 for i in pstages:
                     torch.save(pstage_state_dicts[i], os.path.join(cp_dir_name,"opt-fp32-params-" + str(i)))
             
@@ -268,10 +267,10 @@ class Pipeline:
         self.process_group = config["dp_process_group"]
 
         self.model = model
-        self.partitioned_model = self.model.module if self.data_parallel else self.model
+        self.fp16 = config["fp16"]
+        self.partitioned_model = self.model.module if (self.data_parallel and not self.fp16) else self.model
         self.device = config["device"]
         self.schedule = schedule
-        self.fp16 = config["fp16"]
 
         self.fwd_inp_shape = config["fwd_inp_shape"]
         self.bwd_grad_shape = config["bwd_grad_shape"]
@@ -280,7 +279,7 @@ class Pipeline:
         self.make_logfile = config["make_logfile"]
         if self.make_logfile:
             microBS = self.fwd_inp_shape[0] if self.bwd_grad_shape is None else self.bwd_grad_shape[0]
-            logfilename = "varuna_logs-mBS" + str(microBS) + "-stage" + str(self.stage) + "of" + str(self.partitions)
+            logfilename = "varuna_logs-dd" + str(self.data_depth) + "-mBS" + str(microBS) + "-stage" + str(self.stage) + "of" + str(self.partitions)
             self.logfile = open(logfilename,"a")
         # print(self.schedule)
 
@@ -296,7 +295,7 @@ class Pipeline:
         #         # self.model.module.model.cls.predictions.decoder.weight = self.model.module.model.cls.predictions.decoder.weight.masked_scatter(mask, encoder_weights.to(self.device))
         #         self.model.module.cls.predictions.decoder.weight = torch.nn.Parameter(encoder_weights.to(self.device))
 
-        baseModule = self.model.module if (self.fp16 or not self.data_parallel) else self.model.module.module
+        baseModule = self.model.module if (not self.data_parallel or self.fp16) else self.model.module.module
 
         if self.partitions > 1:
             if self.stage == self.partitions - 1:
@@ -513,11 +512,7 @@ class Pipeline:
                 if self.fp16:
                     with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=self.data_parallel, last_microbatch=lastub) as scaled_loss:
                         scaled_loss.backward()
-                        # if lastub:
-                        #     for p in self.optimizer.state:
-                        #         assert p.grad is None,"why is the optimizer getting grads"
 
-                    # self.optimizer.backward(self.loss)
                 else:
                     self.loss.backward()
 
@@ -537,7 +532,7 @@ class Pipeline:
             # For data parallel, sync only when doing last microbatch fwd/bwd
             # and for fp16, directly just all reduce optimizer master param grads
             task_time = time.time()
-            if self.data_parallel and (task[1] < (len(self.batches) - 1) or  self.fp16):
+            if not self.fp16 and self.data_parallel and (task[1] < (len(self.batches) - 1)):
                 with self.model.no_sync():
                     self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
             else:

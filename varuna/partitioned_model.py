@@ -311,12 +311,12 @@ class PartitionedModel(Module):
 
         # last cutpoint
         if len(state_dict.keys()) > 0 and (cp_count < self.cuts_per_stage):
+            state_dict["cls.predictions.bias"] = self.module.cls.predictions.bias
             torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
             for p in temp_param_names:
                 param_name_to_pstage[p] = stage_index
-
-        param_name_to_pstage["cls.predictions.bias"] = 23
-
+            param_name_to_pstage["cls.predictions.bias"] = 23
+            
         print("checkpointed!!")
         return param_name_to_pstage
         
