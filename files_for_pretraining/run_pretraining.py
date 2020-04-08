@@ -324,6 +324,8 @@ def prepare_model_and_optimizer(args, device):
     model.to(device)
     
     param_optimizer = list(model.named_parameters())
+
+    # param_optimizer = list(model.named_parameters())
     no_decay = ['bias', 'gamma', 'beta', 'LayerNorm']
     
     optimizer_grouped_parameters = [
@@ -383,7 +385,10 @@ def prepare_model_and_optimizer(args, device):
         # reload optimizer state
         opt_dict = checkpoint['optimizer']
         opt_cp_dir = os.path.join(args.output_dir, "opt_ckpt_{}".format(global_step))
-        optimizer.load_state_dict(opt_dict)  # , strict=False)
+        for i,g in enumerate(opt_dict['param_groups']):
+            for k,v in g.items():
+                if k != 'params':
+                    optimizer.param_groups[i][k] = v
         load_varuna_optimizer(optimizer, args.stage, args.partitions, config.num_hidden_layers, parameter_names, opt_cp_dir, args.fp16)
 
         for state in optimizer.state.values():
@@ -446,6 +451,22 @@ def main():
 
     # Prepare optimizer
     model, optimizer, lr_scheduler, checkpoint, global_step, parameter_names = prepare_model_and_optimizer(args, device)
+    if args.stage == 0:
+        opt_p1 = None
+        opt_p2 = None
+        for p in amp.master_params(optimizer):
+            if parameter_names[p] == "bert.embeddings.position_embeddings.weight":
+                opt_p1 = p
+            if parameter_names[p] == "bert.embeddings.token_type_embeddings.weight":
+                opt_p2 = p
+        print("position embeddings")
+        print(str(model.model.module.bert.embeddings.position_embeddings.weight))
+        print(str(opt_p1))
+        print(str(optimizer.state[opt_p1]))
+        print("token type embeddings:")
+        print(str(opt_p2))
+        print(str(optimizer.state[opt_p2]))
+        print(str(model.model.module.bert.embeddings.token_type_embeddings.weight))
 
     if args.loss_filename == "":
         args.loss_filename = 'stats/varuna_lamb_'+("fp16" if args.fp16 else "fp32") +"_"+str(args.learning_rate)+"_"+str(args.train_batch_size)+'_'+str(args.partitions)+'p_'+str(data_depth)+'dp_'+str(args.chunk_size)+'csize'
@@ -545,7 +566,7 @@ def main():
                     # torch.cuda.reset_max_memory_allocated(args.device)
                     # pre_pipeline_mem = torch.cuda.memory_allocated(args.device)
                     minibatch_time = time.time()
-                    loss = model(inputs)
+                    loss = model(inputs, parameter_names)
                     minibatch_time = time.time() - minibatch_time
                     # tflops = 1.33 * (args.train_batch_size / minibatch_time)     # TFLOPS ~ 1.33 * examples per sec
                     # tflops = tflops / (args.partitions * data_depth)        # scale by # gpus
@@ -566,7 +587,7 @@ def main():
                                         args.log_freq, loss, optimizer.param_groups[0]['lr']))
                         total_train_time = time.time() - train_start_time
                         loss_scale = _amp_state.loss_scalers[0].loss_scale()
-                        loss_file.write("{}, {}, {}, {}\n".format(minibatch_time, total_train_time, loss_scale, average_loss))
+                        loss_file.write("{}, {}, {}, {}, {}\n".format(minibatch_time, total_train_time, optimizer.param_groups[0]['lr'], loss_scale, average_loss))
                         if global_step%50==0:
                             loss_file.flush()
 
@@ -581,9 +602,13 @@ def main():
                             os.makedirs(model_cp_dir)
                         if args.rank == 0 and not os.path.exists(opt_cp_dir):
                             os.makedirs(opt_cp_dir)
+                        old_opt_cp_dir = opt_cp_dir + "_old"
+                        if args.rank == 0 and not os.path.exists(old_opt_cp_dir):
+                            os.makedirs(old_opt_cp_dir)
                         torch.distributed.barrier()
                         param_name_to_pstage = model.checkpoint(model_cp_dir)
                         model.checkpoint_optimizer(optimizer, parameter_names, param_name_to_pstage, opt_cp_dir)
+                        model.checkpoint_optimizer_old(optimizer, parameter_names, old_opt_cp_dir)
                         if args.rank == 0:
                             # assert model_state_dict is not None, "Wrong checkpointing!!"
                             if args.resume_step < 0 or not args.phase2:
@@ -607,10 +632,10 @@ def main():
                                 f.write(str(global_step))
                         torch.distributed.barrier()
                     
-                    if global_step >= 5 or TERMINATE_TRAINING:
+                    if global_step >= args.max_steps or TERMINATE_TRAINING:
                         del train_dataloader
                         loss_file.close()
-                        # return args
+                        return args
 
                 del train_dataloader
                 # Make sure pool has finished and switch train_dataloader
