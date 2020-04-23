@@ -76,7 +76,7 @@ class CutPoint(Module):
 
 class PartitionedModel(Module):
 
-    def __init__(self, module, rank, local_rank, device, stage_to_rank_map, fp16):
+    def __init__(self, module, rank, local_rank, device, stage_to_rank_map, fp16, shared_weights=None):
         super(PartitionedModel, self).__init__()
         self.module = module
         self.num_stages = len(stage_to_rank_map)
@@ -84,6 +84,7 @@ class PartitionedModel(Module):
         self.rank = rank
         self.local_rank = local_rank
         self.fp16 = fp16
+        self.shared_weights = shared_weights
         
         torch.cuda.set_device(device)
         self.device = torch.device("cuda", device)
@@ -105,6 +106,8 @@ class PartitionedModel(Module):
         # print("Initializing partitioned model!")
         start = time.time()
         self.dry_run(dummy_inputs, from_cache)
+        if self.shared_weights is not None:
+            self.find_shared_weight_stages()
         print("dry run time", time.time() - start)
         self.prep_cutpoints()
         self.remove_unused_parameters()
@@ -167,6 +170,45 @@ class PartitionedModel(Module):
                 self.input_shapes = pickle.load(f)
             self.num_cutpoints = len(self.input_shapes)
     
+    def find_shared_weight_stages(self):
+
+        all_shared_weights = []
+        for w_pair in self.shared_weights:
+            all_shared_weights += [w for w in w_pair]
+        curr_stage = 0
+        weight_stages = dict()
+        for m in self.ordered_modules:
+            module = self.ordered_modules[m]
+            if isinstance(module, CutPoint):
+                curr_stage += 1
+                continue
+            for w in all_shared_weights:
+                param_name = w.split(".")[-1]
+                module_name = w[ : -len(param_name)-1]
+                if m == module_name and hasattr(module, param_name):
+                    weight_stages[w] = curr_stage
+                    break
+                elif m == module_name:
+                    print("Here we have the peculiar case of the missing weight", m, param_name)
+                    print(getattr(module,param_name))
+        
+        for w in all_shared_weights:
+            if w not in weight_stages:
+                param_name = w.split(".")[-1]
+                if hasattr(self.module, param_name):
+                    weight_stages[w] = curr_stage
+
+        cuts_per_stage = (self.num_cutpoints + 1)/ self.num_stages
+        shared_weight_stages = []
+        for w_pair in self.shared_weights:
+            for w in w_pair:
+                assert w in weight_stages, "Shared parameter {} not found in model!".format(w)
+                weight_stages[w] = int(weight_stages[w] // cuts_per_stage)
+            shared_weight_stages.append((weight_stages[w_pair[0]], weight_stages[w_pair[1]]))
+
+        self.shared_weight_stages = shared_weight_stages
+
+
 # """ setting actual cutpoint functions for comunication. """
     def prep_cutpoints(self):
 

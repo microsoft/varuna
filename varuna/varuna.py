@@ -41,7 +41,8 @@ class Varuna(Module):
                 chunk_size,
                 fp16 = False, 
                 local_rank=-1,
-                device=-1):
+                device=-1,
+                shared_weights=None):
         super().__init__()
 
         self.partitions = len(stage_to_rank_map)
@@ -69,11 +70,16 @@ class Varuna(Module):
 
         self.optimizer = optimizer
         self.fp16 = fp16
+        self.shared_weights = shared_weights
 
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
-        self.model = PartitionedModel(model, self.rank, self.local_rank, device, self.stage_to_rank_map, self.fp16)
+        self.model = PartitionedModel(model, self.rank, self.local_rank, device, self.stage_to_rank_map, self.fp16, shared_weights)
         self.model.initialize( dummy_inputs, from_cache=False )
         self.partitioned_model = self.model
+        self.shared_weight_stages = self.model.shared_weight_stages if self.shared_weights is not None else None
+
+        print("SHARED WEIGHTS ARE")
+        print(self.shared_weight_stages)
 
         # assert(batch_size % data_depth == 0, "Batch size not divisible by data parallel depth!")
         self.batch_size = batch_size // data_depth
@@ -96,22 +102,26 @@ class Varuna(Module):
             "device": self.device,
             "data_depth": len(self.stage_to_rank_map[self.stage]),
             "dp_process_group": self.process_group, 
-            "make_logfile": bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
+            "make_logfile": False, #bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
             "last_chunk_size": self.last_chunk_size,
-            "embedding_recv_rank": self.embedding_recv_rank,
-            "embedding_send_rank": self.embedding_send_rank
+            # "embedding_recv_rank": self.embedding_recv_rank,
+            # "embedding_send_rank": self.embedding_send_rank,
+            "shared_weights": self.shared_weights,
+            "shared_weight_stages": self.shared_weight_stages,
+            "stage_to_rank_map": self.stage_to_rank_map
         }
 
         self.schedule = self.generate_schedule()
 
+
     def init_communication(self, rank_within_stage):
         
-        self.embedding_recv_rank = None
-        self.embedding_send_rank = None
-        if self.stage == 0:
-            self.embedding_recv_rank = self.stage_to_rank_map[self.partitions-1][rank_within_stage]
-        if self.stage == self.partitions - 1:
-            self.embedding_send_rank = self.stage_to_rank_map[0][rank_within_stage]
+        # self.embedding_recv_rank = None
+        # self.embedding_send_rank = None
+        # if self.stage == 0:
+        #     self.embedding_recv_rank = self.stage_to_rank_map[self.partitions-1][rank_within_stage]
+        # if self.stage == self.partitions - 1:
+        #     self.embedding_send_rank = self.stage_to_rank_map[0][rank_within_stage]
 
         self.send_rank = None; self.receive_rank = None
 
@@ -152,7 +162,7 @@ class Varuna(Module):
 
     def forward(self, inputs):        
         # Divide a mini-batch into micro-batches.
-        batches = scatter(inputs, self.micro_batch_size)
+        batches = scatter(inputs, int(self.batch_size),self.micro_batch_size)
         
         # need not pass the first argument if rank!=0
         # avoid dataloader compute in machines other than the first
@@ -254,49 +264,50 @@ class Pipeline:
         self.device = config["device"]
         self.schedule = schedule
         self.fp16 = config["fp16"]
+        self.rank = dist.get_rank()
 
         self.fwd_inp_shape = config["fwd_inp_shape"]
         self.bwd_grad_shape = config["bwd_grad_shape"]
 
+        self.shared_weights = config["shared_weights"]
+        self.shared_weight_stages = config["shared_weight_stages"]
+        self.stage_to_rank_map = config["stage_to_rank_map"]
 
         self.make_logfile = config["make_logfile"]
         if self.make_logfile:
             microBS = self.fwd_inp_shape[0] if self.bwd_grad_shape is None else self.bwd_grad_shape[0]
             logfilename = "varuna_logs-mBS" + str(microBS) + "-stage" + str(self.stage) + "of" + str(self.partitions)
             self.logfile = open(logfilename,"a")
-        # print(self.schedule)
-
-        # print(self.model)
-        # if (self.world_size>1):
-        #     if (self.stage == 0):
-        #         # print('fp16 module = ', self.model)
-        #         dist.send(self.model.module.bert.embeddings.word_embeddings.weight.cpu(), self.world_size-1)
-        #     elif (self.stage == self.world_size-1):
-        #         encoder_weights = torch.FloatTensor(self.model.module.cls.predictions.decoder.weight.size()).half()
-        #         dist.recv(encoder_weights, 0)
-        #         # mask = torch.ones(encoder_weights.size()).byte().to(self.device)
-        #         # self.model.module.model.cls.predictions.decoder.weight = self.model.module.model.cls.predictions.decoder.weight.masked_scatter(mask, encoder_weights.to(self.device))
-        #         self.model.module.cls.predictions.decoder.weight = torch.nn.Parameter(encoder_weights.to(self.device))
-
+        
         baseModule = self.model.module if not self.data_parallel else self.model.module.module
 
-        if self.partitions > 1:
-            if self.stage == self.partitions - 1:
-                embed_comm_time = time.time()
-                dist.send(baseModule.cls.predictions.decoder.weight.cpu(), config["embedding_send_rank"])
-                embed_comm_time = time.time() - embed_comm_time
-                if self.make_logfile:
-                    self.logfile.write("embed comm " + str(embed_comm_time) + "\n")
-            elif self.stage == 0:
-                embed_comm_time = time.time()
-                decoder_weights = torch.FloatTensor(baseModule.bert.embeddings.word_embeddings.weight.size())
-                if self.fp16:
-                    decoder_weights = decoder_weights.half()
-                dist.recv(decoder_weights, config["embedding_recv_rank"])
-                baseModule.bert.embeddings.word_embeddings.weight = torch.nn.Parameter(decoder_weights.to(self.device))
-                embed_comm_time = time.time() - embed_comm_time
-                if self.make_logfile:
-                    self.logfile.write("embed comm " + str(embed_comm_time) + "\n")
+        if self.partitions > 1 and self.shared_weights is not None:
+            rank_within_stage = self.stage_to_rank_map[self.stage].index(self.rank)
+            for i,w in enumerate(self.shared_weights):
+                recv_stage, send_stage = self.shared_weight_stages[i]
+                if recv_stage == send_stage:
+                    continue
+                if self.stage == send_stage:
+                    recv_rank = self.stage_to_rank_map[recv_stage][rank_within_stage]
+                    for n,p in baseModule.named_parameters():
+                        if n == w[0]:
+                            send_weight = p
+                            break
+                    dist.send(p.cpu(), recv_rank)
+                elif self.stage == recv_stage:
+                    send_rank = self.stage_to_rank_map[send_stage][rank_within_stage]
+                    for n,p in baseModule.named_parameters():
+                        if n == w[1]:
+                            recv_weight = p
+                            break
+                    recv_weight = torch.zeros(list(recv_weight.size()),dtype=torch.float16 if self.fp16 else toch.float32)
+                    dist.recv(recv_weight, send_rank)
+                    attr_names = w[1].split(".")
+                    param = baseModule
+                    for a in attr_names:
+                        param = getattr(param,a)
+                    param.data.copy_(recv_weight.data)
+                
 
 
         self.receive_rank = config["receive_rank"]
@@ -574,20 +585,33 @@ class Pipeline:
             [allreduced_views, master_grads],
             1./scaler.loss_scale())
 
-def scatter(input, chunk_size):
+def scatter(input, batch_size, chunk_size):
     """
     Accepts input dictionary and splits into microbatches
     """
-    # assert(isinstance(inputs,dict) , "varuna inputs must be given as a dictionary")
+    assert isinstance(input,dict) , "varuna inputs must be given as a dictionary" 
     
     microbatches = []
+    num_microbatches = math.ceil(batch_size / chunk_size)
     for k,v in input.items():
         # TODO: what will happen for indivisibilities in uneven data parallelism !!
-        chunked_values = v.split(chunk_size)
+        # print(dist.get_rank(),k,v.size())
+        # special case for GPT-2 attention mask
+        if v.size(0) == 1:
+            chunked_values = [v for _ in range(num_microbatches)]
+        else:
+            chunked_values = v.split(chunk_size)
         for i,value in enumerate(chunked_values):
             if len(microbatches) <= i:
                 microbatches.append(dict())
             microbatches[i][k]=value
+
+    # with open("scatter-{}".format(dist.get_rank()), "w") as f:
+    #     f.write("Scattered to {}\n".format(len(microbatches)))
+    #     for i,m in enumerate(microbatches):
+    #         for k,v in m.items():
+    #             f.write(k + ": " + str(v) + "\n")
+        # f.write(str(microbatches[1]) + "\n")
     
     return microbatches
 
