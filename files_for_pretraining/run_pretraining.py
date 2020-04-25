@@ -81,7 +81,7 @@ def create_pretraining_dataset(input_file, max_pred_length, shared_list, args, m
     else:
         train_sampler = SequentialSampler(train_data)
         train_dataloader = DataLoader(train_data, sampler=train_sampler,
-                                  batch_size=args.train_batch_size, num_workers=4,
+                                    batch_size=args.train_batch_size, num_workers=4,
                                     pin_memory=True, shuffle = False, drop_last = True)
 
     return train_dataloader, input_file
@@ -537,7 +537,7 @@ def main():
                 raise RuntimeError("File ({}) already exists.".format(loss_filename))
         else:
             loss_file = open(loss_filename, 'w')
-            loss_file.write("MB time, total train time, TFLOPS, Max GPU mem, Curr GPU mem, Opt state mem, loss scale, loss\n")
+            # loss_file.write("MB time, total train time, TFLOPS, Max GPU mem, Curr GPU mem, Opt state mem, loss scale, loss\n")
 
     # Prepare optimizer
     model, optimizer, lr_scheduler, checkpoint, global_step, parameter_names = prepare_model_and_optimizer(args, device)
@@ -554,6 +554,7 @@ def main():
             print("Training. . .")
 
         # model.train()       # comment this for Varuna
+        initialize_model=True
         most_recent_ckpts_paths = []
         most_recent_model_ckpts_paths = []
         average_loss = 0.0  # averaged loss every args.log_freq steps
@@ -614,23 +615,25 @@ def main():
             dummy_input = dict()
             dummy_train_dataloader = DataLoader(train_data, sampler=SequentialSampler(train_data), batch_size=1, num_workers=1, pin_memory=False)
             train_iter = tqdm(dummy_train_dataloader, desc="Iteration")
-            for step, batch in enumerate(train_iter):
-                batch = [t.to(device) for t in batch]
-                input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
-                dummy_input['input_ids'] = input_ids
-                dummy_input['token_type_ids'] = segment_ids
-                dummy_input['attention_mask'] = input_mask
-                dummy_input['masked_lm_labels'] = masked_lm_labels
-                dummy_input['next_sentence_label'] = next_sentence_labels
-                break
-            del train_iter
-            del dummy_train_dataloader
+            if initialize_model:
+                for step, batch in enumerate(train_iter):
+                # batch = train_data[:1]
+                    batch = [t.to(device) for t in batch]
+                    input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
+                    dummy_input['input_ids'] = input_ids
+                    dummy_input['token_type_ids'] = segment_ids
+                    dummy_input['attention_mask'] = input_mask
+                    dummy_input['masked_lm_labels'] = masked_lm_labels
+                    dummy_input['next_sentence_label'] = next_sentence_labels
+                    break
+                del train_iter
+                del dummy_train_dataloader
 
-            model = Varuna(model, stage_to_rank_map, dummy_input, args.train_batch_size, optimizer, args.chunk_size, args.fp16, local_rank=args.local_rank, device=args.device)
-            model.train()
+                model = Varuna(model, stage_to_rank_map, dummy_input, args.train_batch_size, optimizer, args.chunk_size, args.fp16, local_rank=args.local_rank, device=args.device)
+                model.train()
+                initialize_model=False
             # '''
-            
-            
+
             overflow_buf = None
             if args.allreduce_post_accumulation:
                 overflow_buf = torch.cuda.IntTensor([0])
@@ -692,15 +695,16 @@ def main():
                             logger.info("Total Steps:{} Final Loss = {}".format(training_steps / args.gradient_accumulation_steps, average_loss.item()))
                     elif training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
                         if args.stage == args.partitions - 1:
-                            print("Step:{} Average Loss = {} Step Loss = {} LR {}".format(global_step, average_loss / (
+                            print("Step:{} Mini-batch time = {} Average Loss = {} Step Loss = {} LR {}".format(global_step, minibatch_time, average_loss / (
                                         args.log_freq * divisor), loss * args.gradient_accumulation_steps / divisor,
                                         optimizer.param_groups[0]['lr']))
                         if args.stage == args.partitions - 1:
-                            if global_step%20==0:
+                            if global_step%10==0:
                                 loss_file.flush()
                             total_train_time = time.time() - train_start_time
                             loss_scale = _amp_state.loss_scalers[0].loss_scale()
                             loss_file.write("{}, {}, {}, {}, {}, {}, {}, {}\n".format(minibatch_time, total_train_time, tflops, max_mem, curr_mem, opt_state_mem, loss_scale, average_loss))
+                            # loss_file.write("{}, ".format(average_loss))
 
                         average_loss = 0
 
@@ -709,9 +713,9 @@ def main():
                             # Save a trained model
                         model_cp_dir = os.path.join(args.output_dir, "model_ckpt_{}".format(global_step))
                         opt_cp_dir = os.path.join(args.output_dir, "opt_ckpt_{}".format(global_step))
-                        if args.local_rank == 0 and not os.path.exists(model_cp_dir):
+                        if args.rank == 0 and not os.path.exists(model_cp_dir):
                             os.makedirs(model_cp_dir)
-                        if args.local_rank == 0 and not os.path.exists(opt_cp_dir):
+                        if args.rank == 0 and not os.path.exists(opt_cp_dir):
                             os.makedirs(opt_cp_dir)
                         torch.distributed.barrier()
                         model.checkpoint(model_cp_dir)
