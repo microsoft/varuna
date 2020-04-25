@@ -1,8 +1,8 @@
-machines=( $(az vmss nic list --vmss-name vmssdum --subscription a947bb9f-f570-40a9-82cc-2fdd09f1553a --resource-group Varuna --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
-nservers=$2
-ngpus=$1
-nstages=$3
-gpus_per_stage=$4
+machines=( $(az vmss nic list --vmss-name $1 --subscription a947bb9f-f570-40a9-82cc-2fdd09f1553a --resource-group Varuna --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
+nservers=$3
+ngpus=$2
+nstages=$4
+gpus_per_stage=$5
 : '
 machines=( "${machines[@]:0:29}" "${machines[@]:30}" )
 #
