@@ -347,11 +347,11 @@ class Pipeline:
             self.grads_send_thread.daemon=True
             self.grads_send_thread.start() 
     
-    def handle_wait(self, handles, count):
-        while count>0:
-            handle = handles.get()
-            handle.wait()
-            count -= 1
+    # def handle_wait(self, handles, count):
+    #     while count>0:
+    #         handle = handles.get()
+    #         handle.wait()
+    #         count -= 1
     
     def acts_receiver(self):
         chunks = len(self.batches)
@@ -412,17 +412,23 @@ class Pipeline:
 
         send_handles = Queue()
 
-        wait_handler = Thread(target=self.handle_wait, args=(send_handles, count))
-        wait_handler.daemon=True
-        wait_handler.start()
+        # wait_handler = Thread(target=self.handle_wait, args=(send_handles, count))
+        # wait_handler.daemon=True
+        # wait_handler.start()
         
         while count > 0:
             output_acts = self.acts_send_queue.get()
             # print("stage", self.stage, "sending acts of shape", output_acts.size())
             handle = dist.isend(output_acts.cpu(), dst=self.send_rank)
             send_handles.put(handle)
+            if send_handles.qsize()>10:
+                handle = send_handles.get()
+                handle.wait()
             count -= 1
-        wait_handler.join()
+        while not send_handles.empty():
+            handle = send_handles.get()
+            handle.wait()
+        # wait_handler.join()
 
     def grads_sender(self):
         count = 0
@@ -433,17 +439,23 @@ class Pipeline:
         
         send_handles = Queue()
 
-        wait_handler = Thread(target=self.handle_wait, args=(send_handles, count))
-        wait_handler.daemon=True
-        wait_handler.start()
+        # wait_handler = Thread(target=self.handle_wait, args=(send_handles, count))
+        # wait_handler.daemon=True
+        # wait_handler.start()
 
         while count > 0:
             input_grads = self.grads_send_queue.get()
             # print("stage", self.stage, "sending grads of shape", input_grads.size())
             handle = dist.isend(input_grads.cpu(), dst=self.receive_rank)
             send_handles.put(handle)
+            if send_handles.qsize()>10:
+                handle = send_handles.get()
+                handle.wait()
             count -= 1
-        wait_handler.join()
+        while not send_handles.empty():
+            handle = send_handles.get()
+            handle.wait()
+        # wait_handler.join()
         
     # tells the model where to send acts and gradients
     def set_model_send_fn(self, recompute = False):
