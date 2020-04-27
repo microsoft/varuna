@@ -26,10 +26,12 @@ def calculate_config(args):
     stage_to_rank_map = {}
     rank_to_stage_map = {}
 
-    for i in range(args.nstages):
-        stage_to_rank_map[i]= range(i,dist_world_size,args.nstages)
-#    for i in range(0,dist_world_size,gpus_per_stage):
-#        stage_to_rank_map[int(i//gpus_per_stage)] = range(i,i+gpus_per_stage)
+    # if args.placement=='clustered':
+    #     for i in range(args.nstages):
+    #         stage_to_rank_map[i]= range(i,dist_world_size,args.nstages)
+    # else:
+    for i in range(0,dist_world_size,gpus_per_stage):
+        stage_to_rank_map[int(i//gpus_per_stage)] = range(i,i+gpus_per_stage)
     stage_to_rank_map_str = ""
     for stage in stage_to_rank_map:
         ranks = ",".join([str(r) for r in stage_to_rank_map[stage]])
@@ -125,6 +127,9 @@ def parse_args():
                              "followed by all the arguments for the "
                              "training script")
 
+    # parser.add_argument("placement", default='scattered', type=str,
+    #                     help="Scattered/Clustered placement")
+
     # rest from the training program
     parser.add_argument('training_script_args', nargs=REMAINDER)
     return parser.parse_args()
@@ -174,20 +179,21 @@ if __name__ == "__main__":
     def handler(signum,_):
         global loop_pending
         print('Signal handler called with signal', signum)
-        with open('ngpus','r') as f:
-            ngpus_per_server = int(f.read())
-        with open('nservers','r') as f:
-            nservers = int(f.read())
-        if args.ngpus_per_server == ngpus_per_server and args.nservers == nservers:
-            return
-        loop_pending = True
-        if args.node_rank >= nservers:
-            loop_pending = False
-        args.ngpus_per_server = ngpus_per_server
-        args.nservers = nservers
+        # with open('ngpus','r') as f:
+        #     ngpus_per_server = int(f.read())
+        # with open('nservers','r') as f:
+        #     nservers = int(f.read())
+        # if args.ngpus_per_server == ngpus_per_server and args.nservers == nservers:
+        #     return
+        # loop_pending = True
+        # if args.node_rank >= nservers:
+        #     loop_pending = False
+        # args.ngpus_per_server = ngpus_per_server
+        # args.nservers = nservers
         for p in processes:
             p.send_signal(signal.SIGUSR1)
-        print("\n\n CONFIG CHANGED TO ",args.ngpus_per_server,"GPUS, ",args.nservers, "SERVERS","\n\n\n")
+        # print("\n\n CONFIG CHANGED TO ",args.ngpus_per_server,"GPUS, ",args.nservers, "SERVERS","\n\n\n")
+        print("\n\n CONFIG CHANGED!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! \n\n\n")
 
     signal.signal(signal.SIGUSR1, handler)
 

@@ -107,6 +107,8 @@ class pretraining_dataset(Dataset):
             torch.from_numpy(input[index].astype(np.int64)) if indice < 5 else torch.from_numpy(
                 np.asarray(input[index].astype(np.int64))) for indice, input in enumerate(self.inputs)]
 
+        # print("getting index ", index, masked_lm_positions)
+
         masked_lm_labels = torch.ones(input_ids.shape, dtype=torch.long) * -1
         index = self.max_pred_length
         # store number of  masked tokens in index
@@ -218,7 +220,7 @@ def parse_arguments():
                         help="Step to resume training from.")
     parser.add_argument('--num_steps_per_checkpoint',
                         type=int,
-                        default=100,
+                        default=5,
                         help="Number of update steps until a model checkpoint is saved to disk.")
     parser.add_argument('--phase2',
                         default=False,
@@ -507,7 +509,6 @@ def main():
     args = parse_arguments()
     random.seed(args.seed)
     np.random.seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
     torch.manual_seed(args.seed)
 
     # parse stage_to_rank_map
@@ -681,6 +682,7 @@ def main():
 
                     if training_steps % args.gradient_accumulation_steps == 0:
                         lr_scheduler.step()  # learning rate warmup
+                        # print(args.rank, "before optimizer step",torch.cuda.memory_allocated(args.device))
                         global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
                         max_mem = torch.cuda.max_memory_allocated(args.device)
                         curr_mem = torch.cuda.memory_allocated(args.device)
@@ -706,7 +708,7 @@ def main():
                             loss_file.write("{}, {}, {}, {}, {}, {}, {}, {}\n".format(minibatch_time, total_train_time, tflops, max_mem, curr_mem, opt_state_mem, loss_scale, average_loss))
                             # loss_file.write("{}, ".format(average_loss))
 
-                        average_loss = 0
+                        average_loss = 0 
 
                     if global_step >= args.max_steps or TERMINATE_TRAINING or training_steps % (
                             args.num_steps_per_checkpoint * args.gradient_accumulation_steps) == 0:

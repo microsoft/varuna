@@ -238,6 +238,7 @@ def restore_rng_states(rng_states, device):
     # torch.cuda.set_rng_state_all(gpu_rng_states)        # todo: verify correctness;   batchNorm, dropouts, convlayers?
     torch.cuda.set_rng_state(gpu_rng_states, device)
 
+
 class Pipeline:
     """ Pipeline parallelism for Varuna """
 
@@ -346,9 +347,17 @@ class Pipeline:
             self.grads_send_thread.daemon=True
             self.grads_send_thread.start() 
     
+    # def handle_wait(self, handles, count):
+    #     while count>0:
+    #         handle = handles.get()
+    #         handle.wait()
+    #         count -= 1
+    
     def acts_receiver(self):
         chunks = len(self.batches)
         dtype = torch.float16 if self.fp16 else torch.float32
+        recv_handles = Queue()
+
         for task,index in self.schedule:
             if task == 0:
                 fwd_inp_shape = self.fwd_inp_shape
@@ -358,13 +367,22 @@ class Pipeline:
                 acts_tensor = torch.ones(fwd_inp_shape, dtype=dtype)
                 # print("stage", self.stage, "expecting acts of shape", fwd_inp_shape)
                 handle = dist.irecv(acts_tensor, src=self.receive_rank)
-                handle.wait()
-                self.acts_queue.put(acts_tensor.to(self.device))
+                recv_handles.put((handle, acts_tensor))
+                if recv_handles.qsize()>10:
+                    handle, tensor = recv_handles.get()
+                    handle.wait()
+                    self.acts_queue.put(tensor.to(self.device))
+        while not recv_handles.empty():
+            handle, tensor = recv_handles.get()
+            handle.wait()
+            self.acts_queue.put(tensor.to(self.device))
         del acts_tensor
     
     def grads_receiver(self):
         chunks = len(self.batches)
         dtype = torch.float16 if self.fp16 else torch.float32
+        recv_handles = Queue()
+
         for task,index in self.schedule:
             if task == 2:
                 bwd_grad_shape = self.bwd_grad_shape
@@ -374,8 +392,15 @@ class Pipeline:
                 grads_tensor = torch.ones(bwd_grad_shape, dtype=dtype)
                 # print("stage", self.stage, "expecting grads of shape", bwd_grad_shape)
                 handle = dist.irecv(grads_tensor, src=self.send_rank)
-                handle.wait()
-                self.grads_queue.put(grads_tensor.to(self.device))
+                recv_handles.put((handle, grads_tensor))
+                if recv_handles.qsize()>10:
+                    handle, tensor = recv_handles.get()
+                    handle.wait()
+                    self.grads_queue.put(tensor.to(self.device))
+        while not recv_handles.empty():
+            handle, tensor = recv_handles.get()
+            handle.wait()
+            self.grads_queue.put(tensor.to(self.device))
         del grads_tensor
 
     def acts_sender(self):
@@ -383,26 +408,54 @@ class Pipeline:
         for task,index in self.schedule:
             if task == 0:
                 count += 1
+        # count = len(self.batches)   # worsens performance if used instead of for loop. Why?
+
+        send_handles = Queue()
+
+        # wait_handler = Thread(target=self.handle_wait, args=(send_handles, count))
+        # wait_handler.daemon=True
+        # wait_handler.start()
+        
         while count > 0:
             output_acts = self.acts_send_queue.get()
             # print("stage", self.stage, "sending acts of shape", output_acts.size())
             handle = dist.isend(output_acts.cpu(), dst=self.send_rank)
-            handle.wait()
-            del output_acts, handle
+            send_handles.put(handle)
+            if send_handles.qsize()>10:
+                handle = send_handles.get()
+                handle.wait()
             count -= 1
+        while not send_handles.empty():
+            handle = send_handles.get()
+            handle.wait()
+        # wait_handler.join()
 
     def grads_sender(self):
         count = 0
         for task,index in self.schedule:
             if task == 2:
                 count += 1
+        # count = len(self.batches)   # worsens performance if used instead of for loop. Why?
+        
+        send_handles = Queue()
+
+        # wait_handler = Thread(target=self.handle_wait, args=(send_handles, count))
+        # wait_handler.daemon=True
+        # wait_handler.start()
+
         while count > 0:
             input_grads = self.grads_send_queue.get()
             # print("stage", self.stage, "sending grads of shape", input_grads.size())
             handle = dist.isend(input_grads.cpu(), dst=self.receive_rank)
-            handle.wait()
-            del input_grads, handle
+            send_handles.put(handle)
+            if send_handles.qsize()>10:
+                handle = send_handles.get()
+                handle.wait()
             count -= 1
+        while not send_handles.empty():
+            handle = send_handles.get()
+            handle.wait()
+        # wait_handler.join()
         
     # tells the model where to send acts and gradients
     def set_model_send_fn(self, recompute = False):
@@ -447,7 +500,6 @@ class Pipeline:
         # because there's no peek/front method for these queues
         return acts
 
-
     def worker(self, task, grad_mode, inputs_as_dict, lastub):
         """ Main body of worker loop """
 
@@ -470,12 +522,12 @@ class Pipeline:
                 self.logfile.write("{} {} {} {}\n".format(TASK[0], 0, str(task_time_start), str(task_time)))
 
             if grad_mode == False:
-                # if these acts are going to be recomputed
                 ctx = (rng_states, acts)
                 self.recompute_queue.put(ctx)
             else:
                 # save loss and input activations for the backward pass to use
                 self.loss = output[0] if isinstance(output,tuple) else output
+            # print(self.stage, 'forward done')
 
             
         elif task == 1:
@@ -529,6 +581,7 @@ class Pipeline:
                 else:
                     self.loss.backward()
 
+            # print(self.stage, 'backward done')
             del self.loss
             self.loss = None
         
@@ -548,9 +601,9 @@ class Pipeline:
             # task_time_start = time.time()
             if self.data_parallel and (task[1] < (len(self.batches) - 1) or  self.fp16):
                 with self.model.no_sync():
-                    self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
+                    self.worker(task[0], grad_mode, self.batches[task[1]], task[1]==len(self.batches)-1)
             else:
-                self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
+                self.worker(task[0], grad_mode, self.batches[task[1]], task[1]==len(self.batches)-1)
                 if self.make_logfile:
                     self.logfile.write("SYNC! ")
 
