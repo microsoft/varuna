@@ -10,7 +10,6 @@ from apex import amp
 import time
 from apex.amp import _amp_state
 import amp_C, apex_C
-import numpy as np
 
 from .partitioned_model import PartitionedModel
 import gc
@@ -70,11 +69,10 @@ class Varuna(Module):
 
         self.optimizer = optimizer
         self.fp16 = fp16
-        self.overflow = False
 
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
         self.model = PartitionedModel(model, self.rank, self.local_rank, device, self.stage_to_rank_map, self.fp16)
-        self.model.initialize( dummy_inputs, from_cache=True )
+        self.model.initialize( dummy_inputs, from_cache=False )
         self.partitioned_model = self.model
 
         # assert(batch_size % data_depth == 0, "Batch size not divisible by data parallel depth!")
@@ -98,7 +96,7 @@ class Varuna(Module):
             "device": self.device,
             "data_depth": len(self.stage_to_rank_map[self.stage]),
             "dp_process_group": self.process_group, 
-            "make_logfile": False, #bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
+            "make_logfile": bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
             "last_chunk_size": self.last_chunk_size,
             "embedding_recv_rank": self.embedding_recv_rank,
             "embedding_send_rank": self.embedding_send_rank
@@ -131,9 +129,11 @@ class Varuna(Module):
         if self.stage > 0:
             self.fwd_inp_shape = self.model.forward_input_shapes[0]
             self.fwd_inp_shape[0] = self.micro_batch_size
+            # print("Varuna fwd inp shape ", self.fwd_inp_shape)
         if self.stage < (self.partitions-1):
             self.bwd_grad_shape = self.model.backward_grad_shapes[0]
             self.bwd_grad_shape[0] = self.micro_batch_size
+            # print("Varuna bwd grad shape", self.bwd_grad_shape)
 
     def init_distributed(self):
         # create same process groups on all ranks
@@ -146,13 +146,12 @@ class Varuna(Module):
             else:
                 process_groups[stage] = None
 
-        if not self.fp16 and process_groups[self.stage] is not None:
+        if process_groups[self.stage] is not None:
             self.partitioned_model = self.model
             self.model = torch.nn.parallel.DistributedDataParallel(self.model, process_group=process_groups[self.stage], device_ids=[self.device], find_unused_parameters=True)    
-            
-        self.process_group = process_groups[self.stage]
+            self.process_group = process_groups[self.stage]
 
-    def forward(self, inputs, parameter_names=None):        
+    def forward(self, inputs):        
         # Divide a mini-batch into micro-batches.
         batches = scatter(inputs, self.micro_batch_size)
         
@@ -161,10 +160,8 @@ class Varuna(Module):
         # ask the model writer to pass the input batch generating dataloader function to Varuna::__init__
         # and Varuna can take care of input dataloader explicitly
         self.config["make_logfile"] = self.config["make_logfile"] and (self.step < 10)
-        self.config["step"] = self.step
         pipeline = Pipeline(batches, self.model, self.config, self.schedule, self.optimizer)
-        loss, overflow = pipeline.run(parameter_names)
-        self.overflow = overflow
+        loss = pipeline.run()
         self.step += 1
         return loss
     
@@ -224,21 +221,13 @@ class Varuna(Module):
         cp_time = time.time() - cp_time
         print("Opt ckpt time", cp_time)
 
-    def checkpoint_optimizer_old(self, optimizer, parameter_names, cp_dir_name):
-        # one worker from each partition
-        if self.rank == self.stage_to_rank_map[self.stage][0]:
-            new_state = dict()
-            # store state by param names instead of actual parameters
-            for key in optimizer.state:
-                new_state[parameter_names[key]] = optimizer.state[key]
-            torch.save(new_state, os.path.join(cp_dir_name,"opt-state-" + str(self.stage)))
-        torch.distributed.barrier()
 
     def to(self, device):
         self.model.to(device)
     
     def generate_schedule(self):
         chunks = math.ceil(self.batch_size / self.micro_batch_size)
+        print(chunks,"chunks")
         c_schedule = os.popen(os.path.join(os.path.dirname(os.path.abspath(__file__)),'genschedule ')+str(self.partitions)+' '+str(chunks)+' '+str(self.stage)).read()
         schedule = list()
         steps = c_schedule.split(';')
@@ -279,35 +268,22 @@ class Pipeline:
         self.process_group = config["dp_process_group"]
 
         self.model = model
-        self.fp16 = config["fp16"]
-        self.partitioned_model = self.model.module if (self.data_parallel and not self.fp16) else self.model
+        self.partitioned_model = self.model.module if self.data_parallel else self.model
         self.device = config["device"]
         self.schedule = schedule
+        self.fp16 = config["fp16"]
 
         self.fwd_inp_shape = config["fwd_inp_shape"]
         self.bwd_grad_shape = config["bwd_grad_shape"]
 
-        self.step = config["step"]
+
         self.make_logfile = config["make_logfile"]
         if self.make_logfile:
             microBS = self.fwd_inp_shape[0] if self.bwd_grad_shape is None else self.bwd_grad_shape[0]
-            logfilename = "varuna_logs-dd" + str(self.data_depth) + "-mBS" + str(microBS) + "-stage" + str(self.stage) + "of" + str(self.partitions)
+            logfilename = "varuna_logs-mBS" + str(microBS) + "-stage" + str(self.stage) + "of" + str(self.partitions)
             self.logfile = open(logfilename,"a")
-        # print(self.schedule)
 
-        # print(self.model)
-        # if (self.world_size>1):
-        #     if (self.stage == 0):
-        #         # print('fp16 module = ', self.model)
-        #         dist.send(self.model.module.bert.embeddings.word_embeddings.weight.cpu(), self.world_size-1)
-        #     elif (self.stage == self.world_size-1):
-        #         encoder_weights = torch.FloatTensor(self.model.module.cls.predictions.decoder.weight.size()).half()
-        #         dist.recv(encoder_weights, 0)
-        #         # mask = torch.ones(encoder_weights.size()).byte().to(self.device)
-        #         # self.model.module.model.cls.predictions.decoder.weight = self.model.module.model.cls.predictions.decoder.weight.masked_scatter(mask, encoder_weights.to(self.device))
-        #         self.model.module.cls.predictions.decoder.weight = torch.nn.Parameter(encoder_weights.to(self.device))
-
-        baseModule = self.model.module if (not self.data_parallel or self.fp16) else self.model.module.module
+        baseModule = self.model.module if not self.data_parallel else self.model.module.module
 
         if self.partitions > 1:
             if self.stage == self.partitions - 1:
@@ -385,10 +361,10 @@ class Pipeline:
                     fwd_inp_shape = list(self.fwd_inp_shape)
                     fwd_inp_shape[0] = self.last_chunk_size
                 acts_tensor = torch.ones(fwd_inp_shape, dtype=dtype)
-                # print("stage", self.stage, "expecting acts of shape", fwd_inp_shape)
                 handle = dist.irecv(acts_tensor, src=self.receive_rank)
                 handle.wait()
                 self.acts_queue.put(acts_tensor.to(self.device))
+        del acts_tensor
     
     def grads_receiver(self):
         chunks = len(self.batches)
@@ -400,10 +376,10 @@ class Pipeline:
                     bwd_grad_shape = list(self.bwd_grad_shape)
                     bwd_grad_shape[0] = self.last_chunk_size
                 grads_tensor = torch.ones(bwd_grad_shape, dtype=dtype)
-                # print("stage", self.stage, "expecting grads of shape", bwd_grad_shape)
                 handle = dist.irecv(grads_tensor, src=self.send_rank)
                 handle.wait()
                 self.grads_queue.put(grads_tensor.to(self.device))
+        del grads_tensor
 
     def acts_sender(self):
         count = 0
@@ -412,7 +388,6 @@ class Pipeline:
                 count += 1
         while count > 0:
             output_acts = self.acts_send_queue.get()
-            # print("stage", self.stage, "sending acts of shape", output_acts.size())
             handle = dist.isend(output_acts.cpu(), dst=self.send_rank)
             handle.wait()
             del output_acts, handle
@@ -425,7 +400,6 @@ class Pipeline:
                 count += 1
         while count > 0:
             input_grads = self.grads_send_queue.get()
-            # print("stage", self.stage, "sending grads of shape", input_grads.size())
             handle = dist.isend(input_grads.cpu(), dst=self.receive_rank)
             handle.wait()
             del input_grads, handle
@@ -448,10 +422,6 @@ class Pipeline:
             ctx, acts = self.recompute_queue.get()
             restore_rng_states(ctx, self.device)
 
-            # cpu_rng_state = torch.get_rng_state()
-            # gpu_rng_states: Optional[ByteTensor]
-            # gpu_rng_states = torch.cuda.get_rng_state(self.device)
-            # print('recompute: srngs: cpu = ', sha1(cpu_rng_state.cpu().numpy()).hexdigest(), '  gpu = ', sha1(gpu_rng_states.cpu().numpy()).hexdigest())
         else:
             acts = self.acts_queue.get() if self.stage > 0 else None
 
@@ -524,14 +494,18 @@ class Pipeline:
                 if self.fp16:
                     with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_microbatch=lastub) as scaled_loss:
                         scaled_loss.backward()
+                        # if lastub:
+                        #     for p in self.optimizer.state:
+                        #         assert p.grad is None,"why is the optimizer getting grads"
 
+                    # self.optimizer.backward(self.loss)
                 else:
                     self.loss.backward()
 
             del self.loss
             self.loss = None
         
-    def run(self, parameter_names):
+    def run(self):
         self.spawn_receive_workers()
 
         for index, task in enumerate(self.schedule):
@@ -544,7 +518,7 @@ class Pipeline:
             # For data parallel, sync only when doing last microbatch fwd/bwd
             # and for fp16, directly just all reduce optimizer master param grads
             task_time = time.time()
-            if not self.fp16 and self.data_parallel and (task[1] < (len(self.batches) - 1)):
+            if self.data_parallel and (task[1] < (len(self.batches) - 1) or  self.fp16):
                 with self.model.no_sync():
                     self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
             else:
@@ -557,9 +531,8 @@ class Pipeline:
             if self.make_logfile:
                 self.logfile.write("{} {} {}\n".format(TASK[task[0]],task[1], str(task_time)))
         
-        overflow = False
         if self.fp16 and self.data_parallel:
-            overflow = self.all_reduce_opt_grads(parameter_names)
+            self.all_reduce_opt_grads()
 
         if self.make_logfile:
             self.logfile.write("\n\nBATCH END\n\n")
@@ -575,83 +548,28 @@ class Pipeline:
             self.grads_send_thread.join()
 
         # return loss
-        return self.average_loss, overflow
+        return self.average_loss
 
-    def all_reduce_opt_grads(self, parameter_names):
+    def all_reduce_opt_grads(self):
         # 1. allocate an uninitialized buffer for flattened gradient
         scaler = _amp_state.loss_scalers[0]
-        master_grads = []
-        pn = []
-        for p in amp.master_params(self.optimizer):
-            if p.grad is not None:
-                master_grads.append(p.grad)
-                pn.append(parameter_names[p])
-        f = open("morph_nomorph_grads_{}".format(dist.get_rank()),"a")
-        if self.step >= 150:
-            f.write("Step {}".format(self.step))
-            f.write("before:\n")
-            f.write("{}\n".format(pn[0]))
-            f.write(str(master_grads[0]))
-            f.write("\n")
+        master_grads = [p.grad for p in amp.master_params(self.optimizer) if p.grad is not None]
         flat_grad_size = sum(p.numel() for p in master_grads)
         flat_raw = torch.empty(flat_grad_size, device=self.device, dtype=torch.float32)
         # 2. combine unflattening and predivision of unscaled 'raw' gradient
         allreduced_views = apex_C.unflatten(flat_raw, master_grads)
-        overflow_buf = torch.cuda.IntTensor([0]) 
+        overflow_buf = torch.cuda.IntTensor([0]) # not checking for overflow manually
         amp_C.multi_tensor_scale(65536,
             overflow_buf,
             [master_grads, allreduced_views],
             scaler.loss_scale() / self.data_depth)
-        overflow1 = overflow_buf.item()
-        # if overflow1:
-        #     count = 0
-        #     for i,g in enumerate(master_grads):
-        #         mask = (g == float('inf')) | (g == -float('inf')) | (g == float('nan')) | (g!=g)
-        #         ov_count = torch.sum(mask).item()
-        #         if ov_count > 0:
-        #             g_ = g[mask]
-        #             if count == 0:
-        #                 f.write("Overflow {} {}/{}:\n".format(pn[i],ov_count, g.numel()))
-        #                 f.write(str(torch.where(mask)) + "\n")
-        #                 f.write(str(g_) + "\n")
-        #                 f.write(str(g) + "\n")
-        #                 f.write("\n")
-        #             count += 1
-        #     f.write("total overflow: {}\n".format(count))
         # 3. sum gradient across ranks. Because of the predivision, this averages the gradient
-        allred_time = time.time()
         torch.distributed.all_reduce(flat_raw, group=self.process_group)
-        torch.cuda.synchronize()
-        allred_time = time.time() - allred_time
-        if self.make_logfile:
-            self.logfile.write("SYNC! all_reduce {} {}\n".format(flat_grad_size,allred_time))
         # 4. combine unscaling and unflattening of allreduced gradient
-        overflow_buf.zero_()
         amp_C.multi_tensor_scale(65536,
             overflow_buf,
             [allreduced_views, master_grads],
             1./scaler.loss_scale())
-        overflow2 = overflow_buf.item()
-        rank = dist.get_rank()
-        if overflow1 or overflow2:
-            print("Overflow",rank, overflow1, overflow2)
-        if self.step >= 150:
-            f.write("After:\n")
-            f.write(str(master_grads[0]))
-            f.write("\n")
-        f.close()
-        # scaler = _amp_state.loss_scalers[0]
-        # old_overflow_buf = scaler._overflow_buf
-        # scaler._overflow_buf = overflow_buf
-        # had_overflow = scaler.update_scale_custom(True)
-        # scaler._overfloat_buf = old_overflow_buf
-        # if had_overflow:
-        #     print(("Rank {} :: Gradient overflow.  Skipping step, "  +
-        #             "reducing loss scale to {}, {} {}").format(
-        #             torch.distributed.get_rank(),
-        #             scaler.loss_scale(), overflow1, overflow2))
-        # return had_overflow
-        return False
 
 def scatter(input, chunk_size):
     """
