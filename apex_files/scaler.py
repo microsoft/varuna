@@ -292,7 +292,7 @@ class LossScaler(object):
 
             # print('self._unskipped = ', self._unskipped, ', self._scale_seq_len = ', self._scale_seq_len)
         
-            if self._unskipped == 15 and self.dynamic:
+            if self._unskipped == self._scale_seq_len and self.dynamic:
                 print('scaler.py: doubling loss scale')
                 self._loss_scale = min(self._max_loss_scale, self._loss_scale*2.)
                 self._unskipped = 0 
