@@ -112,6 +112,7 @@ class Varuna(Module):
         }
 
         self.schedule = self.generate_schedule()
+        self.step = 0
 
 
     def init_communication(self, rank_within_stage):
@@ -168,8 +169,10 @@ class Varuna(Module):
         # avoid dataloader compute in machines other than the first
         # ask the model writer to pass the input batch generating dataloader function to Varuna::__init__
         # and Varuna can take care of input dataloader explicitly
+        self.config["make_logfile"] = bool(self.config["make_logfile"] and self.step < 10)
         pipeline = Pipeline(batches, self.model, self.config, self.schedule, self.optimizer)
         loss = pipeline.run()
+        self.step += 1
         return loss
     
     def eval(self):
@@ -195,7 +198,7 @@ class Varuna(Module):
             for key in optimizer.state:
                 new_state[parameter_names[key]] = optimizer.state[key]
             torch.save(new_state, os.path.join(cp_dir_name,"opt-state-" + str(self.stage)))
-        torch.distributed.barrier()
+        # torch.distributed.barrier()
 
         # if self.stage == 0 and self.rank == self.stage_to_rank_map[0][0]:
         #     sd = optimizer.state_dict()
@@ -214,6 +217,51 @@ class Varuna(Module):
         print("Opt ckpt time", cp_time)
         # return sd
 
+    def checkpoint_optimizer(self, optimizer, parameter_to_name, param_name_to_pstage, cp_dir_name):
+        cp_time = time.time()
+
+        # one worker from each partition
+        if self.rank == self.stage_to_rank_map[self.stage][0]:
+            cuts_per_stage = self.partitioned_model.cuts_per_stage
+            # save param states for each cutpoint separately
+            pstages = range(cuts_per_stage * self.stage, (self.stage+1)* cuts_per_stage)
+            pstage_state_dicts = dict()
+            for i in pstages:
+                pstage_state_dicts[i] = dict()
+
+            # store state by param names instead of actual parameters
+            for key in optimizer.state:
+                param_name = parameter_to_name[key]
+                assert param_name in param_name_to_pstage, "param {} not found in rank {}".format(param_name,dist.get_rank())
+                pstage = param_name_to_pstage[param_name]
+                pstage_state_dicts[pstage][param_name] = optimizer.state[key]
+            for i in pstages:
+                torch.save(pstage_state_dicts[i], os.path.join(cp_dir_name,"opt-state-" + str(i)))
+
+            # also store optimizer master params for mixed precision training
+            if self.fp16:
+
+                pstage_state_dicts = dict()
+                for i in pstages:
+                    pstage_state_dicts[i] = dict()
+
+                for p in amp.master_params(optimizer):
+                    param_name = parameter_to_name[p]
+                    # not a part of the worker's stage
+                    if param_name not in param_name_to_pstage:
+                        continue
+                    pstage = param_name_to_pstage[param_name]
+                    if pstage not in pstages:
+                        continue
+                    pstage_state_dicts[pstage][param_name] = p
+                for i in pstages:
+                    torch.save(pstage_state_dicts[i], os.path.join(cp_dir_name,"opt-fp32-params-" + str(i)))
+            
+        # torch.distributed.barrier()
+        cp_time = time.time() - cp_time
+        print("Opt ckpt time", cp_time)
+
+    
     def to(self, device):
         self.model.to(device)
     
@@ -278,10 +326,12 @@ class Pipeline:
             microBS = self.fwd_inp_shape[0] if self.bwd_grad_shape is None else self.bwd_grad_shape[0]
             logfilename = "varuna_logs-mBS" + str(microBS) + "-stage" + str(self.stage) + "of" + str(self.partitions)
             self.logfile = open(logfilename,"a")
+            self.logfile.write("start time {}\n".format(time.time()))
         
         baseModule = self.model.module if not self.data_parallel else self.model.module.module
 
         if self.partitions > 1 and self.shared_weights is not None:
+            embed_time = time.time()
             rank_within_stage = self.stage_to_rank_map[self.stage].index(self.rank)
             for i,w in enumerate(self.shared_weights):
                 recv_stage, send_stage = self.shared_weight_stages[i]
@@ -307,7 +357,10 @@ class Pipeline:
                     for a in attr_names:
                         param = getattr(param,a)
                     param.data.copy_(recv_weight.data)
-                
+            torch.cuda.synchronize(self.device)
+            embed_time = time.time() - embed_time
+            if self.make_logfile:
+                self.logfile.write("weight sharing {}\n".format(embed_time))       
 
 
         self.receive_rank = config["receive_rank"]
@@ -371,7 +424,7 @@ class Pipeline:
                 handle = dist.irecv(acts_tensor, src=self.receive_rank)
                 handle.wait()
                 self.acts_queue.put(acts_tensor.to(self.device))
-        del acts_tensor
+        # del acts_tensor
     
     def grads_receiver(self):
         chunks = len(self.batches)
@@ -387,7 +440,7 @@ class Pipeline:
                 handle = dist.irecv(grads_tensor, src=self.send_rank)
                 handle.wait()
                 self.grads_queue.put(grads_tensor.to(self.device))
-        del grads_tensor
+        # del grads_tensor
 
     def acts_sender(self):
         count = 0
@@ -540,13 +593,19 @@ class Pipeline:
                 if self.make_logfile:
                     self.logfile.write("SYNC! ")
 
+            torch.cuda.synchronize(self.device)
             task_time = time.time() - task_time
             
             if self.make_logfile:
                 self.logfile.write("{} {} {}\n".format(TASK[task[0]],task[1], str(task_time)))
         
         if self.fp16 and self.data_parallel:
+            sync_time = time.time()
             self.all_reduce_opt_grads()
+            torch.cuda.synchronize(self.device)
+            sync_time =  time.time() - sync_time
+            if self.make_logfile:
+                self.logfile.write("SYNC! all-reduce time {}".format(sync_time))
 
         if self.make_logfile:
             self.logfile.write("\n\nBATCH END\n\n")
@@ -584,6 +643,8 @@ class Pipeline:
             overflow_buf,
             [allreduced_views, master_grads],
             1./scaler.loss_scale())
+        with open("grads-{}".format(dist.get_rank()),"a") as f:
+            f.write(str(master_grads[0]))
 
 def scatter(input, batch_size, chunk_size):
     """
@@ -616,3 +677,25 @@ def scatter(input, batch_size, chunk_size):
     return microbatches
 
 
+def load_varuna_optimizer(optimizer, my_stage, num_stages, total_num_pstages, parameter_names, common_store, fp16=False):
+    stages_per_worker = total_num_pstages // num_stages
+    pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
+    # reload state
+    opt_state = {}
+    for i in pstages_to_read:
+        state_ = torch.load(os.path.join(common_store,"opt-state-{}".format(i)),map_location='cpu')
+        opt_state.update(state_)
+    for p in amp.master_params(optimizer):
+        name = parameter_names[p]
+        if name in opt_state:
+            optimizer.state[p] = opt_state[name]
+    # reload master params
+    if fp16:
+        saved_master_params = dict()
+        for i in pstages_to_read:
+            params_ = torch.load(os.path.join(common_store, "opt-fp32-params-{}".format(i)),map_location="cpu")
+            saved_master_params.update(params_)
+        for p in amp.master_params(optimizer):
+            name = parameter_names[p]
+            if name in saved_master_params:
+                p.data.copy_(saved_master_params[name].data)
