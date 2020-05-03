@@ -113,10 +113,6 @@ class Varuna(Module):
 
         self.schedule = self.generate_schedule()
         self.step = 0
-<<<<<<< HEAD
-
-=======
->>>>>>> 8990ff385926beb1ae61702d7c2b9b6efed9e5a6
 
     def init_communication(self, rank_within_stage):
         
