@@ -174,7 +174,48 @@ class Varuna(Module):
         loss = pipeline.run()
         self.step += 1
         return loss
-    
+
+    def evaluate(self, inputs):
+        assert isinstance(inputs, dict), "input must be a dictionary!"
+
+        self.partitioned_model.eval()
+        def send(x, grads=False):
+            # print("sending to rank", self.send_rank, x.size())
+            dist.send(x.cpu(), self.send_rank)
+        def recv(grads=False):
+            x_shape = self.fwd_inp_shape
+            x = torch.zeros(x_shape, dtype=torch.float16 if self.fp16 else torch.float32)
+            # print("receiving from rank", self.receive_rank, x_shape)
+            dist.recv(x, self.receive_rank)
+            return x.to(self.device)
+        self.partitioned_model.set_send_fn(send)
+        self.partitioned_model.set_recv_fn(recv)
+
+        batches = scatter(inputs, int(self.batch_size),self.micro_batch_size)
+        
+        with torch.no_grad():
+            avg_output = None
+            for mb in batches[:-1]:
+                output = self.partitioned_model(**mb)
+                avg_output = output if avg_output is None else avg_output + output
+            mb = batches[-1]
+            def recv(grads=False):
+                x_shape = list(self.fwd_inp_shape)
+                if self.last_chunk_size > 0:
+                    x_shape[0] = self.last_chunk_size
+                x = torch.zeros(x_shape, dtype=torch.float16 if self.fp16 else torch.float32)
+                # print("last receiving from rank", self.receive_rank, x_shape)
+                dist.recv(x, self.receive_rank)
+                return x.to(self.device)
+            self.partitioned_model.set_recv_fn(recv)
+            output = self.partitioned_model(**mb)
+            if self.stage == self.partitions - 1:
+                avg_output = output if avg_output is None else avg_output + output
+
+        if self.stage == self.partitions - 1:
+            avg_output /= len(batches)
+        return avg_output
+
     def eval(self):
         self.model.eval()
     
@@ -186,36 +227,6 @@ class Varuna(Module):
     
     def checkpoint(self, cp_dir_name):
         return self.partitioned_model.checkpoint(cp_dir_name)
-
-    def checkpoint_optimizer(self, optimizer, parameter_names, cp_dir_name):
-        cp_time = time.time()
-        # sd = None
-
-        # one worker from each partition
-        if self.rank == self.stage_to_rank_map[self.stage][0]:
-            new_state = dict()
-            # store state by param names instead of actual parameters
-            for key in optimizer.state:
-                new_state[parameter_names[key]] = optimizer.state[key]
-            torch.save(new_state, os.path.join(cp_dir_name,"opt-state-" + str(self.stage)))
-        # torch.distributed.barrier()
-
-        # if self.stage == 0 and self.rank == self.stage_to_rank_map[0][0]:
-        #     sd = optimizer.state_dict()
-        #     new_state = dict()
-        #     for key in optimizer.state:
-        #         new_state[parameter_names[key]] = optimizer.state[key]
-        #     for stage in range(1,self.partitions):
-        #         state_filename = os.path.join(cp_dir_name,"opt-state-" + str(stage))
-        #         state_ = torch.load(state_filename)
-        #         new_state.update(state_)
-        #         os.remove(state_filename)
-        #     sd["state"] = new_state
-        #     # torch.save(sd, os.path.join(cp_dir_name,"opt-state"))
-        # torch.distributed.barrier()
-        cp_time = time.time() - cp_time
-        print("Opt ckpt time", cp_time)
-        # return sd
 
     def checkpoint_optimizer(self, optimizer, parameter_to_name, param_name_to_pstage, cp_dir_name):
         cp_time = time.time()
@@ -328,35 +339,9 @@ class Pipeline:
             self.logfile = open(logfilename,"a")
             self.logfile.write("start time {}\n".format(time.time()))
         
-        baseModule = self.model.module if not self.data_parallel else self.model.module.module
-
         if self.partitions > 1 and self.shared_weights is not None:
             embed_time = time.time()
-            rank_within_stage = self.stage_to_rank_map[self.stage].index(self.rank)
-            for i,w in enumerate(self.shared_weights):
-                recv_stage, send_stage = self.shared_weight_stages[i]
-                if recv_stage == send_stage:
-                    continue
-                if self.stage == send_stage:
-                    recv_rank = self.stage_to_rank_map[recv_stage][rank_within_stage]
-                    for n,p in baseModule.named_parameters():
-                        if n == w[0]:
-                            send_weight = p
-                            break
-                    dist.send(p.cpu(), recv_rank)
-                elif self.stage == recv_stage:
-                    send_rank = self.stage_to_rank_map[send_stage][rank_within_stage]
-                    for n,p in baseModule.named_parameters():
-                        if n == w[1]:
-                            recv_weight = p
-                            break
-                    recv_weight = torch.zeros(list(recv_weight.size()),dtype=torch.float16 if self.fp16 else toch.float32)
-                    dist.recv(recv_weight, send_rank)
-                    attr_names = w[1].split(".")
-                    param = baseModule
-                    for a in attr_names:
-                        param = getattr(param,a)
-                    param.data.copy_(recv_weight.data)
+            self.share_weights()
             torch.cuda.synchronize(self.device)
             embed_time = time.time() - embed_time
             if self.make_logfile:
@@ -387,6 +372,34 @@ class Pipeline:
         # stores output of recompute(/forward) pass to be used by backward()
         self.loss = None
         self.average_loss = 0
+
+    def share_weights(self):
+        baseModule = self.model.module if not self.data_parallel else self.model.module.module
+        rank_within_stage = self.stage_to_rank_map[self.stage].index(self.rank)
+        for i,w in enumerate(self.shared_weights):
+            recv_stage, send_stage = self.shared_weight_stages[i]
+            if recv_stage == send_stage:
+                continue
+            if self.stage == send_stage:
+                recv_rank = self.stage_to_rank_map[recv_stage][rank_within_stage]
+                for n,p in baseModule.named_parameters():
+                    if n == w[0]:
+                        send_weight = p
+                        break
+                dist.send(p.cpu(), recv_rank)
+            elif self.stage == recv_stage:
+                send_rank = self.stage_to_rank_map[send_stage][rank_within_stage]
+                for n,p in baseModule.named_parameters():
+                    if n == w[1]:
+                        recv_weight = p
+                        break
+                recv_weight = torch.zeros(list(recv_weight.size()),dtype=torch.float16 if self.fp16 else toch.float32)
+                dist.recv(recv_weight, send_rank)
+                attr_names = w[1].split(".")
+                param = baseModule
+                for a in attr_names:
+                    param = getattr(param,a)
+                param.data.copy_(recv_weight.data)       
 
     def spawn_receive_workers(self):
         if self.stage > 0:
@@ -666,13 +679,6 @@ def scatter(input, batch_size, chunk_size):
             if len(microbatches) <= i:
                 microbatches.append(dict())
             microbatches[i][k]=value
-
-    # with open("scatter-{}".format(dist.get_rank()), "w") as f:
-    #     f.write("Scattered to {}\n".format(len(microbatches)))
-    #     for i,m in enumerate(microbatches):
-    #         for k,v in m.items():
-    #             f.write(k + ": " + str(v) + "\n")
-        # f.write(str(microbatches[1]) + "\n")
     
     return microbatches
 
