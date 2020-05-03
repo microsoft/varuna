@@ -362,7 +362,6 @@ class PartitionedModel(Module):
         print("checkpointed!!")
         return param_name_to_pstage
         
-
     def set_ret_val(self, val):
         self.ret_val = val
 

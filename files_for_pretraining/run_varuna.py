@@ -10,13 +10,15 @@ local_rank_to_device = [0,1,2,3]
 
 # different for diff kinds of GPUs
 MAX_GPU_MEM = 16280000000
+processes = []
 
 def calculate_config(args):
     # world size in terms of number of processes
     gpus_available = args.ngpus_per_server * args.nservers
     gpus_per_stage = (gpus_available // args.nstages) if args.gpus_per_stage == 0 else args.gpus_per_stage
-    dist_world_size = gpus_per_stage * args.nstages
-    assert(dist_world_size < gpus_available, "Too many gpus_per_stage!")
+    args.gpus_per_stage = gpus_per_stage
+    dist_world_size = args.gpus_per_stage * args.nstages
+    assert dist_world_size <= gpus_available, "Too many gpus_per_stage - {}!".format(args.gpus_per_stage)
     unused_gpus = (gpus_available - dist_world_size)
 
     # one whole server is unused
@@ -36,8 +38,8 @@ def calculate_config(args):
         stage_to_rank_map_str += (ranks + ";")
 
     # batch size should be divisible by num of data parallel workers
-    per_gpu_batch_size = args.batch_size // gpus_per_stage
-    train_batch_size = per_gpu_batch_size * gpus_per_stage
+    per_gpu_batch_size = args.batch_size // args.gpus_per_stage
+    train_batch_size = per_gpu_batch_size * args.gpus_per_stage
     
     # per_gpu_micro_batch_size = math.ceil(per_gpu_batch_size / (1.0 * args.chunks))
     # gradient_accumulation_steps = 1
@@ -54,6 +56,17 @@ def calculate_config(args):
     # # for pipelining, we don't really need gradient accumalation steps - just increase the number of chunks
     # # we want to keep the micro BS same
     # args.chunks = args.chunks * gradient_accumulation_steps
+
+    # hard coded microbatch sizes for the current configs
+    if args.nstages == 4:
+        # 4x4 and 4x5
+        args.chunk_size = 128
+    elif args.nstages == 8:
+        # 8x2
+        args.chunk_size = 200
+    else:
+        #2x9
+        args.chunk_size = 64
 
     first_rank_in_server = args.node_rank * args.ngpus_per_server
     if args.node_rank == args.nservers - 1:
@@ -170,6 +183,10 @@ if __name__ == "__main__":
         f.write(str(args.ngpus_per_server))
     with open('nservers', 'w') as f:
         f.write(str(args.nservers))
+    with open('nstages', 'w') as f:
+        f.write(str(args.nstages))
+    with open('gpus_per_stage', 'w') as f:
+        f.write(str(args.gpus_per_stage))
 
     def handler(signum,_):
         global loop_pending
@@ -178,16 +195,22 @@ if __name__ == "__main__":
             ngpus_per_server = int(f.read())
         with open('nservers','r') as f:
             nservers = int(f.read())
-        if args.ngpus_per_server == ngpus_per_server and args.nservers == nservers:
+        with open('nstages','r') as f:
+            nstages = int(f.read())
+        with open('gpus_per_stage','r') as f:
+            gpus_per_stage = int(f.read())
+        if args.ngpus_per_server == ngpus_per_server and args.nservers == nservers and args.nstages == nstages and args.gpus_per_stage == gpus_per_stage:
             return
         loop_pending = True
         if args.node_rank >= nservers:
             loop_pending = False
         args.ngpus_per_server = ngpus_per_server
         args.nservers = nservers
+        args.gpus_per_stage = gpus_per_stage
+        args.nstages = nstages
         for p in processes:
             p.send_signal(signal.SIGUSR1)
-        print("\n\n CONFIG CHANGED TO ",args.ngpus_per_server,"GPUS, ",args.nservers, "SERVERS","\n\n\n")
+        print("\n\n CONFIG CHANGED TO ",args.nstages, "x",args.gpus_per_stage,"!!\n\n\n")
 
     signal.signal(signal.SIGUSR1, handler)
 
@@ -241,7 +264,10 @@ if __name__ == "__main__":
             cmd.append("--device={}".format(str(local_rank_to_device[local_rank])))
             cmd.append("--train_batch_size={}".format(str(train_batch_size)))
             if loop_count > 0:
+                with open("resume_step","r") as f:
+                    resume_step = int(f.read())
                 cmd.append("--resume_from_checkpoint")
+                cmd.append("--resume_step={}".format(resume_step))
 
             cmd.extend(args.training_script_args)
             print(" ".join(cmd))
@@ -253,6 +279,9 @@ if __name__ == "__main__":
         # cleanup on kill or error
         # def cleanup:
 
+        with open("prev_job_done","w")as f:
+            f.write("notdone")
+
         # wait for all processes
         for process in processes:
             process.wait()
@@ -262,6 +291,9 @@ if __name__ == "__main__":
                     p.kill()
                 raise subprocess.CalledProcessError(returncode=process.returncode,
                                                     cmd=cmd)
+
+        with open("prev_job_done","w")as f:
+            f.write("done")
 
         loop_count += 1
 

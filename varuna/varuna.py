@@ -113,7 +113,10 @@ class Varuna(Module):
 
         self.schedule = self.generate_schedule()
         self.step = 0
+<<<<<<< HEAD
 
+=======
+>>>>>>> 8990ff385926beb1ae61702d7c2b9b6efed9e5a6
 
     def init_communication(self, rank_within_stage):
         
@@ -268,7 +271,6 @@ class Varuna(Module):
                 for i in pstages:
                     torch.save(pstage_state_dicts[i], os.path.join(cp_dir_name,"opt-fp32-params-" + str(i)))
             
-        # torch.distributed.barrier()
         cp_time = time.time() - cp_time
         print("Opt ckpt time", cp_time)
 
@@ -433,7 +435,6 @@ class Pipeline:
                     fwd_inp_shape = list(self.fwd_inp_shape)
                     fwd_inp_shape[0] = self.last_chunk_size
                 acts_tensor = torch.ones(fwd_inp_shape, dtype=dtype)
-                # print("stage", self.stage, "expecting acts of shape", fwd_inp_shape)
                 handle = dist.irecv(acts_tensor, src=self.receive_rank)
                 handle.wait()
                 self.acts_queue.put(acts_tensor.to(self.device))
@@ -449,7 +450,6 @@ class Pipeline:
                     bwd_grad_shape = list(self.bwd_grad_shape)
                     bwd_grad_shape[0] = self.last_chunk_size
                 grads_tensor = torch.ones(bwd_grad_shape, dtype=dtype)
-                # print("stage", self.stage, "expecting grads of shape", bwd_grad_shape)
                 handle = dist.irecv(grads_tensor, src=self.send_rank)
                 handle.wait()
                 self.grads_queue.put(grads_tensor.to(self.device))
@@ -462,7 +462,6 @@ class Pipeline:
                 count += 1
         while count > 0:
             output_acts = self.acts_send_queue.get()
-            # print("stage", self.stage, "sending acts of shape", output_acts.size())
             handle = dist.isend(output_acts.cpu(), dst=self.send_rank)
             handle.wait()
             del output_acts, handle
@@ -475,7 +474,6 @@ class Pipeline:
                 count += 1
         while count > 0:
             input_grads = self.grads_send_queue.get()
-            # print("stage", self.stage, "sending grads of shape", input_grads.size())
             handle = dist.isend(input_grads.cpu(), dst=self.receive_rank)
             handle.wait()
             del input_grads, handle
@@ -498,10 +496,6 @@ class Pipeline:
             ctx, acts = self.recompute_queue.get()
             restore_rng_states(ctx, self.device)
 
-            # cpu_rng_state = torch.get_rng_state()
-            # gpu_rng_states: Optional[ByteTensor]
-            # gpu_rng_states = torch.cuda.get_rng_state(self.device)
-            # print('recompute: srngs: cpu = ', sha1(cpu_rng_state.cpu().numpy()).hexdigest(), '  gpu = ', sha1(gpu_rng_states.cpu().numpy()).hexdigest())
         else:
             acts = self.acts_queue.get() if self.stage > 0 else None
 
