@@ -103,6 +103,7 @@ class Varuna(Module):
         }
 
         self.schedule = self.generate_schedule()
+        self.step = 0
 
     def init_communication(self, rank_within_stage):
         
@@ -158,8 +159,10 @@ class Varuna(Module):
         # avoid dataloader compute in machines other than the first
         # ask the model writer to pass the input batch generating dataloader function to Varuna::__init__
         # and Varuna can take care of input dataloader explicitly
+        self.config["make_logfile"] = self.config["make_logfile"] and (self.step < 10)
         pipeline = Pipeline(batches, self.model, self.config, self.schedule, self.optimizer)
         loss = pipeline.run()
+        self.step += 1
         return loss
     
     def eval(self):
@@ -174,35 +177,50 @@ class Varuna(Module):
     def checkpoint(self, cp_dir_name):
         return self.partitioned_model.checkpoint(cp_dir_name)
 
-    def checkpoint_optimizer(self, optimizer, parameter_names, cp_dir_name):
+    def checkpoint_optimizer(self, optimizer, parameter_to_name, param_name_to_pstage, cp_dir_name):
         cp_time = time.time()
-        # sd = None
 
         # one worker from each partition
         if self.rank == self.stage_to_rank_map[self.stage][0]:
-            new_state = dict()
+            cuts_per_stage = self.partitioned_model.cuts_per_stage
+            # save param states for each cutpoint separately
+            pstages = range(cuts_per_stage * self.stage, (self.stage+1)* cuts_per_stage)
+            pstage_state_dicts = dict()
+            for i in pstages:
+                pstage_state_dicts[i] = dict()
+
             # store state by param names instead of actual parameters
             for key in optimizer.state:
-                new_state[parameter_names[key]] = optimizer.state[key]
-            torch.save(new_state, os.path.join(cp_dir_name,"opt-state-" + str(self.stage)))
-        torch.distributed.barrier()
+                param_name = parameter_to_name[key]
+                assert param_name in param_name_to_pstage, "param {} not found in rank {}".format(param_name,dist.get_rank())
+                pstage = param_name_to_pstage[param_name]
+                pstage_state_dicts[pstage][param_name] = optimizer.state[key]
+            for i in pstages:
+                torch.save(pstage_state_dicts[i], os.path.join(cp_dir_name,"opt-state-" + str(i)))
 
-        # if self.stage == 0 and self.rank == self.stage_to_rank_map[0][0]:
-        #     sd = optimizer.state_dict()
-        #     new_state = dict()
-        #     for key in optimizer.state:
-        #         new_state[parameter_names[key]] = optimizer.state[key]
-        #     for stage in range(1,self.partitions):
-        #         state_filename = os.path.join(cp_dir_name,"opt-state-" + str(stage))
-        #         state_ = torch.load(state_filename)
-        #         new_state.update(state_)
-        #         os.remove(state_filename)
-        #     sd["state"] = new_state
-        #     # torch.save(sd, os.path.join(cp_dir_name,"opt-state"))
-        # torch.distributed.barrier()
+            # also store optimizer master params for mixed precision training
+            if self.fp16:
+
+                pstage_state_dicts = dict()
+                for i in pstages:
+                    pstage_state_dicts[i] = dict()
+
+                for p in amp.master_params(optimizer):
+                    param_name = parameter_to_name[p]
+                    # not a part of the worker's stage
+                    if param_name not in param_name_to_pstage:
+                        continue
+                    pstage = param_name_to_pstage[param_name]
+                    if pstage not in pstages:
+                        continue
+                    pstage_state_dicts[pstage][param_name] = p
+                for i in pstages:
+                    torch.save(pstage_state_dicts[i], os.path.join(cp_dir_name,"opt-fp32-params-" + str(i)))
+            
+        torch.distributed.barrier()
         cp_time = time.time() - cp_time
         print("Opt ckpt time", cp_time)
-        # return sd
+
 
     def to(self, device):
         self.model.to(device)
@@ -264,19 +282,6 @@ class Pipeline:
             microBS = self.fwd_inp_shape[0] if self.bwd_grad_shape is None else self.bwd_grad_shape[0]
             logfilename = "varuna_logs-mBS" + str(microBS) + "-stage" + str(self.stage) + "of" + str(self.partitions)
             self.logfile = open(logfilename,"a")
-        # print(self.schedule)
-
-        # print(self.model)
-        # if (self.world_size>1):
-        #     if (self.stage == 0):
-        #         # print('fp16 module = ', self.model)
-        #         dist.send(self.model.module.bert.embeddings.word_embeddings.weight.cpu(), self.world_size-1)
-        #     elif (self.stage == self.world_size-1):
-        #         encoder_weights = torch.FloatTensor(self.model.module.cls.predictions.decoder.weight.size()).half()
-        #         dist.recv(encoder_weights, 0)
-        #         # mask = torch.ones(encoder_weights.size()).byte().to(self.device)
-        #         # self.model.module.model.cls.predictions.decoder.weight = self.model.module.model.cls.predictions.decoder.weight.masked_scatter(mask, encoder_weights.to(self.device))
-        #         self.model.module.cls.predictions.decoder.weight = torch.nn.Parameter(encoder_weights.to(self.device))
 
         baseModule = self.model.module if not self.data_parallel else self.model.module.module
 
@@ -356,7 +361,6 @@ class Pipeline:
                     fwd_inp_shape = list(self.fwd_inp_shape)
                     fwd_inp_shape[0] = self.last_chunk_size
                 acts_tensor = torch.ones(fwd_inp_shape, dtype=dtype)
-                # print("stage", self.stage, "expecting acts of shape", fwd_inp_shape)
                 handle = dist.irecv(acts_tensor, src=self.receive_rank)
                 handle.wait()
                 self.acts_queue.put(acts_tensor.to(self.device))
@@ -372,7 +376,6 @@ class Pipeline:
                     bwd_grad_shape = list(self.bwd_grad_shape)
                     bwd_grad_shape[0] = self.last_chunk_size
                 grads_tensor = torch.ones(bwd_grad_shape, dtype=dtype)
-                # print("stage", self.stage, "expecting grads of shape", bwd_grad_shape)
                 handle = dist.irecv(grads_tensor, src=self.send_rank)
                 handle.wait()
                 self.grads_queue.put(grads_tensor.to(self.device))
@@ -385,7 +388,6 @@ class Pipeline:
                 count += 1
         while count > 0:
             output_acts = self.acts_send_queue.get()
-            # print("stage", self.stage, "sending acts of shape", output_acts.size())
             handle = dist.isend(output_acts.cpu(), dst=self.send_rank)
             handle.wait()
             del output_acts, handle
@@ -398,7 +400,6 @@ class Pipeline:
                 count += 1
         while count > 0:
             input_grads = self.grads_send_queue.get()
-            # print("stage", self.stage, "sending grads of shape", input_grads.size())
             handle = dist.isend(input_grads.cpu(), dst=self.receive_rank)
             handle.wait()
             del input_grads, handle
@@ -421,10 +422,6 @@ class Pipeline:
             ctx, acts = self.recompute_queue.get()
             restore_rng_states(ctx, self.device)
 
-            # cpu_rng_state = torch.get_rng_state()
-            # gpu_rng_states: Optional[ByteTensor]
-            # gpu_rng_states = torch.cuda.get_rng_state(self.device)
-            # print('recompute: srngs: cpu = ', sha1(cpu_rng_state.cpu().numpy()).hexdigest(), '  gpu = ', sha1(gpu_rng_states.cpu().numpy()).hexdigest())
         else:
             acts = self.acts_queue.get() if self.stage > 0 else None
 
@@ -592,3 +589,25 @@ def scatter(input, chunk_size):
     return microbatches
 
 
+def load_varuna_optimizer(optimizer, my_stage, num_stages, total_num_pstages, parameter_names, common_store, fp16=False):
+    stages_per_worker = total_num_pstages // num_stages
+    pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
+    # reload state
+    opt_state = {}
+    for i in pstages_to_read:
+        state_ = torch.load(os.path.join(common_store,"opt-state-{}".format(i)),map_location='cpu')
+        opt_state.update(state_)
+    for p in amp.master_params(optimizer):
+        name = parameter_names[p]
+        if name in opt_state:
+            optimizer.state[p] = opt_state[name]
+    # reload master params
+    if fp16:
+        saved_master_params = dict()
+        for i in pstages_to_read:
+            params_ = torch.load(os.path.join(common_store, "opt-fp32-params-{}".format(i)),map_location="cpu")
+            saved_master_params.update(params_)
+        for p in amp.master_params(optimizer):
+            name = parameter_names[p]
+            if name in saved_master_params:
+                p.data.copy_(saved_master_params[name].data)

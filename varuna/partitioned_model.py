@@ -281,6 +281,8 @@ class PartitionedModel(Module):
         stage_index = 0
         state_dict = {}
         cp_count = 0
+        param_name_to_pstage = dict()
+        temp_param_names = []
 
         for name in modules:
             module = self.ordered_modules[name]
@@ -289,6 +291,9 @@ class PartitionedModel(Module):
             if isinstance(module, CutPoint):
                 if len(state_dict.keys()) > 0:
                     torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
+                    for p in temp_param_names:
+                        param_name_to_pstage[p] = stage_index
+                    temp_param_names = []
                     cp_count += 1
                 if cp_count >= self.cuts_per_stage:
                     break
@@ -298,15 +303,23 @@ class PartitionedModel(Module):
                 module_state_dict = module.state_dict()
                 module_state_dict_ = OrderedDict()
                 for key, val in module_state_dict.items():
-                    module_state_dict_[name + "." + key] = val
+                    param_name = name + "." + key
+                    module_state_dict_[param_name] = val
+                    temp_param_names.append(param_name)
+
                 state_dict.update(module_state_dict_)
 
         # last cutpoint
         if len(state_dict.keys()) > 0 and (cp_count < self.cuts_per_stage):
+            state_dict["cls.predictions.bias"] = self.module.cls.predictions.bias
             torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
-
+            for p in temp_param_names:
+                param_name_to_pstage[p] = stage_index
+            param_name_to_pstage["cls.predictions.bias"] = 23
+            
         print("checkpointed!!")
-
+        return param_name_to_pstage
+        
     def set_ret_val(self, val):
         self.ret_val = val
 
