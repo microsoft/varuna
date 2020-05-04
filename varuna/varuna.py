@@ -141,12 +141,15 @@ class Varuna(Module):
         for stage in range(self.partitions):
             ranks = self.stage_to_rank_map[stage]
             if len(ranks) > 1:
-                process_groups[stage] = dist.new_group(ranks=ranks)
+                process_groups[stage] = dist.new_group(ranks=ranks, backend='nccl')
             else:
                 process_groups[stage] = None
 
         if process_groups[self.stage] is not None:
             self.partitioned_model = self.model
+            # ensure DDP is initialised in DP group master first
+            if self.rank!=self.stage_to_rank_map[self.stage][0]:
+                time.sleep(3)
             self.model = torch.nn.parallel.DistributedDataParallel(self.model, process_group=process_groups[self.stage], device_ids=[self.device], find_unused_parameters=True)    
             self.process_group = process_groups[self.stage]
 
