@@ -368,7 +368,7 @@ class Pipeline:
                 # print("stage", self.stage, "expecting acts of shape", fwd_inp_shape)
                 handle = dist.irecv(acts_tensor, src=self.receive_rank)
                 recv_handles.put((handle, acts_tensor))
-                if recv_handles.qsize()>10:
+                if recv_handles.qsize()>4:
                     handle, tensor = recv_handles.get()
                     handle.wait()
                     self.acts_queue.put(tensor.to(self.device))
@@ -393,7 +393,7 @@ class Pipeline:
                 # print("stage", self.stage, "expecting grads of shape", bwd_grad_shape)
                 handle = dist.irecv(grads_tensor, src=self.send_rank)
                 recv_handles.put((handle, grads_tensor))
-                if recv_handles.qsize()>10:
+                if recv_handles.qsize()>4:
                     handle, tensor = recv_handles.get()
                     handle.wait()
                     self.grads_queue.put(tensor.to(self.device))
@@ -421,7 +421,7 @@ class Pipeline:
             # print("stage", self.stage, "sending acts of shape", output_acts.size())
             handle = dist.isend(output_acts.cpu(), dst=self.send_rank)
             send_handles.put(handle)
-            if send_handles.qsize()>10:
+            if send_handles.qsize()>4:
                 handle = send_handles.get()
                 handle.wait()
             count -= 1
@@ -448,7 +448,7 @@ class Pipeline:
             # print("stage", self.stage, "sending grads of shape", input_grads.size())
             handle = dist.isend(input_grads.cpu(), dst=self.receive_rank)
             send_handles.put(handle)
-            if send_handles.qsize()>10:
+            if send_handles.qsize()>4:
                 handle = send_handles.get()
                 handle.wait()
             count -= 1
