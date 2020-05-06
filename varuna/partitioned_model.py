@@ -142,7 +142,8 @@ class PartitionedModel(Module):
                 if isinstance(module, CutPoint):
                     self.num_cutpoints += 1
             
-            self.module(**dummy_inputs)
+            with torch.no_grad():
+                self.module(**dummy_inputs)
 
             for h in hooks:
                 h.remove()
