@@ -13,7 +13,7 @@ echo $NNODES $NODE_RANK $MASTER_ADDR
 DATA_PATH=/home/varuna/bert-large-blob/openwebtext-subset_text_document
 CHECKPOINT_PATH=/home/varuna/bert-large-blob/megaperf
 
-python3 run_varuna.py --nstages 96 --batch_size 8096 --chunk_size 2 --total_num_stages 96 --ngpus_per_server 4 --nservers $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR  pretrain_gpt2.py \
+python3 run_varuna.py --nstages 48 --batch_size 8096 --chunk_size 2 --total_num_stages 96 --ngpus_per_server 4 --nservers $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR  pretrain_gpt2.py \
        --num-layers 96 \
        --hidden-size 4200 \
        --num-attention-heads 42 \

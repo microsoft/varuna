@@ -76,11 +76,14 @@ class Varuna(Module):
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
         self.model = PartitionedModel(model, self.rank, self.local_rank, device, self.stage_to_rank_map, self.fp16, shared_weights)
         self.model.initialize( dummy_inputs, from_cache=True )
+        if self.local_rank==0:
+            # print("varuna init() after dry run init: ", self.local_rank, torch.cuda.memory_summary(self.device))
+            print('varuna init() after dry run:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
         self.partitioned_model = self.model
         self.shared_weight_stages = self.model.shared_weight_stages if self.shared_weights is not None else None
 
-        print("SHARED WEIGHTS ARE")
-        print(self.shared_weight_stages)
+        # print("SHARED WEIGHTS ARE")
+        # print(self.shared_weight_stages)
 
         # assert(batch_size % data_depth == 0, "Batch size not divisible by data parallel depth!")
         self.batch_size = batch_size // data_depth
@@ -89,7 +92,14 @@ class Varuna(Module):
         self.init_communication(rank_within_stage)
 
         self.model.to(self.device)
+        torch.cuda.synchronize()
+        if self.local_rank==0:
+            # print("varuna_init() post model.to: ", self.local_rank, torch.cuda.memory_summary(self.device))
+            print('varuna init() post model.to:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
         self.init_distributed()
+        if self.local_rank==0:
+            # print("varuna_init() post ddp init: ", self.local_rank, torch.cuda.memory_summary(self.device))
+            print('varuna init() post ddp init:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
 
 
         self.config = {
@@ -109,7 +119,8 @@ class Varuna(Module):
             # "embedding_send_rank": self.embedding_send_rank,
             "shared_weights": self.shared_weights,
             "shared_weight_stages": self.shared_weight_stages,
-            "stage_to_rank_map": self.stage_to_rank_map
+            "stage_to_rank_map": self.stage_to_rank_map,
+            "local_rank": self.local_rank
         }
 
         self.schedule = self.generate_schedule()
@@ -157,8 +168,9 @@ class Varuna(Module):
                 process_groups[stage] = None
 
         if process_groups[self.stage] is not None:
-            self.partitioned_model = self.model
-            self.model = torch.nn.parallel.DistributedDataParallel(self.model, process_group=process_groups[self.stage], device_ids=[self.device], find_unused_parameters=True)    
+            # self.partitioned_model = self.model
+            # self.model = torch.nn.parallel.DistributedDataParallel(self.model, process_group=process_groups[self.stage], device_ids=[self.device], find_unused_parameters=True)    
+            # self.partitioned_model = self.model.module
             self.process_group = process_groups[self.stage]
 
     def forward(self, inputs):        
@@ -318,7 +330,7 @@ class Pipeline:
         self.process_group = config["dp_process_group"]
 
         self.model = model
-        self.partitioned_model = self.model.module if self.data_parallel else self.model
+        self.partitioned_model = self.model#.module if self.data_parallel else self.model
         self.device = config["device"]
         self.schedule = schedule
         self.fp16 = config["fp16"]
@@ -351,6 +363,7 @@ class Pipeline:
         self.send_rank = config["send_rank"]
 
         self.last_chunk_size = config["last_chunk_size"]
+        self.local_rank = config["local_rank"]
 
         self.optimizer = optimizer
         self.fp16 = config["fp16"]
@@ -373,7 +386,7 @@ class Pipeline:
         self.average_loss = 0
 
     def share_weights(self):
-        baseModule = self.model.module if not self.data_parallel else self.model.module.module
+        baseModule = self.model.module #if not self.data_parallel else self.model.module.module
         rank_within_stage = self.stage_to_rank_map[self.stage].index(self.rank)
         for i,w in enumerate(self.shared_weights):
             recv_stage, send_stage = self.shared_weight_stages[i]
@@ -578,8 +591,11 @@ class Pipeline:
         
     def run(self):
         self.spawn_receive_workers()
+        batchstart = time.time()
 
         for index, task in enumerate(self.schedule):
+            if self.local_rank==0 and task[0]==2 and (task[1]%500==0 or task[1]==1):
+                print('iteration memory at micro-step', task[1], ':', torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
             grad_mode = False
             if task[0] == 0:
                 if self.schedule[index+1][0] == 2:      
@@ -589,13 +605,14 @@ class Pipeline:
             # For data parallel, sync only when doing last microbatch fwd/bwd
             # and for fp16, directly just all reduce optimizer master param grads
             task_time = time.time()
-            if self.data_parallel and (task[1] < (len(self.batches) - 1) or  self.fp16):
-                with self.model.no_sync():
-                    self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
-            else:
-                self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
-                if self.make_logfile:
-                    self.logfile.write("SYNC! ")
+            # if self.data_parallel and (task[1] < (len(self.batches) - 1) or  self.fp16):
+            #     with self.model.no_sync():
+            #         self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
+            # else:
+            #     self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
+            self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
+            if self.make_logfile:
+                self.logfile.write("SYNC! ")
 
             torch.cuda.synchronize(self.device)
             task_time = time.time() - task_time
@@ -611,8 +628,9 @@ class Pipeline:
             if self.make_logfile:
                 self.logfile.write("SYNC! all-reduce time {}".format(sync_time))
 
+        batchtime = time.time() - batchstart
         if self.make_logfile:
-            self.logfile.write("\n\nBATCH END\n\n")
+            self.logfile.write("\n\nBATCH END time = {}\n\n".format(batchtime))
             self.logfile.close()        
         if self.acts_receive_thread is not None:
             self.acts_receive_thread.join()
@@ -629,11 +647,18 @@ class Pipeline:
 
     def all_reduce_opt_grads(self):
         # 1. allocate an uninitialized buffer for flattened gradient
+        if self.local_rank==0:
+            # print("all_reduce() start: ", self.local_rank, torch.cuda.memory_summary(self.device))
+            print('all_reduce() start:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
         scaler = _amp_state.loss_scalers[0]
         master_grads = [p.grad for p in amp.master_params(self.optimizer) if p.grad is not None]
-        print("all_reduce_opt_grads() grad details: ", self.stage, len(master_grads), numpy.array([numpy.array(x.size()).prod() for x in master_grads]).sum())
+        # print("all_reduce_opt_grads() grad details: ", self.stage, len(master_grads), numpy.array([numpy.array(x.size()).prod() for x in master_grads]).sum())
         flat_grad_size = sum(p.numel() for p in master_grads)
         flat_raw = torch.empty(flat_grad_size, device=self.device, dtype=torch.float32)
+        # print("all_reduce_opt_grads(): flat_raw initialized, memory ", self.device, torch.cuda.max_memory_allocated(self.device))
+        if self.local_rank==0:
+            # print("all_reduce() flat_raw initialized: ", self.local_rank, torch.cuda.memory_summary(self.device))
+            print('all_reduce() flat raw initialized:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
         # 2. combine unflattening and predivision of unscaled 'raw' gradient
         allreduced_views = apex_C.unflatten(flat_raw, master_grads)
         overflow_buf = torch.cuda.IntTensor([0]) # not checking for overflow manually
@@ -642,7 +667,13 @@ class Pipeline:
             [master_grads, allreduced_views],
             scaler.loss_scale() / self.data_depth)
         # 3. sum gradient across ranks. Because of the predivision, this averages the gradient
+        if self.local_rank==0:
+            # print("all_reduce() before allreduce: ", self.local_rank, torch.cuda.memory_summary(self.device))
+            print('all_reduce() before allreduce:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
         torch.distributed.all_reduce(flat_raw, group=self.process_group)
+        if self.local_rank==0:
+            # print("all_reduce() after allreduce: ", self.local_rank, torch.cuda.memory_summary(self.device))
+            print('all_reduce() after allreduce:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
         # 4. combine unscaling and unflattening of allreduced gradient
         amp_C.multi_tensor_scale(65536,
             overflow_buf,

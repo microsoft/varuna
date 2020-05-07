@@ -98,7 +98,6 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
 
     # Data stuff.
     torch.cuda.synchronize()
-    print("building real data!!")
     timers('train/valid/test data iterators').start()
     train_data_iterator, valid_data_iterator, test_data_iterator, dry_run_input \
         = build_train_valid_test_data_iterators(
@@ -210,11 +209,9 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input):
     """Setup model and optimizer."""
     args = get_args()
 
-    print('getting model!')
     model = get_model(model_provider_func)
-    print('got model! Moving on to dry run!')
-    optimizer = get_optimizer(model)
-    lr_scheduler = get_learning_rate_scheduler(optimizer)
+    optimizer = None#get_optimizer(model)
+    # lr_scheduler = get_learning_rate_scheduler(optimizer)
 
     if args.varuna:
         device = torch.device("cuda", args.local_rank)
@@ -248,9 +245,16 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input):
         shared_weights = [("language_model.embedding.word_embeddings.weight","lm_head_weight")]
         model = Varuna(model, args.stage_to_rank_map, dry_run_input, args.batch_size * args.data_depth, optimizer, args.chunk_size, args.fp16, local_rank=args.local_rank, device=args.local_rank, shared_weights=shared_weights)
         # model.cuda(torch.cuda.current_device())
-        model.to(device)
+        if args.local_rank==0:
+            # print("setup_model() post varuna init: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
+            print('setup_model() post varuna init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())            
+        # model.to(device)
     
     optimizer = get_optimizer(model)
+    model.optimizer = optimizer
+    if args.local_rank==0:
+        # print("setup_model() post optimizer init: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
+        print('setup_model() post optimizer init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
     lr_scheduler = get_learning_rate_scheduler(optimizer)
 
     if args.fp16:
@@ -260,8 +264,15 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input):
         else:
             model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale=args.loss_scale, min_loss_scale=args.min_scale)
     
+    # '''
+    if args.local_rank==0:
+        # print("setup_model() post amp init: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
+        print('setup_model() post amp init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
     # fp32 param names for checkpointing
     optimizer._amp_lazy_init()
+    if args.local_rank==0:
+        # print("setup_model() post amp opt init: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
+        print('setup_model() post amp opt init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
     parameter_names_ = dict()
     for n,p in model.named_parameters():
         parameter_names_[p] = n
@@ -275,7 +286,11 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input):
             parameter_names[p_master] = parameter_names_.pop(p_model)
             count += 1
     print(count, "params found in rank", args.rank)
+    # if args.local_rank==0:
+        # print("setup_model() post opt init: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
+        # print('setup_model() post opt int:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
     # print(args.rank, parameter_names)
+    # '''
 
     # Wrap model for distributed training."""
     # if args.DDP_impl == 'torch':
@@ -303,7 +318,8 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input):
     #     with torch.no_grad():
     #         model.model.module.module.lm_head_weight.data.copy_(param.data) 
 
-    model.optimizer = optimizer
+    # model.optimizer = optimizer
+    print(model)
 
     return model, optimizer, lr_scheduler, parameter_names
 
@@ -391,7 +407,13 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
 
     # Update parameters.
     timers('optimizer').start()
+    if args.local_rank==0:
+        # print("setup_model() pre opt step: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
+        print('setup_model() pre opt step:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
     overflow = optimizer.step()
+    if args.local_rank==0:
+        # print("setup_model() post opt step: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
+        print('setup_model() post opt step:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())        
     timers('optimizer').stop()
 
     for param in model.parameters():
