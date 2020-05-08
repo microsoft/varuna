@@ -342,6 +342,7 @@ class Pipeline:
         self.shared_weights = config["shared_weights"]
         self.shared_weight_stages = config["shared_weight_stages"]
         self.stage_to_rank_map = config["stage_to_rank_map"]
+        self.local_rank = config["local_rank"]
 
         self.make_logfile = config["make_logfile"]
         if self.make_logfile:
@@ -363,7 +364,6 @@ class Pipeline:
         self.send_rank = config["send_rank"]
 
         self.last_chunk_size = config["last_chunk_size"]
-        self.local_rank = config["local_rank"]
 
         self.optimizer = optimizer
         self.fp16 = config["fp16"]
@@ -395,19 +395,20 @@ class Pipeline:
             if self.stage == send_stage:
                 recv_rank = self.stage_to_rank_map[recv_stage][rank_within_stage]
                 for n,p in baseModule.named_parameters():
-                    if n == w[0]:
+                    if n == w[1]:
                         send_weight = p
                         break
-                dist.send(p.cpu(), recv_rank)
+                # dist.send(p.cpu(), recv_rank)
+                dist.send(send_weight.cpu(), recv_rank)
             elif self.stage == recv_stage:
                 send_rank = self.stage_to_rank_map[send_stage][rank_within_stage]
                 for n,p in baseModule.named_parameters():
-                    if n == w[1]:
+                    if n == w[0]:
                         recv_weight = p
                         break
                 recv_weight = torch.zeros(list(recv_weight.size()),dtype=torch.float16 if self.fp16 else toch.float32)
                 dist.recv(recv_weight, send_rank)
-                attr_names = w[1].split(".")
+                attr_names = w[0].split(".")
                 param = baseModule
                 for a in attr_names:
                     param = getattr(param,a)
