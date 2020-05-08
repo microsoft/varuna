@@ -398,12 +398,6 @@ class PartitionedModel(Module):
         to_remove = []
         with open("remove_params-{}".format(dist.get_rank()), "w") as f:
             for n,p in self.module.named_parameters():
-                if "lm_head" in n:
-                    print(self.local_rank, n, end=' ')
-                    if p.grad is None:
-                        print('grad is none')
-                    else:
-                        print()
                 if p.grad is None:
                     to_remove.append(n)
                     path = n.split(".")
@@ -419,6 +413,7 @@ class PartitionedModel(Module):
             self.module.train()
 
         for m in self.ordered_modules:
+            m = self.ordered_modules[m] 
             if isinstance(m,CutPoint):
                 m.pruning = False
         self.model_pruned = True

@@ -174,6 +174,7 @@ class Varuna(Module):
             self.process_group = process_groups[self.stage]
 
     def forward(self, inputs):        
+        # torch.cuda.empty_cache()
         # Divide a mini-batch into micro-batches.
         batches = scatter(inputs, int(self.batch_size),self.micro_batch_size)
         
@@ -398,7 +399,6 @@ class Pipeline:
                     if n == w[1]:
                         send_weight = p
                         break
-                # dist.send(p.cpu(), recv_rank)
                 dist.send(send_weight.cpu(), recv_rank)
             elif self.stage == recv_stage:
                 send_rank = self.stage_to_rank_map[send_stage][rank_within_stage]
@@ -595,8 +595,8 @@ class Pipeline:
         batchstart = time.time()
 
         for index, task in enumerate(self.schedule):
-            if self.local_rank==0 and task[0]==2 and (task[1]%500==0 or task[1]==1):
-                print('iteration memory at micro-step', task[1], ':', torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
+            if self.local_rank==0  and (task[1]%200==0 or task[1]<10):
+                print(TASK[task[0]], 'iteration memory at micro-step', task[1], ':', torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
             grad_mode = False
             if task[0] == 0:
                 if self.schedule[index+1][0] == 2:      
@@ -653,7 +653,7 @@ class Pipeline:
             print('all_reduce() start:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
         scaler = _amp_state.loss_scalers[0]
         master_grads = [p.grad for p in amp.master_params(self.optimizer) if p.grad is not None]
-        # print("all_reduce_opt_grads() grad details: ", self.stage, len(master_grads), numpy.array([numpy.array(x.size()).prod() for x in master_grads]).sum())
+        print("all_reduce_opt_grads() grad details: ", self.stage, len(master_grads), numpy.array([numpy.array(x.size()).prod() for x in master_grads]).sum())
         flat_grad_size = sum(p.numel() for p in master_grads)
         flat_raw = torch.empty(flat_grad_size, device=self.device, dtype=torch.float32)
         # print("all_reduce_opt_grads(): flat_raw initialized, memory ", self.device, torch.cuda.max_memory_allocated(self.device))
