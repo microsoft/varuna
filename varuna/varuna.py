@@ -163,7 +163,7 @@ class Varuna(Module):
         for stage in range(self.partitions):
             ranks = self.stage_to_rank_map[stage]
             if len(ranks) > 1:
-                process_groups[stage] = dist.new_group(ranks=ranks)
+                process_groups[stage] = dist.new_group(ranks=ranks, backend='nccl')
             else:
                 process_groups[stage] = None
 
@@ -319,6 +319,7 @@ def restore_rng_states(rng_states, device):
     # torch.cuda.set_rng_state_all(gpu_rng_states)        # todo: verify correctness;   batchNorm, dropouts, convlayers?
     torch.cuda.set_rng_state(gpu_rng_states, device)
 
+
 class Pipeline:
     """ Pipeline parallelism for Varuna """
 
@@ -353,12 +354,12 @@ class Pipeline:
             self.logfile.write("start time {}\n".format(time.time()))
         
         if self.partitions > 1 and self.shared_weights is not None:
-            embed_time = time.time()
+            embed_comm_start = time.time()
             self.share_weights()
             torch.cuda.synchronize(self.device)
-            embed_time = time.time() - embed_time
+            embed_comm_time = time.time() - embed_comm_start
             if self.make_logfile:
-                self.logfile.write("weight sharing {}\n".format(embed_time))       
+                self.logfile.write("{} {} {} {}\n".format("embedcomm", 0, embed_comm_start, embed_comm_time))
 
 
         self.receive_rank = config["receive_rank"]
@@ -436,9 +437,17 @@ class Pipeline:
             self.grads_send_thread.daemon=True
             self.grads_send_thread.start() 
     
+    # def handle_wait(self, handles, count):
+    #     while count>0:
+    #         handle = handles.get()
+    #         handle.wait()
+    #         count -= 1
+    
     def acts_receiver(self):
         chunks = len(self.batches)
         dtype = torch.float16 if self.fp16 else torch.float32
+        recv_handles = Queue()
+
         for task,index in self.schedule:
             if task == 0:
                 fwd_inp_shape = self.fwd_inp_shape
@@ -447,13 +456,22 @@ class Pipeline:
                     fwd_inp_shape[0] = self.last_chunk_size
                 acts_tensor = torch.ones(fwd_inp_shape, dtype=dtype)
                 handle = dist.irecv(acts_tensor, src=self.receive_rank)
-                handle.wait()
-                self.acts_queue.put(acts_tensor.to(self.device))
-        # del acts_tensor
+                recv_handles.put((handle, acts_tensor))
+                if recv_handles.qsize()>4:
+                    handle, tensor = recv_handles.get()
+                    handle.wait()
+                    self.acts_queue.put(tensor.to(self.device))
+        while not recv_handles.empty():
+            handle, tensor = recv_handles.get()
+            handle.wait()
+            self.acts_queue.put(tensor.to(self.device))
+        del acts_tensor
     
     def grads_receiver(self):
         chunks = len(self.batches)
         dtype = torch.float16 if self.fp16 else torch.float32
+        recv_handles = Queue()
+
         for task,index in self.schedule:
             if task == 2:
                 bwd_grad_shape = self.bwd_grad_shape
@@ -462,33 +480,68 @@ class Pipeline:
                     bwd_grad_shape[0] = self.last_chunk_size
                 grads_tensor = torch.ones(bwd_grad_shape, dtype=dtype)
                 handle = dist.irecv(grads_tensor, src=self.send_rank)
-                handle.wait()
-                self.grads_queue.put(grads_tensor.to(self.device))
-        # del grads_tensor
+                recv_handles.put((handle, grads_tensor))
+                if recv_handles.qsize()>4:
+                    handle, tensor = recv_handles.get()
+                    handle.wait()
+                    self.grads_queue.put(tensor.to(self.device))
+        while not recv_handles.empty():
+            handle, tensor = recv_handles.get()
+            handle.wait()
+            self.grads_queue.put(tensor.to(self.device))
+        del grads_tensor
 
     def acts_sender(self):
         count = 0
         for task,index in self.schedule:
             if task == 0:
                 count += 1
+        # count = len(self.batches)   # worsens performance if used instead of for loop. Why?
+
+        send_handles = Queue()
+
+        # wait_handler = Thread(target=self.handle_wait, args=(send_handles, count))
+        # wait_handler.daemon=True
+        # wait_handler.start()
+        
         while count > 0:
             output_acts = self.acts_send_queue.get()
             handle = dist.isend(output_acts.cpu(), dst=self.send_rank)
-            handle.wait()
-            del output_acts, handle
+            send_handles.put(handle)
+            if send_handles.qsize()>4:
+                handle = send_handles.get()
+                handle.wait()
             count -= 1
+        while not send_handles.empty():
+            handle = send_handles.get()
+            handle.wait()
+        # wait_handler.join()
 
     def grads_sender(self):
         count = 0
         for task,index in self.schedule:
             if task == 2:
                 count += 1
+        # count = len(self.batches)   # worsens performance if used instead of for loop. Why?
+        
+        send_handles = Queue()
+
+        # wait_handler = Thread(target=self.handle_wait, args=(send_handles, count))
+        # wait_handler.daemon=True
+        # wait_handler.start()
+
         while count > 0:
             input_grads = self.grads_send_queue.get()
             handle = dist.isend(input_grads.cpu(), dst=self.receive_rank)
-            handle.wait()
-            del input_grads, handle
+            send_handles.put(handle)
+            if send_handles.qsize()>4:
+                handle = send_handles.get()
+                handle.wait()
             count -= 1
+        while not send_handles.empty():
+            handle = send_handles.get()
+            handle.wait()
+        # wait_handler.join()
         
     # tells the model where to send acts and gradients
     def set_model_send_fn(self, recompute = False):
@@ -508,15 +561,19 @@ class Pipeline:
             restore_rng_states(ctx, self.device)
 
         else:
+            recv_time_start = time.time()
             acts = self.acts_queue.get() if self.stage > 0 else None
+            recv_time = time.time() - recv_time_start
+            if self.make_logfile:
+                self.logfile.write("{} {} {} {}\n".format("recvacts", 0, recv_time_start, recv_time))
 
         def recv(grads = False):
             if grads:
-                recv_time = time.time()
+                recv_time_start = time.time()
                 g = self.grads_queue.get()
-                recv_time = time.time() - recv_time
+                recv_time = time.time() - recv_time_start
                 if self.make_logfile:   
-                    self.logfile.write("rcv grads " + str(recv_time) + "\n")
+                    self.logfile.write("{} {} {} {}\n".format("recvgrads", 0, recv_time_start, recv_time))
                 return g
             else:
                 return acts
@@ -524,7 +581,6 @@ class Pipeline:
         self.partitioned_model.set_recv_fn(recv)
         # because there's no peek/front method for these queues
         return acts
-
 
     def worker(self, task, grad_mode, inputs_as_dict, lastub):
         """ Main body of worker loop """
@@ -538,27 +594,35 @@ class Pipeline:
                 rng_states = save_rng_states(self.device)
 
             self.set_model_send_fn(recompute = False)
-            recv_time = time.time()
             acts = self.set_model_recv_fn(recompute = False)
-            recv_time = time.time() - recv_time
-            if self.make_logfile:
-                self.logfile.write("rcv acts " + str(recv_time) + "\n")
+            task_time_start = time.time()
             output = self.model(**inputs_as_dict)
+            if self.make_logfile:
+                torch.cuda.synchronize(self.device)
+            task_time = time.time() - task_time_start
+            if self.make_logfile:
+                self.logfile.write("{} {} {} {}\n".format(TASK[0], 0, str(task_time_start), str(task_time)))
 
             if grad_mode == False:
-                # if these acts are going to be recomputed
                 ctx = (rng_states, acts)
                 self.recompute_queue.put(ctx)
             else:
                 # save loss and input activations for the backward pass to use
                 self.loss = output[0] if isinstance(output,tuple) else output
+            # print(self.stage, 'forward done')
 
             
         elif task == 1:
             torch.set_grad_enabled(True)
             self.set_model_send_fn(recompute = True)
             self.set_model_recv_fn(recompute = True)
+            task_time_start = time.time()
             output = self.model(**inputs_as_dict)
+            if self.make_logfile:
+                torch.cuda.synchronize(self.device)
+            task_time = time.time() - task_time_start
+            if self.make_logfile:
+               self.logfile.write("{} {} {} {}\n".format(TASK[1], 0, str(task_time_start), str(task_time)))
 
             self.loss = output[0] if isinstance(output,tuple) else output
         
@@ -566,8 +630,14 @@ class Pipeline:
             if self.stage != self.partitions-1:
                 grads = torch.ones(self.loss.size(), dtype = torch.float32).to(self.device)
                 if self.fp16:
+                    task_time_start = time.time()
                     with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_microbatch=lastub, last_partition=False) as scaled_loss:
                         scaled_loss.backward(grads)
+                    if self.make_logfile:
+                        torch.cuda.synchronize(self.device)
+                    task_time = time.time() - task_time_start
+                    if self.make_logfile:
+                        self.logfile.write("{} {} {} {}\n".format(TASK[2], 0, str(task_time_start), str(task_time)))
                 else:
                     self.loss.backward(grads)
 
@@ -577,23 +647,30 @@ class Pipeline:
                 self.average_loss += self.loss.item()
 
                 if self.fp16:
+                    task_time_start = time.time()
                     with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_microbatch=lastub) as scaled_loss:
                         scaled_loss.backward()
                         # if lastub:
                         #     for p in self.optimizer.state:
                         #         assert p.grad is None,"why is the optimizer getting grads"
+                    if self.make_logfile:
+                        torch.cuda.synchronize(self.device)
+                    task_time = time.time() - task_time_start
+                    if self.make_logfile:
+                        self.logfile.write("{} {} {} {}\n".format(TASK[2], 0, str(task_time_start), str(task_time)))
 
                     # self.optimizer.backward(self.loss)
                 else:
                     self.loss.backward()
 
+            # print(self.stage, 'backward done')
             del self.loss
             self.loss = None
         
     def run(self):
         self.spawn_receive_workers()
-        batchstart = time.time()
 
+        batchstart = time.time()
         for index, task in enumerate(self.schedule):
             if self.local_rank==0  and (task[1]%200==0 or task[1]<10):
                 print(TASK[task[0]], 'iteration memory at micro-step', task[1], ':', torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
@@ -605,7 +682,7 @@ class Pipeline:
 
             # For data parallel, sync only when doing last microbatch fwd/bwd
             # and for fp16, directly just all reduce optimizer master param grads
-            task_time = time.time()
+            # task_time = time.time()
             # if self.data_parallel and (task[1] < (len(self.batches) - 1) or  self.fp16):
             #     with self.model.no_sync():
             #         self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
@@ -615,11 +692,11 @@ class Pipeline:
             if self.make_logfile:
                 self.logfile.write("SYNC! ")
 
-            torch.cuda.synchronize(self.device)
-            task_time = time.time() - task_time
+            # torch.cuda.synchronize(self.device)
+            # task_time = time.time() - task_time
             
-            if self.make_logfile:
-                self.logfile.write("{} {} {}\n".format(TASK[task[0]],task[1], str(task_time)))
+            # if self.make_logfile:
+            #     self.logfile.write("{} {} {} {}\n".format(TASK[task[0]],task[1], str(task_time_start), str(task_time)))
         
         if self.fp16 and self.data_parallel:
             sync_time = time.time()
@@ -629,9 +706,9 @@ class Pipeline:
             if self.make_logfile:
                 self.logfile.write("SYNC! all-reduce time {}".format(sync_time))
 
-        batchtime = time.time() - batchstart
+        batchtime = time.time()-batchstart
         if self.make_logfile:
-            self.logfile.write("\n\nBATCH END time = {}\n\n".format(batchtime))
+            self.logfile.write("\n\nBATCH END {} {}\n\n".format(batchstart, batchtime))
             self.logfile.close()        
         if self.acts_receive_thread is not None:
             self.acts_receive_thread.join()
@@ -668,13 +745,12 @@ class Pipeline:
             [master_grads, allreduced_views],
             scaler.loss_scale() / self.data_depth)
         # 3. sum gradient across ranks. Because of the predivision, this averages the gradient
-        if self.local_rank==0:
-            # print("all_reduce() before allreduce: ", self.local_rank, torch.cuda.memory_summary(self.device))
-            print('all_reduce() before allreduce:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
+        allred_time_start = time.time()
         torch.distributed.all_reduce(flat_raw, group=self.process_group)
-        if self.local_rank==0:
-            # print("all_reduce() after allreduce: ", self.local_rank, torch.cuda.memory_summary(self.device))
-            print('all_reduce() after allreduce:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
+        torch.cuda.synchronize()
+        allred_time = time.time() - allred_time_start
+        if self.make_logfile:
+            self.logfile.write("SYNC! all_reduce {} {} {}\n".format(flat_grad_size,allred_time_start,allred_time))
         # 4. combine unscaling and unflattening of allreduced gradient
         amp_C.multi_tensor_scale(65536,
             overflow_buf,
