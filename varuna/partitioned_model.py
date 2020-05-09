@@ -8,11 +8,6 @@ import pickle
 
 from collections import OrderedDict 
 
-blob_store_folder = "~/myblobcontainer"
-
-cp_partition_prefix = "cp-partition"
-
-
 class CutPoint(Module):
     def __init__(self):
         super(CutPoint, self).__init__()
@@ -25,6 +20,10 @@ class CutPoint(Module):
         self.send_fn = self.recv_fn = None
         self.stage = -1
         self.fp16 = False
+        self.pruning = False
+    
+    def set_pruning(self, boolean):
+        self.pruning = boolean
 
     def forward(self, *inputs, **kwargs):
         # not set by ModelParallel, pass through as is
@@ -32,8 +31,11 @@ class CutPoint(Module):
             return inputs[0]
 
         if len(inputs) < 0 or (len(inputs) == 1 and inputs[0] is None):
-            dtype = torch.float16 if self.fp16 else torch.float32
-            inputs = (torch.tensor([-1.0],requires_grad = True, dtype=dtype).to(self.device),)
+            if self.pruning:
+                inputs = (torch.tensor([-1.0],requires_grad = True),)
+            else:
+                dtype = torch.float16 if self.fp16 else torch.float32
+                inputs = (torch.tensor([-1.0],requires_grad = True, dtype=dtype).to(self.device),)
 
         if isinstance(self.cp_func, torch.autograd.Function):
             out = self.cp_func.apply(*inputs, **kwargs)            
@@ -56,7 +58,7 @@ class CutPoint(Module):
                 if is_in_next_stage and self.recv_fn is not None:
                     i = self.recv_fn()
                 # send activations
-                elif is_in_prev_stage:
+                elif is_in_prev_stage and self.send_fn is not None:
                     self.send_fn(i)
                 return i
 
@@ -66,7 +68,7 @@ class CutPoint(Module):
                 if is_in_prev_stage and self.recv_fn is not None:
                     grad_output = self.recv_fn(grads = True)
                 # send gradients
-                elif is_in_next_stage:
+                elif is_in_next_stage and self.send_fn is not None:
                     self.send_fn(grad_output, grads = True)
                 return grad_output
         
@@ -110,7 +112,7 @@ class PartitionedModel(Module):
             self.find_shared_weight_stages()
         print("dry run time", time.time() - start)
         self.prep_cutpoints()
-        self.remove_unused_parameters()
+        self.remove_unused_parameters(dummy_inputs)
         self.model_pruned = True
 
 
@@ -142,7 +144,8 @@ class PartitionedModel(Module):
                 if isinstance(module, CutPoint):
                     self.num_cutpoints += 1
             
-            self.module(**dummy_inputs)
+            with torch.no_grad():
+                self.module(**dummy_inputs)
 
             for h in hooks:
                 h.remove()
@@ -252,7 +255,7 @@ class PartitionedModel(Module):
                 break
         
 # """ remove unused modules to save memory. """
-    def remove_unused_parameters(self):
+    def remove_unused_parameters(self, dummy_inputs):
 
         pre_cp_index = self.stage
         post_cp_index = self.stage + 1
@@ -293,7 +296,7 @@ class PartitionedModel(Module):
                 modules[path[-1]] = PassThroughModule()
                 self.ordered_modules[m] = None
 
-        self.model_pruned = True
+        self.check_unused_parameters(dummy_inputs)
 
     """For each partition/stage, the first rank in that stage saves state_dict 
     of the cutpoints used by that stage to a common store. So checkpoint is sharded 
@@ -361,6 +364,62 @@ class PartitionedModel(Module):
             
         print("checkpointed!!")
         return param_name_to_pstage
+
+    def check_unused_parameters(self, dummy_inputs):
+        # set eval mode and clear grads
+        prev_training = self.module.training
+        self.module.eval()
+        for p in self.module.parameters():
+            p.grad = None
+        count = 0
+        for n in self.ordered_modules:
+            m = self.ordered_modules[n]
+            if isinstance(m,CutPoint):
+                m.set_pruning(True)
+                count += 1
+
+        # forward
+        self.set_recv_fn(lambda grads=False: torch.zeros(self.forward_input_shapes[0], dtype=torch.float32))     
+        try:
+            calc_val = self.module(**dummy_inputs)
+            ret_val = self.ret_val if self.ret_val is not None else calc_val
+        except Exception as e:
+            if self.ret_val is None:
+                raise e
+            ret_val = self.ret_val
+        
+        # backward
+        self.set_recv_fn(None)
+        if self.stage != self.num_stages - 1:
+            ret_val.backward(torch.ones(list(ret_val.size()), dtype=torch.float32))
+        else:
+            ret_val.backward()
+
+        self.ret_val = None
+        to_remove = []
+        for n,p in self.module.named_parameters():
+            if p.grad is None:
+                to_remove.append(n)
+                path = n.split(".")
+                parent = self.module
+                for i in range(len(path) - 1):
+                    parent = getattr(parent, path[i])
+                setattr(parent,path[-1], None)
+        
+        # reset grads and train mode
+        for p in self.module.parameters():
+            p.grad = None
+        if prev_training:
+            self.module.train()
+
+        count = 0
+        for m in self.ordered_modules:
+            m = self.ordered_modules[m]
+            if isinstance(m,CutPoint):
+                m.set_pruning(False)
+                count += 1
+        self.model_pruned = True
+
         
     def set_ret_val(self, val):
         self.ret_val = val

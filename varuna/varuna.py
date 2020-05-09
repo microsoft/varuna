@@ -37,7 +37,6 @@ class Varuna(Module):
                 stage_to_rank_map,
                 dummy_inputs,
                 batch_size,
-                optimizer,
                 chunk_size,
                 fp16 = False, 
                 local_rank=-1,
@@ -68,7 +67,7 @@ class Varuna(Module):
         torch.cuda.set_device(device)
         self.device = torch.device("cuda", device)
 
-        self.optimizer = optimizer
+        self.optimizer = None
         self.fp16 = fp16
         self.shared_weights = shared_weights
 
@@ -104,8 +103,6 @@ class Varuna(Module):
             "dp_process_group": self.process_group, 
             "make_logfile": False, #bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
             "last_chunk_size": self.last_chunk_size,
-            # "embedding_recv_rank": self.embedding_recv_rank,
-            # "embedding_send_rank": self.embedding_send_rank,
             "shared_weights": self.shared_weights,
             "shared_weight_stages": self.shared_weight_stages,
             "stage_to_rank_map": self.stage_to_rank_map
@@ -115,14 +112,6 @@ class Varuna(Module):
         self.step = 0
 
     def init_communication(self, rank_within_stage):
-        
-        # self.embedding_recv_rank = None
-        # self.embedding_send_rank = None
-        # if self.stage == 0:
-        #     self.embedding_recv_rank = self.stage_to_rank_map[self.partitions-1][rank_within_stage]
-        # if self.stage == self.partitions - 1:
-        #     self.embedding_send_rank = self.stage_to_rank_map[0][rank_within_stage]
-
         self.send_rank = None; self.receive_rank = None
 
         # send ranks
@@ -160,7 +149,10 @@ class Varuna(Module):
             self.model = torch.nn.parallel.DistributedDataParallel(self.model, process_group=process_groups[self.stage], device_ids=[self.device], find_unused_parameters=True)    
             self.process_group = process_groups[self.stage]
 
-    def forward(self, inputs):        
+    def forward(self, inputs):
+        if self.fp16:
+            assert self.optimizer is not None, "For fp16, you must set the optimizer using set_optimizer()"        
+        
         # Divide a mini-batch into micro-batches.
         batches = scatter(inputs, int(self.batch_size),self.micro_batch_size)
         
@@ -220,6 +212,9 @@ class Varuna(Module):
     
     def train(self):
         self.model.train()
+
+    def set_optimizer(self, optimizer):
+        self.optimizer = optimizer
 
     def zero_grad(self):
         self.model.zero_grad()
@@ -381,19 +376,19 @@ class Pipeline:
             if self.stage == send_stage:
                 recv_rank = self.stage_to_rank_map[recv_stage][rank_within_stage]
                 for n,p in baseModule.named_parameters():
-                    if n == w[0]:
+                    if n == w[1]:
                         send_weight = p
                         break
-                dist.send(p.cpu(), recv_rank)
+                dist.send(send_weight.cpu(), recv_rank)
             elif self.stage == recv_stage:
                 send_rank = self.stage_to_rank_map[send_stage][rank_within_stage]
                 for n,p in baseModule.named_parameters():
-                    if n == w[1]:
+                    if n == w[0]:
                         recv_weight = p
                         break
                 recv_weight = torch.zeros(list(recv_weight.size()),dtype=torch.float16 if self.fp16 else toch.float32)
                 dist.recv(recv_weight, send_rank)
-                attr_names = w[1].split(".")
+                attr_names = w[0].split(".")
                 param = baseModule
                 for a in attr_names:
                     param = getattr(param,a)
@@ -564,11 +559,6 @@ class Pipeline:
                 if self.fp16:
                     with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_microbatch=lastub) as scaled_loss:
                         scaled_loss.backward()
-                        # if lastub:
-                        #     for p in self.optimizer.state:
-                        #         assert p.grad is None,"why is the optimizer getting grads"
-
-                    # self.optimizer.backward(self.loss)
                 else:
                     self.loss.backward()
 
@@ -646,8 +636,8 @@ class Pipeline:
             overflow_buf,
             [allreduced_views, master_grads],
             1./scaler.loss_scale())
-        with open("grads-{}".format(dist.get_rank()),"a") as f:
-            f.write(str(master_grads[0]))
+        # with open("grads-{}".format(dist.get_rank()),"a") as f:
+        #     f.write(str(master_grads[0]))
 
 def scatter(input, batch_size, chunk_size):
     """
