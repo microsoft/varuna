@@ -88,7 +88,6 @@ class PartitionedModel(Module):
     def __init__(self, module, rank, local_rank, device, stage_to_rank_map, fp16, shared_weights=None):
         super(PartitionedModel, self).__init__()
         self.module = module
-        self.is_data_parallel = False
         self.num_stages = len(stage_to_rank_map)
         self.stage_to_rank_map = stage_to_rank_map
         self.rank = rank

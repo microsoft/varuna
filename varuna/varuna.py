@@ -113,7 +113,7 @@ class Varuna(Module):
             "device": self.device,
             "data_depth": len(self.stage_to_rank_map[self.stage]),
             "dp_process_group": self.process_group, 
-            "make_logfile": False, #bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
+            "make_logfile": bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
             "last_chunk_size": self.last_chunk_size,
             # "embedding_recv_rank": self.embedding_recv_rank,
             # "embedding_send_rank": self.embedding_send_rank,
@@ -383,6 +383,8 @@ class Pipeline:
         self.acts_send_thread = None
         self.grads_send_thread = None
 
+        self.back_start_times = Queue()
+
         # stores output of recompute(/forward) pass to be used by backward()
         self.loss = None
         self.average_loss = 0
@@ -574,6 +576,7 @@ class Pipeline:
                 recv_time = time.time() - recv_time_start
                 if self.make_logfile:   
                     self.logfile.write("{} {} {} {}\n".format("recvgrads", 0, recv_time_start, recv_time))
+                self.back_start_times.put(time.time())
                 return g
             else:
                 return acts
@@ -630,11 +633,12 @@ class Pipeline:
             if self.stage != self.partitions-1:
                 grads = torch.ones(self.loss.size(), dtype = torch.float32).to(self.device)
                 if self.fp16:
-                    task_time_start = time.time()
+                    # task_time_start = time.time()
                     with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_microbatch=lastub, last_partition=False) as scaled_loss:
                         scaled_loss.backward(grads)
                     if self.make_logfile:
                         torch.cuda.synchronize(self.device)
+                    task_time_start = self.back_start_times.get()
                     task_time = time.time() - task_time_start
                     if self.make_logfile:
                         self.logfile.write("{} {} {} {}\n".format(TASK[2], 0, str(task_time_start), str(task_time)))
@@ -682,15 +686,7 @@ class Pipeline:
 
             # For data parallel, sync only when doing last microbatch fwd/bwd
             # and for fp16, directly just all reduce optimizer master param grads
-            # task_time = time.time()
-            # if self.data_parallel and (task[1] < (len(self.batches) - 1) or  self.fp16):
-            #     with self.model.no_sync():
-            #         self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
-            # else:
-            #     self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
             self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
-            if self.make_logfile:
-                self.logfile.write("SYNC! ")
 
             # torch.cuda.synchronize(self.device)
             # task_time = time.time() - task_time
