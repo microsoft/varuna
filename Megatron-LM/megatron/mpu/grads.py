@@ -24,7 +24,7 @@ from torch._six import inf
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
 
-from .initialize import get_model_parallel_group
+from .initialize import get_model_parallel_group, model_parallel_is_initialized
 from .initialize import get_model_parallel_rank
 
 
@@ -32,16 +32,15 @@ def l2_grad_clipper(parameters, max_norm):
     """Efficient L2 norm gradient clipping."""
 
     overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
-    # Make sure we have an iterable.
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
     # Filter parameters with gradients.
     parameters_with_grads = list(filter(
         lambda p: p.grad is not None, parameters))
     # Filter parameters for norm calculations.
-    mp_rank_is_zero = (get_model_parallel_rank() == 0)
+    mp_rank_is_zero = (not model_parallel_is_initialized()) or (get_model_parallel_rank() == 0)
     parameters_for_norm = list(filter(
-        lambda p: p.model_parallel or mp_rank_is_zero, parameters_with_grads))
+        lambda p: mp_rank_is_zero or p.model_parallel, parameters_with_grads))
     # Calculate L2 norm.
     norm, _ = multi_tensor_applier(
         amp_C.multi_tensor_l2norm,
@@ -51,9 +50,10 @@ def l2_grad_clipper(parameters, max_norm):
     )
     # Sum across all model parallel GPUs.
     norm_2 = norm * norm
-    torch.distributed.all_reduce(norm_2,
-                                 op=torch.distributed.ReduceOp.SUM,
-                                 group=get_model_parallel_group())
+    if model_parallel_is_initialized():
+        torch.distributed.all_reduce(norm_2,
+                                    op=torch.distributed.ReduceOp.SUM,
+                                    group=get_model_parallel_group())
     total_norm = norm_2.item() ** 0.5
     # Scale to get max_norm.
     clip_coef = float(max_norm) / (total_norm + 1.0e-6)
@@ -89,13 +89,15 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
     parameters = list(filter(lambda p: p.grad is not None, parameters))
     max_norm = float(max_norm)
     norm_type = float(norm_type)
+    model_parallel_enabled = model_parallel_is_initialized()
     if norm_type == inf:
         total_norm = max(p.grad.data.abs().max() for p in parameters)
         total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
-        # Take max across all GPUs.
-        torch.distributed.all_reduce(total_norm_cuda,
-                                     op=torch.distributed.ReduceOp.MAX,
-                                     group=get_model_parallel_group())
+        if model_parallel_enabled:
+            # Take max across all GPUs.
+            torch.distributed.all_reduce(total_norm_cuda,
+                                        op=torch.distributed.ReduceOp.MAX,
+                                        group=get_model_parallel_group())
         total_norm = total_norm_cuda[0].item()
         clip_coef = max_norm / (total_norm + 1e-6)
         if clip_coef < 1:
@@ -107,14 +109,15 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
     else:
         total_norm = 0
         for p in parameters:
-            if p.model_parallel or (get_model_parallel_rank() == 0):
+            if not model_parallel_enabled or p.model_parallel or (get_model_parallel_rank() == 0):
                 param_norm = p.grad.data.norm(norm_type)
                 total_norm += param_norm.item() ** norm_type
         # Sum across all model parallel GPUs.
         total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
-        torch.distributed.all_reduce(total_norm_cuda,
-                                     op=torch.distributed.ReduceOp.SUM,
-                                     group=get_model_parallel_group())
+        if model_parallel_enabled:
+            torch.distributed.all_reduce(total_norm_cuda,
+                                        op=torch.distributed.ReduceOp.SUM,
+                                        group=get_model_parallel_group())
         total_norm = total_norm_cuda[0].item() ** (1. / norm_type)
         clip_coef = max_norm / (total_norm + 1e-6)
         if clip_coef < 1:
