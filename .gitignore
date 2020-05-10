@@ -12,7 +12,6 @@ ssh_out*
 parent_process
 args
 ssh_err*
-mpu/
 old_partitioned_model*
 varuna_for_finetuning*
 varuna
