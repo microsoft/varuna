@@ -67,7 +67,6 @@ class Varuna(Module):
                 stage_to_rank_map,
                 dummy_inputs,
                 batch_size,
-                optimizer,
                 chunk_size,
                 fp16 = False, 
                 local_rank=-1,
@@ -99,7 +98,7 @@ class Varuna(Module):
         torch.cuda.set_device(device)
         self.device = torch.device("cuda", device)
 
-        self.optimizer = optimizer
+        self.optimizer = None
         self.fp16 = fp16
         self.shared_weights = shared_weights
 
@@ -144,14 +143,6 @@ class Varuna(Module):
         self.step = 0
 
     def init_communication(self, rank_within_stage):
-        
-        # self.embedding_recv_rank = None
-        # self.embedding_send_rank = None
-        # if self.stage == 0:
-        #     self.embedding_recv_rank = self.stage_to_rank_map[self.partitions-1][rank_within_stage]
-        # if self.stage == self.partitions - 1:
-        #     self.embedding_send_rank = self.stage_to_rank_map[0][rank_within_stage]
-
         self.send_rank = None; self.receive_rank = None
 
         # send ranks
@@ -189,7 +180,10 @@ class Varuna(Module):
             self.model = torch.nn.parallel.DistributedDataParallel(self.model, process_group=process_groups[self.stage], device_ids=[self.device], find_unused_parameters=True)    
             self.process_group = process_groups[self.stage]
 
-    def forward(self, inputs):        
+    def forward(self, inputs):
+        if self.fp16:
+            assert self.optimizer is not None, "For fp16, you must set the optimizer using set_optimizer()"        
+        
         # Divide a mini-batch into micro-batches.
         batches = scatter(inputs, int(self.batch_size),self.micro_batch_size)
         
@@ -251,6 +245,9 @@ class Varuna(Module):
     
     def train(self):
         self.model.train()
+
+    def set_optimizer(self, optimizer):
+        self.optimizer = optimizer
 
     def zero_grad(self):
         self.model.zero_grad()
