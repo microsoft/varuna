@@ -184,9 +184,9 @@ class Varuna(Module):
         # and Varuna can take care of input dataloader explicitly
         self.config["make_logfile"] = bool(self.config["make_logfile"] and self.step < 10)
         pipeline = Pipeline(batches, self.model, self.config, self.schedule, self.optimizer)
-        loss = pipeline.run()
+        loss, overflow = pipeline.run()
         self.step += 1
-        return loss
+        return loss, overflow
 
     def evaluate(self, inputs):
         assert isinstance(inputs, dict), "input must be a dictionary!"
@@ -585,7 +585,7 @@ class Pipeline:
         # because there's no peek/front method for these queues
         return acts
 
-    def worker(self, task, grad_mode, inputs_as_dict, lastub):
+    def worker(self, task, grad_mode, inputs_as_dict):
         """ Main body of worker loop """
 
         if task == 0:       
@@ -634,7 +634,7 @@ class Pipeline:
                 grads = torch.ones(self.loss.size(), dtype = torch.float32).to(self.device)
                 if self.fp16:
                     # task_time_start = time.time()
-                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_microbatch=lastub, last_partition=False) as scaled_loss:
+                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=True, last_partition=False) as scaled_loss:
                         scaled_loss.backward(grads)
                     if self.make_logfile:
                         torch.cuda.synchronize(self.device)
@@ -652,7 +652,7 @@ class Pipeline:
 
                 if self.fp16:
                     task_time_start = time.time()
-                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_microbatch=lastub) as scaled_loss:
+                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=True) as scaled_loss:
                         scaled_loss.backward()
                         # if lastub:
                         #     for p in self.optimizer.state:
@@ -686,7 +686,7 @@ class Pipeline:
 
             # For data parallel, sync only when doing last microbatch fwd/bwd
             # and for fp16, directly just all reduce optimizer master param grads
-            self.worker(task[0], grad_mode, self.batches[task[1]],task[1]==len(self.batches)-1)
+            self.worker(task[0], grad_mode, self.batches[task[1]])
 
             # torch.cuda.synchronize(self.device)
             # task_time = time.time() - task_time
@@ -696,7 +696,7 @@ class Pipeline:
         
         if self.fp16 and self.data_parallel:
             sync_time = time.time()
-            self.all_reduce_opt_grads()
+            overflow = self.all_reduce_opt_grads()
             torch.cuda.synchronize(self.device)
             sync_time =  time.time() - sync_time
             if self.make_logfile:
@@ -717,7 +717,7 @@ class Pipeline:
             self.grads_send_thread.join()
 
         # return loss
-        return self.average_loss
+        return self.average_loss, overflow
 
     def all_reduce_opt_grads(self):
         # 1. allocate an uninitialized buffer for flattened gradient
@@ -754,6 +754,25 @@ class Pipeline:
             1./scaler.loss_scale())
         with open("grads-{}".format(dist.get_rank()),"a") as f:
             f.write(str(master_grads[0]))
+        # 5. update loss scale
+        scaler = _amp_state.loss_scalers[0]
+
+        # all-reduce to sync overflow
+        print(self.rank, ': before all_reduce: overflow_buf = ', overflow_buf)
+        # improve this - should only happen for corresponding dp ranks in each pipeline stream
+        torch.distributed.all_reduce(overflow_buf)
+        print(self.rank, ': after all_reduce: overflow_buf = ', overflow_buf)
+        if overflow_buf.item()==0:
+            overflow_buf = torch.cuda.IntTensor([0])
+        else:
+            overflow_buf = torch.cuda.IntTensor([1])
+        
+        old_overflow_buf = scaler._overflow_buf
+        scaler._overflow_buf = overflow_buf
+        had_overflow = scaler.update_scale()
+        scaler._overfloat_buf = old_overflow_buf
+
+        return had_overflow
 
 def scatter(input, batch_size, chunk_size):
     """

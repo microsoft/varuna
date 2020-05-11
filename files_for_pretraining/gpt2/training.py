@@ -396,7 +396,7 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
 
     # Forward model for one step.
     # timers('forward').start()
-    loss, loss_reduced = varuna_step(data_iterator, model)
+    loss, loss_reduced, overflow = varuna_step(data_iterator, model)
     # timers('forward').stop()
 
     if args.clip_grad > 0:
@@ -410,7 +410,8 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
     if args.local_rank==0:
         # print("setup_model() pre opt step: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
         print('setup_model() pre opt step:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
-    overflow = optimizer.step()
+    if overflow:
+        optimizer.step()
     if args.local_rank==0:
         # print("setup_model() post opt step: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
         print('setup_model() post opt step:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())        
