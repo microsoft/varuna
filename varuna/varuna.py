@@ -23,6 +23,36 @@ Module = nn.Module
 
 TASK = ["fwd", "rec", "bwd"]
 
+def share_weights(model):
+    baseModule = model.model.module if not model.data_parallel else model.model.module.module
+    rank_within_stage = model.stage_to_rank_map[model.stage].index(model.rank)
+    for i,w in enumerate(model.shared_weights):
+        recv_stage, send_stage = model.shared_weight_stages[i]
+        if recv_stage == send_stage:
+            continue
+        if model.stage == send_stage:
+            recv_rank = model.stage_to_rank_map[recv_stage][rank_within_stage]
+            for n,p in baseModule.named_parameters():
+                if n == w[1]:
+                    send_weight = p
+                    break
+            # print("sending", w[1])
+            dist.send(send_weight.cpu(), recv_rank)
+        elif model.stage == recv_stage:
+            send_rank = model.stage_to_rank_map[send_stage][rank_within_stage]
+            for n,p in baseModule.named_parameters():
+                if n == w[0]:
+                    recv_weight = p
+                    break
+            # print("receiving", w[0])
+            recv_weight = torch.zeros(list(recv_weight.size()),dtype=torch.float16 if model.fp16 else toch.float32)
+            dist.recv(recv_weight, send_rank)
+            attr_names = w[0].split(".")
+            param = baseModule
+            for a in attr_names:
+                param = getattr(param,a)
+            param.data.copy_(recv_weight.data)       
+
 class Varuna(Module):
     """
     model = nn.Sequential(a,b,c,d)
@@ -37,11 +67,11 @@ class Varuna(Module):
                 stage_to_rank_map,
                 dummy_inputs,
                 batch_size,
-                optimizer,
                 chunk_size,
                 fp16 = False, 
                 local_rank=-1,
-                device=-1):
+                device=-1,
+                shared_weights=None):
         super().__init__()
 
         self.partitions = len(stage_to_rank_map)
@@ -61,19 +91,25 @@ class Varuna(Module):
                 i += 1
         if self.stage == -1:
             raise ValueError("Rank " + str(self.rank) + " not found in stage to rank map!")
+        self.data_parallel = data_depth > 1
 
         if device == -1:
             device = self.local_rank
         torch.cuda.set_device(device)
         self.device = torch.device("cuda", device)
 
-        self.optimizer = optimizer
+        self.optimizer = None
         self.fp16 = fp16
+        self.shared_weights = shared_weights
 
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
-        self.model = PartitionedModel(model, self.rank, self.local_rank, device, self.stage_to_rank_map, self.fp16)
+        self.model = PartitionedModel(model, self.rank, self.local_rank, device, self.stage_to_rank_map, self.fp16, shared_weights)
         self.model.initialize( dummy_inputs, from_cache=False )
         self.partitioned_model = self.model
+        self.shared_weight_stages = self.model.shared_weight_stages if self.shared_weights is not None else None
+
+        print("SHARED WEIGHTS ARE")
+        print(self.shared_weight_stages)
 
         # assert(batch_size % data_depth == 0, "Batch size not divisible by data parallel depth!")
         self.batch_size = batch_size // data_depth
@@ -96,24 +132,17 @@ class Varuna(Module):
             "device": self.device,
             "data_depth": len(self.stage_to_rank_map[self.stage]),
             "dp_process_group": self.process_group, 
-            "make_logfile": bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
+            "make_logfile": False, #bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
             "last_chunk_size": self.last_chunk_size,
-            "embedding_recv_rank": self.embedding_recv_rank,
-            "embedding_send_rank": self.embedding_send_rank
+            "shared_weights": self.shared_weights,
+            "shared_weight_stages": self.shared_weight_stages,
+            "stage_to_rank_map": self.stage_to_rank_map
         }
 
         self.schedule = self.generate_schedule()
         self.step = 0
 
     def init_communication(self, rank_within_stage):
-        
-        self.embedding_recv_rank = None
-        self.embedding_send_rank = None
-        if self.stage == 0:
-            self.embedding_recv_rank = self.stage_to_rank_map[self.partitions-1][rank_within_stage]
-        if self.stage == self.partitions - 1:
-            self.embedding_send_rank = self.stage_to_rank_map[0][rank_within_stage]
-
         self.send_rank = None; self.receive_rank = None
 
         # send ranks
@@ -151,25 +180,74 @@ class Varuna(Module):
             self.model = torch.nn.parallel.DistributedDataParallel(self.model, process_group=process_groups[self.stage], device_ids=[self.device], find_unused_parameters=True)    
             self.process_group = process_groups[self.stage]
 
-    def forward(self, inputs):        
+    def forward(self, inputs):
+        if self.fp16:
+            assert self.optimizer is not None, "For fp16, you must set the optimizer using set_optimizer()"        
+        
         # Divide a mini-batch into micro-batches.
-        batches = scatter(inputs, self.micro_batch_size)
+        batches = scatter(inputs, int(self.batch_size),self.micro_batch_size)
         
         # need not pass the first argument if rank!=0
         # avoid dataloader compute in machines other than the first
         # ask the model writer to pass the input batch generating dataloader function to Varuna::__init__
         # and Varuna can take care of input dataloader explicitly
-        self.config["make_logfile"] = self.config["make_logfile"] and (self.step < 10)
+        self.config["make_logfile"] = bool(self.config["make_logfile"] and self.step < 10)
         pipeline = Pipeline(batches, self.model, self.config, self.schedule, self.optimizer)
         loss = pipeline.run()
         self.step += 1
         return loss
-    
+
+    def evaluate(self, inputs):
+        assert isinstance(inputs, dict), "input must be a dictionary!"
+
+        share_weights(self)
+
+        # self.partitioned_model.eval()
+        def send(x, grads=False):
+            # print("sending to rank", self.send_rank, x.size())
+            dist.send(x.cpu(), self.send_rank)
+        def recv(grads=False):
+            x_shape = self.fwd_inp_shape
+            x = torch.zeros(x_shape, dtype=torch.float16 if self.fp16 else torch.float32)
+            # print("receiving from rank", self.receive_rank, x_shape)
+            dist.recv(x, self.receive_rank)
+            return x.to(self.device)
+        self.partitioned_model.set_send_fn(send)
+        self.partitioned_model.set_recv_fn(recv)
+
+        batches = scatter(inputs, int(self.batch_size),self.micro_batch_size)
+        
+        with torch.no_grad():
+            avg_output = None
+            for mb in batches[:-1]:
+                output = self.partitioned_model(**mb)
+                avg_output = output if avg_output is None else avg_output + output
+            mb = batches[-1]
+            def recv(grads=False):
+                x_shape = list(self.fwd_inp_shape)
+                if self.last_chunk_size > 0:
+                    x_shape[0] = self.last_chunk_size
+                x = torch.zeros(x_shape, dtype=torch.float16 if self.fp16 else torch.float32)
+                # print("last receiving from rank", self.receive_rank, x_shape)
+                dist.recv(x, self.receive_rank)
+                return x.to(self.device)
+            self.partitioned_model.set_recv_fn(recv)
+            output = self.partitioned_model(**mb)
+            if self.stage == self.partitions - 1:
+                avg_output = output if avg_output is None else avg_output + output
+
+        if self.stage == self.partitions - 1:
+            avg_output /= len(batches)
+        return avg_output
+
     def eval(self):
         self.model.eval()
     
     def train(self):
         self.model.train()
+
+    def set_optimizer(self, optimizer):
+        self.optimizer = optimizer
 
     def zero_grad(self):
         self.model.zero_grad()
@@ -217,11 +295,10 @@ class Varuna(Module):
                 for i in pstages:
                     torch.save(pstage_state_dicts[i], os.path.join(cp_dir_name,"opt-fp32-params-" + str(i)))
             
-        torch.distributed.barrier()
         cp_time = time.time() - cp_time
         print("Opt ckpt time", cp_time)
 
-
+    
     def to(self, device):
         self.model.to(device)
     
@@ -272,36 +349,29 @@ class Pipeline:
         self.device = config["device"]
         self.schedule = schedule
         self.fp16 = config["fp16"]
+        self.rank = dist.get_rank()
 
         self.fwd_inp_shape = config["fwd_inp_shape"]
         self.bwd_grad_shape = config["bwd_grad_shape"]
 
+        self.shared_weights = config["shared_weights"]
+        self.shared_weight_stages = config["shared_weight_stages"]
+        self.stage_to_rank_map = config["stage_to_rank_map"]
 
         self.make_logfile = config["make_logfile"]
         if self.make_logfile:
             microBS = self.fwd_inp_shape[0] if self.bwd_grad_shape is None else self.bwd_grad_shape[0]
             logfilename = "varuna_logs-mBS" + str(microBS) + "-stage" + str(self.stage) + "of" + str(self.partitions)
             self.logfile = open(logfilename,"a")
-
-        baseModule = self.model.module if not self.data_parallel else self.model.module.module
-
-        if self.partitions > 1:
-            if self.stage == self.partitions - 1:
-                embed_comm_time = time.time()
-                dist.send(baseModule.cls.predictions.decoder.weight.cpu(), config["embedding_send_rank"])
-                embed_comm_time = time.time() - embed_comm_time
-                if self.make_logfile:
-                    self.logfile.write("embed comm " + str(embed_comm_time) + "\n")
-            elif self.stage == 0:
-                embed_comm_time = time.time()
-                decoder_weights = torch.FloatTensor(baseModule.bert.embeddings.word_embeddings.weight.size())
-                if self.fp16:
-                    decoder_weights = decoder_weights.half()
-                dist.recv(decoder_weights, config["embedding_recv_rank"])
-                baseModule.bert.embeddings.word_embeddings.weight = torch.nn.Parameter(decoder_weights.to(self.device))
-                embed_comm_time = time.time() - embed_comm_time
-                if self.make_logfile:
-                    self.logfile.write("embed comm " + str(embed_comm_time) + "\n")
+            self.logfile.write("start time {}\n".format(time.time()))
+        
+        if self.partitions > 1 and self.shared_weights is not None:
+            embed_time = time.time()
+            share_weights(self)
+            torch.cuda.synchronize(self.device)
+            embed_time = time.time() - embed_time
+            if self.make_logfile:
+                self.logfile.write("weight sharing {}\n".format(embed_time))       
 
 
         self.receive_rank = config["receive_rank"]
@@ -364,7 +434,7 @@ class Pipeline:
                 handle = dist.irecv(acts_tensor, src=self.receive_rank)
                 handle.wait()
                 self.acts_queue.put(acts_tensor.to(self.device))
-        del acts_tensor
+        # del acts_tensor
     
     def grads_receiver(self):
         chunks = len(self.batches)
@@ -379,7 +449,7 @@ class Pipeline:
                 handle = dist.irecv(grads_tensor, src=self.send_rank)
                 handle.wait()
                 self.grads_queue.put(grads_tensor.to(self.device))
-        del grads_tensor
+        # del grads_tensor
 
     def acts_sender(self):
         count = 0
@@ -494,11 +564,6 @@ class Pipeline:
                 if self.fp16:
                     with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=False, last_microbatch=lastub) as scaled_loss:
                         scaled_loss.backward()
-                        # if lastub:
-                        #     for p in self.optimizer.state:
-                        #         assert p.grad is None,"why is the optimizer getting grads"
-
-                    # self.optimizer.backward(self.loss)
                 else:
                     self.loss.backward()
 
@@ -526,13 +591,19 @@ class Pipeline:
                 if self.make_logfile:
                     self.logfile.write("SYNC! ")
 
+            torch.cuda.synchronize(self.device)
             task_time = time.time() - task_time
             
             if self.make_logfile:
                 self.logfile.write("{} {} {}\n".format(TASK[task[0]],task[1], str(task_time)))
         
         if self.fp16 and self.data_parallel:
+            sync_time = time.time()
             self.all_reduce_opt_grads()
+            torch.cuda.synchronize(self.device)
+            sync_time =  time.time() - sync_time
+            if self.make_logfile:
+                self.logfile.write("SYNC! all-reduce time {}".format(sync_time))
 
         if self.make_logfile:
             self.logfile.write("\n\nBATCH END\n\n")
@@ -570,17 +641,25 @@ class Pipeline:
             overflow_buf,
             [allreduced_views, master_grads],
             1./scaler.loss_scale())
+        # with open("grads-{}".format(dist.get_rank()),"a") as f:
+        #     f.write(str(master_grads[0]))
 
-def scatter(input, chunk_size):
+def scatter(input, batch_size, chunk_size):
     """
     Accepts input dictionary and splits into microbatches
     """
-    # assert(isinstance(inputs,dict) , "varuna inputs must be given as a dictionary")
+    assert isinstance(input,dict) , "varuna inputs must be given as a dictionary" 
     
     microbatches = []
+    num_microbatches = math.ceil(batch_size / chunk_size)
     for k,v in input.items():
         # TODO: what will happen for indivisibilities in uneven data parallelism !!
-        chunked_values = v.split(chunk_size)
+        # print(dist.get_rank(),k,v.size())
+        # special case for GPT-2 attention mask
+        if v.size(0) == 1:
+            chunked_values = [v for _ in range(num_microbatches)]
+        else:
+            chunked_values = v.split(chunk_size)
         for i,value in enumerate(chunked_values):
             if len(microbatches) <= i:
                 microbatches.append(dict())

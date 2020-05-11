@@ -183,18 +183,12 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
     with open("/home/varuna/local_ckpt_tracker.txt","w") as f:
         f.write(str(iteration))
 
+def parse_last_ckpt_iteration():
 
-def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
-    """Load a model checkpoint and return the iteration."""
     args = get_args()
+    if args.load_iteration != -1:
+        return args.load_iteration, False
 
-    if args.varuna:
-        assert parameter_names is not None, "parameter_names not given while loading checkpoint!"
-
-    if isinstance(model, torchDDP):
-        model = model.module
-
-    if args.load_iteration == -1:
         # Read the tracker file and set the iteration.
         tracker_filename = get_checkpoint_tracker_filename(args.load)
 
@@ -204,7 +198,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
                 tracker_filename))
             print_rank_0('    will not load any checkpoints and will start from '
                         'random')
-            return 0
+            return 0, False
 
         # Otherwise, read the tracker file and either set the iteration or
         # mark it as a release checkpoint.
@@ -224,10 +218,24 @@ def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
         assert iteration > 0 or release, 'error parsing metadata file {}'.format(
             tracker_filename)
 
-    else:
-        iteration = args.load_iteration
-        release = False
+    return iteration, release
 
+
+def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
+    """Load a model checkpoint and return the iteration."""
+    args = get_args()
+
+    if args.varuna:
+        assert parameter_names is not None, "parameter_names not given while loading checkpoint!"
+
+    if isinstance(model, torchDDP):
+        model = model.module
+
+    iteration, release = parse_last_ckpt_iteration()
+
+    if iteration == 0:
+        return 0
+        
     # Checkpoint.
     checkpoint_name = get_checkpoint_name(args.load, iteration, release)
     if (not mpu.model_parallel_is_initialized()) or mpu.get_data_parallel_rank() == 0:
