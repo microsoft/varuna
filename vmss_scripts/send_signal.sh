@@ -1,20 +1,9 @@
-machines=( $(az vmss nic list --vmss-name $1 --subscription a947bb9f-f570-40a9-82cc-2fdd09f1553a --resource-group Varuna --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
+machines=($(az vmss nic list --vmss-name megatron --subscription a947bb9f-f570-40a9-82cc-2fdd09f1553a --resource-group Varuna --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
 
-
-if [ $# != 1 ]
-then
-    echo "need four arguments!!"
-    exit
-fi
-
-# trigger signal on existing workers
-orig_nservers=$2 # get this from - `cat nservers` in manager
-
+echo "triggering stop signal"
 i=0
-while [ $i != $orig_nservers ]
+while [ $i -lt ${#machines[@]} ]
 do
-    ssh -i ~/.ssh/id_rsa_gandiva "${machines[i]}" "cd /home/varuna/DeepLearningExamples/PyTorch/LanguageModeling/BERT; kill -10 \$(cat parent_process)"
+    ssh -i ~/.ssh/vdummy.pem "varuna@${machines[i]}" "cd t-nisar/Megatron-LM; echo 0 >nservers; kill -10 \$(cat parent_process)"
     i=$(($i+1))
 done
-
-args=`cat args`
