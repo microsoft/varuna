@@ -28,7 +28,7 @@ from torch.nn.parameter import Parameter
 from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
 
 from .initialize import get_model_parallel_rank
-from .initialize import get_model_parallel_world_size
+from .initialize import get_model_parallel_world_size, model_parallel_is_initialized
 from .mappings import copy_to_model_parallel_region
 from .mappings import gather_from_model_parallel_region
 from .mappings import reduce_from_model_parallel_region
@@ -52,7 +52,7 @@ def _initialize_affine_weight(weight, output_size, input_size,
     weight.stride = stride
 
     # If we only use 1 process for model parallelism, bypass scatter.
-    world_size = get_model_parallel_world_size()
+    world_size = get_model_parallel_world_size() if model_parallel_is_initialized() else 1
     if world_size == 1:
         init_method(weight)
         if return_master_weight:
@@ -69,7 +69,7 @@ def _initialize_affine_weight(weight, output_size, input_size,
     per_partition_per_stride_size = divide(per_partition_size, stride)
     weight_list = torch.split(master_weight, per_partition_per_stride_size,
                               dim=partition_dim)
-    rank = get_model_parallel_rank()
+    rank = get_model_parallel_rank() if model_parallel_is_initialized() else 0
     my_weight_list = weight_list[rank::world_size]
 
     with torch.no_grad():
@@ -104,10 +104,15 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.sparse = False
         self._weight = None
         # Divide the weight matrix along the vocaburaly dimension.
+        self.mp_rank = 0
+        self.mp_world_size = 1
+        if model_parallel_is_initialized():
+            self.mp_rank = get_model_parallel_rank()
+            self.mp_world_size = get_model_parallel_world_size()
         self.vocab_start_index, self.vocab_end_index = \
             VocabUtility.vocab_range_from_global_vocab_size(
-                self.num_embeddings, get_model_parallel_rank(),
-                get_model_parallel_world_size())
+                self.num_embeddings, self.mp_rank,
+                self.mp_world_size)
         self.num_embeddings_per_partition = self.vocab_end_index - \
             self.vocab_start_index
 
@@ -134,7 +139,11 @@ class VocabParallelEmbedding(torch.nn.Module):
         # Mask the output embedding.
         output_parallel[input_mask, :] = 0.0
         # Reduce across all the model parallel GPUs.
-        output = reduce_from_model_parallel_region(output_parallel)
+        if self.mp_world_size > 1:
+            output = reduce_from_model_parallel_region(output_parallel)
+        else:
+            output = output_parallel
+
         return output
 
 
@@ -164,9 +173,9 @@ class ParallelEmbedding(torch.nn.Module):
         self.sparse = False
         self._weight = None
         # Divide the weight matrix along the embedding dimension.
-        world_size = get_model_parallel_world_size()
+        self.mp_world_size = get_model_parallel_world_size() if model_parallel_is_initialized() else 1
         self.embedding_dim_per_partition = divide(self.embedding_dim,
-                                                  world_size)
+                                                  self.mp_world_size)
 
         # Allocate weights.
         self.weight = Parameter(torch.Tensor(self.num_embeddings,
@@ -178,12 +187,15 @@ class ParallelEmbedding(torch.nn.Module):
             stride=1, return_master_weight=False)
 
     def forward(self, input_):
-        input_parallel = copy_to_model_parallel_region(input_)
+        input_parallel = copy_to_model_parallel_region(input_) if self.mp_world_size >1 else input_
         output_parallel = F.embedding(input_parallel, self.weight,
                                       self.padding_idx, self.max_norm,
                                       self.norm_type, self.scale_grad_by_freq,
                                       self.sparse)
-        output = gather_from_model_parallel_region(output_parallel)
+        if self.mp_world_size > 1:
+            output = gather_from_model_parallel_region(output_parallel)
+        else:
+            output = output_parallel
         return output
 
 
@@ -218,8 +230,8 @@ class ColumnParallelLinear(torch.nn.Module):
         self.output_size = output_size
         self.gather_output = gather_output
         # Divide the weight matrix along the last dimension.
-        world_size = get_model_parallel_world_size()
-        self.output_size_per_partition = divide(output_size, world_size)
+        self.mp_world_size = get_model_parallel_world_size() if model_parallel_is_initialized() else 1
+        self.output_size_per_partition = divide(output_size, self.mp_world_size)
 
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
@@ -245,10 +257,10 @@ class ColumnParallelLinear(torch.nn.Module):
 
     def forward(self, input_):
         # Set up backprop all-reduce.
-        input_parallel = copy_to_model_parallel_region(input_)
+        input_parallel = copy_to_model_parallel_region(input_) if self.mp_world_size > 1 else input_
         # Matrix multiply.
         output_parallel = F.linear(input_parallel, self.weight, self.bias)
-        if self.gather_output:
+        if self.mp_world_size > 1 and self.gather_output:
             # All-gather across the partitions.
             output = gather_from_model_parallel_region(output_parallel)
         else:
@@ -294,8 +306,8 @@ class RowParallelLinear(torch.nn.Module):
         self.output_size = output_size
         self.input_is_parallel = input_is_parallel
         # Divide the weight matrix along the last dimension.
-        world_size = get_model_parallel_world_size()
-        self.input_size_per_partition = divide(input_size, world_size)
+        self.mp_world_size = get_model_parallel_world_size() if model_parallel_is_initialized() else 1
+        self.input_size_per_partition = divide(input_size, self.mp_world_size)
 
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
@@ -318,14 +330,16 @@ class RowParallelLinear(torch.nn.Module):
 
     def forward(self, input_):
         # Set up backprop all-reduce.
-        if self.input_is_parallel:
+        if self.input_is_parallel or self.mp_world_size == 1:
             input_parallel = input_
         else:
             input_parallel = scatter_to_model_parallel_region(input_)
         # Matrix multiply.
         output_parallel = F.linear(input_parallel, self.weight)
+        
         # All-reduce across all the partitions.
-        output_ = reduce_from_model_parallel_region(output_parallel)
+        output_ = reduce_from_model_parallel_region(output_parallel) if self.mp_world_size > 1 else output_parallel
+
         if self.bias is not None:
             output = output_ + self.bias
         else:

@@ -31,7 +31,7 @@ from megatron.fp16 import FP16_Optimizer
 def reduce_losses(losses):
     """Reduce a tensor of losses across all GPUs."""
     reduced_losses = torch.cat(
-        [loss.clone().detach().view(1) for loss in losses])
+        [loss.clone().detach().view(1) if isinstance(loss, torch.Tensor) else torch.Tensor([loss]) for loss in losses])
     torch.distributed.all_reduce(reduced_losses)
     reduced_losses = reduced_losses / torch.distributed.get_world_size()
 
@@ -96,8 +96,15 @@ def make_data_loader(dataset):
     args = get_args()
 
     # Data parallel arguments.
-    world_size = mpu.get_data_parallel_world_size()
-    rank = mpu.get_data_parallel_rank()
+    if args.varuna:
+        world_size = args.data_depth
+        rank = args.stage_to_rank_map[args.stage].index(args.rank)
+    elif mpu.model_parallel_is_initialized():
+        world_size = mpu.get_data_parallel_world_size()
+        rank = mpu.get_data_parallel_rank()
+    else:
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
     global_batch_size = args.batch_size * world_size
     num_workers = args.num_workers
 

@@ -36,6 +36,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_validation_args(parser)
     parser = _add_data_args(parser)
     parser = _add_autoresume_args(parser)
+    parser = _add_varuna_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -59,16 +60,34 @@ def parse_args(extra_args_provider=None, defaults={},
     # Check required arguments.
     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
                      'max_position_embeddings']
+    if args.varuna:
+        required_args += ['stage_to_rank_map', 'partitions', 'chunk_size']
     for req_arg in required_args: 
         _check_arg_is_not_none(args, req_arg)
 
     # Distributed args.
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
-    args.model_parallel_size = min(args.model_parallel_size, args.world_size)
+    args.model_parallel_size = 1
     if args.rank == 0:
         print('using world size: {} and model-parallel size: {} '.format(
             args.world_size, args.model_parallel_size))
+
+    if args.varuna:
+        # parse stage_to_rank_map
+        assert len(args.stage_to_rank_map) > 0, "Need a valid stage to rank map for Varuna!"
+        stage_to_rank_map = args.stage_to_rank_map
+        stage_ranks = stage_to_rank_map.split(";", args.partitions)
+        args.stage = -1
+        stage_to_rank_map = {}
+        for i in range(args.partitions):
+            ranks = stage_ranks[i].split(",")
+            stage_to_rank_map[i] = [int(r) for r in ranks]
+            if args.rank in stage_to_rank_map[i]:
+                args.stage = i
+        args.data_depth = len(ranks)
+        args.stage_to_rank_map = stage_to_rank_map
+        assert args.stage != -1, "Invalid stage to rank map!"
 
     # Fp16 loss scaling.
     args.dynamic_loss_scale = False
@@ -134,6 +153,21 @@ def _add_network_size_args(parser):
     return parser
 
 
+def _add_varuna_args(parser):
+    group = parser.add_argument_group(title='varuna')
+
+    group.add_argument("--varuna", action='store_true', default=False,
+                        help = "Enable varuna pipeline training")
+    group.add_argument("--loss-file",type=str, default="gpt2-loss",
+                        help = "Prefix of file to log loss curve")
+    group.add_argument("--stage_to_rank_map", type=str, default=None,
+                        help = "stage to rank map of Varuna model")
+    group.add_argument("--partitions", type=int, default=None,
+                        help = "number of pipeline stages/partitions")
+    group.add_argument("--chunk_size", type=int,default=None,
+                        help = "number of microbatches for pipeline")
+    return parser
+
 def _add_regularization_args(parser):
     group = parser.add_argument_group(title='regularization')
 
@@ -161,9 +195,13 @@ def _add_training_args(parser):
                        'with larger models, sequences, and batch sizes.')
     group.add_argument('--checkpoint-num-layers', type=int, default=1,
                        help='chunk size (number of layers) for checkpointing.')
+    group.add_argument('--gradient-accumulation-steps',type=int, default=1,
+                        help="number of steps to accumulate gradients over")
     group.add_argument('--train-iters', type=int, default=None,
                        help='Total number of iterations to train over all '
                        'training runs.')
+    group.add_argument('--use-adam', action='store_true', default=False,
+                        help="Whether to use Adam instead of default LAMB")
     group.add_argument('--log-interval', type=int, default=100,
                        help='Report loss and timing interval.')
     group.add_argument('--exit-interval', type=int, default=None,
@@ -229,6 +267,9 @@ def _add_checkpointing_args(parser):
                        help='Output directory to save checkpoints to.')
     group.add_argument('--save-interval', type=int, default=None,
                        help='Number of iterations between checkpoint saves.')
+    group.add_argument('--max-num-ckpts', type=int, default=None,
+                        help="Cap on number of checkpoints stored, removes older checkpoints accordingly")
+    group.add_argument('--min-ckpt-iter-to-remove', type=int, default=0)
     group.add_argument('--no-save-optim', action='store_true',
                        help='Do not save current optimizer.')
     group.add_argument('--no-save-rng', action='store_true',
@@ -243,6 +284,7 @@ def _add_checkpointing_args(parser):
                        help='Load model for finetuning. Do not load optimizer '
                        'or rng state from checkpoint and set iteration to 0. '
                        'Assumed when loading a release checkpoint.')
+    group.add_argument('--load-iteration', type=int, default=-1)
 
     return parser
 
@@ -282,12 +324,14 @@ def _add_distributed_args(parser):
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
-    group.add_argument('--DDP-impl', default='local',
-                       choices=['local', 'torch'],
+    group.add_argument('--DDP-impl', default='none',
+                       choices=['local', 'torch','none'],
                        help='which DistributedDataParallel implementation '
                        'to use.')
     group.add_argument('--local_rank', type=int, default=None,
                        help='local rank passed from distributed launcher.')
+    group.add_argument('--rank', type=int, default=None,
+                       help='Global rank passed from distributed launcher.')
 
     return parser
 

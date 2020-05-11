@@ -203,10 +203,13 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
     # This should be a barrier but nccl barrier assumes
     # device_index=rank which is not the case for model
     # parallel case
-    counts = torch.cuda.LongTensor([1])
-    torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
-    assert counts[0].item() == torch.distributed.get_world_size(
-        group=mpu.get_data_parallel_group())
+    if mpu.model_parallel_is_initialized():
+        counts = torch.cuda.LongTensor([1])
+        torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
+        assert counts[0].item() == torch.distributed.get_world_size(
+            group=mpu.get_data_parallel_group())
+    else:
+        torch.distributed.barrier()
 
     # Load mappings.
     start_time = time.time()

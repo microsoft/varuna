@@ -30,14 +30,15 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
                        bias=None):
     """LM logits using word embedding weights."""
     # Parallel logits.
-    input_parallel = mpu.copy_to_model_parallel_region(input_)
+    model_parllel = mpu.model_parallel_is_initialized()
+    input_parallel = mpu.copy_to_model_parallel_region(input_) if model_parllel else input_
     # Matrix multiply.
     if bias is None:
         logits_parallel = F.linear(input_parallel, word_embeddings_weight)
     else:
         logits_parallel = F.linear(input_parallel, word_embeddings_weight, bias)
     # Gather if needed.
-    if parallel_output:
+    if parallel_output or not model_parllel:
         return logits_parallel
 
     return mpu.gather_from_model_parallel_region(logits_parallel)
@@ -164,6 +165,9 @@ class Embedding(MegatronModule):
         self.init_method(self.tokentype_embeddings.weight)
 
     def forward(self, input_ids, position_ids, tokentype_ids=None):
+
+        # with open("amp-varuna-input-{}".format(torch.distributed.get_rank()),"a") as f:
+        #     f.write(str(input_ids) + "\n")
         # Embeddings.
         words_embeddings = self.word_embeddings(input_ids)
         position_embeddings = self.position_embeddings(position_ids)
@@ -173,6 +177,10 @@ class Embedding(MegatronModule):
             embeddings = embeddings + self.tokentype_embeddings(tokentype_ids)
         else:
             assert self.tokentype_embeddings is None
+
+        # with open("amp-varuna-embed-{}".format(torch.distributed.get_rank()),"a") as f:
+        #     f.write(str(self.word_embeddings.weight) + "\n")
+        #     f.write(str(words_embeddings) + "\n")
 
         # Dropout.
         embeddings = self.embedding_dropout(embeddings)

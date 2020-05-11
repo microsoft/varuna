@@ -19,6 +19,7 @@ import os
 import random
 import sys
 import numpy as np
+import shutil
 
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
@@ -27,6 +28,9 @@ from megatron import mpu
 from megatron import get_args
 from megatron import print_rank_0
 
+from varuna import load_varuna_checkpoint, load_varuna_optimizer
+
+from apex import amp
 
 def check_checkpoint_args(checkpoint_args):
     """Ensure fixed arguments for a model are the same for the input
@@ -65,10 +69,10 @@ def get_checkpoint_name(checkpoints_path, iteration,
         directory = 'release'
     else:
         directory = 'iter_{:07d}'.format(iteration)
+    if mp_rank is None:
+        mp_rank = mpu.get_model_parallel_rank() if mpu.model_parallel_is_initialized() else 0
     return os.path.join(checkpoints_path, directory,
-                        'mp_rank_{:02d}'.format(
-                            mpu.get_model_parallel_rank() if mp_rank is None
-                            else mp_rank),
+                        'mp_rank_{:02d}'.format(mp_rank),
                         'model_optim_rng.pt')
 
 
@@ -78,25 +82,47 @@ def get_checkpoint_tracker_filename(checkpoints_path):
     return os.path.join(checkpoints_path, 'latest_checkpointed_iteration.txt')
 
 
-def save_checkpoint(iteration, model, optimizer, lr_scheduler):
+def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=None):
     """Save a model checkpoint."""
     args = get_args()
 
     # Only rank zero of the data parallel writes to the disk.
-    if isinstance(model, torchDDP):
+    if not args.varuna and isinstance(model, torchDDP):
         model = model.module
-    if mpu.get_data_parallel_rank() == 0:
+
+    if args.varuna:
+        data_parallel_rank = args.stage_to_rank_map[args.stage].index(args.rank)
+    elif mpu.model_parallel_is_initialized():
+        data_parallel_rank = mpu.get_data_parallel_rank()
+    else:
+        data_parallel_rank = torch.distributed.get_rank()
+    
+    if data_parallel_rank == 0:
+
+        checkpoint_name = get_checkpoint_name(args.save, iteration)
+        model_cp_dir = os.path.join(args.save, "model_ckpt_{}".format(iteration))
+        opt_cp_dir = os.path.join(args.save, "opt_ckpt_{}".format(iteration))
+        if args.rank == 0:
+            ensure_directory_exists(checkpoint_name)
+            if not os.path.exists(model_cp_dir):
+                os.makedirs(model_cp_dir)
+            if not os.path.exists(opt_cp_dir):
+                os.makedirs(opt_cp_dir)
 
         # Arguments, iteration, and model.
         state_dict = {}
         state_dict['args'] = args
         state_dict['iteration'] = iteration
-        state_dict['model'] = model.state_dict_for_save_checkpoint()
+        if not args.varuna:
+            state_dict['model'] = model.state_dict_for_save_checkpoint()
 
         # Optimizer stuff.
         if not args.no_save_optim:
             if optimizer is not None:
-                state_dict['optimizer'] = optimizer.state_dict()
+                opt_state = optimizer.state_dict()
+                if args.varuna:
+                    opt_state["state"] = {}
+                state_dict['optimizer'] = opt_state
             if lr_scheduler is not None:
                 state_dict['lr_scheduler'] = lr_scheduler.state_dict()
 
@@ -109,12 +135,39 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
             state_dict['rng_tracker_states'] \
                 = mpu.get_cuda_rng_tracker().get_states()
 
-        # Save.
-        checkpoint_name = get_checkpoint_name(args.save, iteration)
-        print('global rank {} is saving checkpoint at iteration {:7d} to {}'.
-              format(torch.distributed.get_rank(), iteration, checkpoint_name))
-        ensure_directory_exists(checkpoint_name)
-        torch.save(state_dict, checkpoint_name)
+        if args.fp16:
+            state_dict['amp'] = amp.state_dict()
+
+        if args.rank == 0:
+            # Save.
+            print('global rank {} is saving checkpoint at iteration {:7d} to {}'.
+                format(torch.distributed.get_rank(), iteration, checkpoint_name))
+            torch.save(state_dict, checkpoint_name)
+
+        if args.varuna:
+            assert parameter_names is not None, "No parameter names given!"
+            while not (os.path.exists(model_cp_dir) and os.path.exists(opt_cp_dir)):
+                pass
+            param_name_to_pstage = model.checkpoint(model_cp_dir)
+            param_name_to_pstage["lm_head_weight"] = args.num_layers - 1
+            model.checkpoint_optimizer(optimizer, parameter_names, param_name_to_pstage, opt_cp_dir)
+            
+        # remove old checkpoints
+        if args.max_num_ckpts is not None and torch.distributed.get_rank() == 0:
+            all_ckpted_iters = sorted([int(f.split("_")[-1]) for f in os.listdir(args.save) if f.startswith("model_ckpt")])
+            # assert all_ckpted_iters[-1] == iteration, "The latest checkpoint is corrupted?"
+            if len(all_ckpted_iters) > args.max_num_ckpts:
+                to_remove = all_ckpted_iters[:-args.max_num_ckpts]
+                print("removing older checkpoints at: ", to_remove)
+                for it in to_remove:
+                    if it <= args.min_ckpt_iter_to_remove:
+                        continue
+                    try:
+                        shutil.rmtree(os.path.join(args.save,"model_ckpt_{}".format(it)))
+                        shutil.rmtree(os.path.join(args.save, "opt_ckpt_{}".format(it)))
+                        shutil.rmtree(os.path.join(args.save,'iter_{:07d}'.format(it)))
+                    except Exception as e:
+                        print("Error while removing checkpoint {}: {}".format(it,str(e)))
         print('  successfully saved {}'.format(checkpoint_name))
 
     # Wait so everyone is done (necessary)
@@ -127,45 +180,57 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
     # Wait so everyone is done (not necessary)
     torch.distributed.barrier()
 
+    with open("/home/varuna/local_ckpt_tracker.txt","w") as f:
+        f.write(str(iteration))
 
-def load_checkpoint(model, optimizer, lr_scheduler):
+
+def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
     """Load a model checkpoint and return the iteration."""
     args = get_args()
 
+    if args.varuna:
+        assert parameter_names is not None, "parameter_names not given while loading checkpoint!"
+
     if isinstance(model, torchDDP):
         model = model.module
-    # Read the tracker file and set the iteration.
-    tracker_filename = get_checkpoint_tracker_filename(args.load)
 
-    # If no tracker file, return iretation zero.
-    if not os.path.isfile(tracker_filename):
-        print_rank_0('WARNING: could not find the metadata file {} '.format(
-            tracker_filename))
-        print_rank_0('    will not load any checkpoints and will start from '
-                     'random')
-        return 0
+    if args.load_iteration == -1:
+        # Read the tracker file and set the iteration.
+        tracker_filename = get_checkpoint_tracker_filename(args.load)
 
-    # Otherwise, read the tracker file and either set the iteration or
-    # mark it as a release checkpoint.
-    iteration = 0
-    release = False
-    with open(tracker_filename, 'r') as f:
-        metastring = f.read().strip()
-        try:
-            iteration = int(metastring)
-        except ValueError:
-            release = metastring == 'release'
-            if not release:
-                print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
-                    tracker_filename))
-                sys.exit()
+        # If no tracker file, return iretation zero.
+        if not os.path.isfile(tracker_filename):
+            print_rank_0('WARNING: could not find the metadata file {} '.format(
+                tracker_filename))
+            print_rank_0('    will not load any checkpoints and will start from '
+                        'random')
+            return 0
 
-    assert iteration > 0 or release, 'error parsing metadata file {}'.format(
-        tracker_filename)
+        # Otherwise, read the tracker file and either set the iteration or
+        # mark it as a release checkpoint.
+        iteration = 0
+        release = False
+        with open(tracker_filename, 'r') as f:
+            metastring = f.read().strip()
+            try:
+                iteration = int(metastring)
+            except ValueError:
+                release = metastring == 'release'
+                if not release:
+                    print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
+                        tracker_filename))
+                    sys.exit()
+
+        assert iteration > 0 or release, 'error parsing metadata file {}'.format(
+            tracker_filename)
+
+    else:
+        iteration = args.load_iteration
+        release = False
 
     # Checkpoint.
     checkpoint_name = get_checkpoint_name(args.load, iteration, release)
-    if mpu.get_data_parallel_rank() == 0:
+    if (not mpu.model_parallel_is_initialized()) or mpu.get_data_parallel_rank() == 0:
         print('global rank {} is loading checkpoint {}'.format(
             torch.distributed.get_rank(), checkpoint_name))
 
@@ -206,13 +271,33 @@ def load_checkpoint(model, optimizer, lr_scheduler):
         print_rank_0('could not find arguments in the checkpoint ...')
 
     # Model.
-    model.load_state_dict(state_dict['model'])
+    if args.varuna:
+        model_cp_dir = os.path.join(args.load, "model_ckpt_{}".format(iteration))
+        print("loading varuna ckpt", iteration)
+        model_state_dict = load_varuna_checkpoint(args.stage, args.partitions, args.num_layers, model_cp_dir)
+        model.load_state_dict(model_state_dict, strict = False)
+    else:
+        model.load_state_dict(state_dict['model'])
 
     # Optimizer.
     if not release and not args.finetune and not args.no_load_optim:
         try:
             if optimizer is not None:
-                optimizer.load_state_dict(state_dict['optimizer'])
+                opt_dict = state_dict['optimizer']
+                if args.varuna:
+                    for i,g in enumerate(opt_dict['param_groups']):
+                        for k,v in g.items():
+                            if k != 'params':
+                                optimizer.param_groups[i][k] = v
+                    opt_cp_dir = os.path.join(args.load, "opt_ckpt_{}".format(iteration))
+                    load_varuna_optimizer(optimizer, args.stage, args.partitions, args.num_layers, parameter_names, opt_cp_dir, args.fp16)
+                    device = args.local_rank
+                    for state in optimizer.state.values():
+                        for k, v in state.items():
+                            if isinstance(v, torch.Tensor):
+                                state[k] = v.to(device)
+                else:
+                    optimizer.load_state_dict(opt_dict)
             if lr_scheduler is not None:
                 lr_scheduler.load_state_dict(state_dict['lr_scheduler'])
         except KeyError:
@@ -222,6 +307,8 @@ def load_checkpoint(model, optimizer, lr_scheduler):
                          'exiting ...'.format(checkpoint_name))
             sys.exit()
 
+    if args.fp16:
+        amp.load_state_dict(state_dict['amp'])
     # rng states.
     if not release and not args.finetune and not args.no_load_rng:
         try:
@@ -239,7 +326,6 @@ def load_checkpoint(model, optimizer, lr_scheduler):
             sys.exit()
 
     torch.distributed.barrier()
-    if mpu.get_data_parallel_rank() == 0:
-        print('  successfully loaded {}'.format(checkpoint_name))
+    print('  successfully loaded {}'.format(checkpoint_name))
 
     return iteration

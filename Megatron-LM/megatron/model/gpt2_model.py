@@ -19,6 +19,7 @@ import torch
 
 from megatron import get_args
 from megatron.module import MegatronModule
+from megatron import mpu
 
 from .language_model import parallel_lm_logits
 from .language_model import get_language_model
@@ -48,7 +49,10 @@ class GPT2Model(MegatronModule):
             scaled_init_method=scaled_init_method_normal(args.init_method_std,
                                                          args.num_layers))
 
-    def forward(self, input_ids, position_ids, attention_mask,
+        self.lm_head_weight = torch.nn.Parameter(self.language_model.embedding.word_embeddings.weight)
+
+
+    def forward(self, input_ids, position_ids, attention_mask, loss_mask, labels,
                 tokentype_ids=None, layer_past=None, get_key_value=False,
                 forward_method_parallel_output=None):
 
@@ -69,11 +73,17 @@ class GPT2Model(MegatronModule):
             parallel_output = forward_method_parallel_output
         output = parallel_lm_logits(
             lm_output,
-            self.language_model.embedding.word_embeddings.weight,
+            self.lm_head_weight,
             parallel_output)
 
+        losses = mpu.vocab_parallel_cross_entropy(output.contiguous().float(),
+                                              labels)
+        loss_mask = loss_mask.view(-1)
+        loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+        output = loss
+
         if get_key_value:
-            output = [output, presents]
+            output = [loss, presents]
 
         return output
 

@@ -24,6 +24,7 @@ from megatron import get_args
 from megatron import mpu
 from megatron.module import MegatronModule
 
+from varuna import CutPoint
 
 """ We use the following notation throughout this file:
      h: hidden size
@@ -112,7 +113,7 @@ class ParallelSelfAttention(MegatronModule):
         self.layer_number = max(1, layer_number)
 
         # Per attention head and per partition values.
-        world_size = mpu.get_model_parallel_world_size()
+        world_size = mpu.get_model_parallel_world_size() if mpu.model_parallel_is_initialized() else 1
         self.hidden_size_per_partition = mpu.divide(args.hidden_size,
                                                     world_size)
         self.hidden_size_per_attention_head = mpu.divide(
@@ -189,9 +190,12 @@ class ParallelSelfAttention(MegatronModule):
         attention_probs = torch.nn.Softmax(dim=-1)(attention_scores)
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
-        with mpu.get_cuda_rng_tracker().fork():
+        if mpu.model_parallel_is_initialized():
+            with mpu.get_cuda_rng_tracker().fork():
+                attention_probs = self.attention_dropout(attention_probs)
+        else:
             attention_probs = self.attention_dropout(attention_probs)
-
+            
         return attention_probs
 
     def _get_attended_context(self, attention_probs, value_layer):
@@ -368,6 +372,7 @@ class ParallelTransformer(MegatronModule):
         # Transformer layers.
         self.layers = torch.nn.ModuleList(
             [get_layer(i + 1) for i in range(args.num_layers)])
+        self.cutpoints = torch.nn.ModuleList([CutPoint() for i in range(args.num_layers - 1)])
 
         # Final layer norm before output.
         self.final_layernorm = LayerNorm(
@@ -422,6 +427,10 @@ class ParallelTransformer(MegatronModule):
                                       attention_mask,
                                       layer_past=past,
                                       get_key_value=get_key_value)
+
+                if i < (len(self.layers) - 1):
+                    hidden_states = self.cutpoints[i](hidden_states)
+
                 if get_key_value:
                     hidden_states, present = hidden_states
                     presents.append(present)

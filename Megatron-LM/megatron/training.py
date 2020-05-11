@@ -18,16 +18,19 @@
 from datetime import datetime
 import math
 import sys
+import os
 
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from apex.optimizers import FusedAdam as Adam
+from apex.optimizers import FusedLAMB as LAMB
 
 from megatron import get_args
 from megatron import get_timers
 from megatron import get_tensorboard_writer
 from megatron import mpu
 from megatron import print_rank_0
+from megatron import get_tokenizer
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.fp16 import FP16_Module
@@ -39,10 +42,19 @@ from megatron.model import get_params_for_weight_decay_optimization
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import make_data_loader
 from megatron.utils import report_memory
+from megatron.utils import get_ltor_masks_and_position_ids
 
+from varuna import Varuna
+from varuna import load_varuna_checkpoint
+
+import time
+from apex import amp
+from apex.amp import _amp_state
+
+accumulated_loss = 0
 
 def pretrain(train_valid_test_dataset_provider, model_provider,
-             forward_step_func, extra_args_provider=None, args_defaults={}):
+             forward_step_func, eval_step_varuna, extra_args_provider=None, args_defaults={}):
     """Main training program.
 
     This function will run the followings in the order provided:
@@ -75,16 +87,44 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
 
     # Model, optimizer, and learning rate.
     timers('model and optimizer').start()
-    model, optimizer, lr_scheduler = setup_model_and_optimizer(model_provider)
+    model, optimizer, lr_scheduler, parameter_names = setup_model_and_optimizer(model_provider)
     timers('model and optimizer').stop()
 
     # Data stuff.
     timers('train/valid/test data iterators').start()
-    train_data_iterator, valid_data_iterator, test_data_iterator \
+    train_data_iterator, valid_data_iterator, test_data_iterator, dry_run_input \
         = build_train_valid_test_data_iterators(
             train_valid_test_dataset_provider)
     timers('train/valid/test data iterators').stop()
 
+    if args.varuna:
+        device = args.local_rank
+
+        # Unpack.
+        tokens_ = torch.Tensor(dry_run_input['text']).view(1,-1).long()
+        labels = tokens_[:,1:].contiguous()
+        tokens = tokens_[:,:-1].contiguous()
+
+        # Get the masks and postition ids.
+        tokenizer = get_tokenizer()
+        attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+            tokens,
+            tokenizer.eod,
+            args.reset_position_ids,
+            args.reset_attention_mask,
+            args.eod_mask_loss)
+
+        dry_run_input = dict({
+            "input_ids": tokens.to(device),
+            "position_ids": position_ids.to(device),
+            "attention_mask": attention_mask.to(device),
+            "loss_mask": loss_mask.to(device),
+            "labels": labels.to(device)
+        })
+
+        shared_weights = [("language_model.embedding.word_embeddings.weight","lm_head_weight")]
+        model = Varuna(model, args.stage_to_rank_map, dry_run_input, args.batch_size * args.data_depth, optimizer, args.chunk_size, args.fp16, local_rank=args.local_rank, device=args.local_rank, shared_weights=shared_weights)            
+    
     # Print setup timing.
     print_rank_0('done with setups ...')
     timers.log(['model and optimizer', 'train/valid/test data iterators'])
@@ -95,21 +135,21 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
         if args.do_train:
             iteration, _ = train(forward_step_func,
                                  model, optimizer, lr_scheduler,
-                                 train_data_iterator, valid_data_iterator)
+                                 train_data_iterator, valid_data_iterator, parameter_names, eval_step_varuna)
 
     if args.do_valid:
         prefix = 'the end of training for val data'
-        evaluate_and_print_results(prefix, forward_step_func,
+        evaluate_and_print_results(prefix, forward_step_func if not args.varuna else eval_step_varuna,
                                    valid_data_iterator, model,
                                    iteration, False)
 
     if args.save and iteration != 0:
-        save_checkpoint(iteration, model, optimizer, lr_scheduler)
+        save_checkpoint(iteration, model, optimizer, lr_scheduler,parameter_names)
 
     if args.do_test:
         # Run on test data.
         prefix = 'the end of training for test data'
-        evaluate_and_print_results(prefix, forward_step_func,
+        evaluate_and_print_results(prefix, forward_step_func if not args.varuna else eval_step_varuna,
                                    test_data_iterator, model,
                                    0, True)
 
@@ -122,30 +162,16 @@ def get_model(model_provider_func):
     model = model_provider_func()
 
     # Print number of parameters.
-    if mpu.get_data_parallel_rank() == 0:
+    if mpu.model_parallel_is_initialized() and  mpu.get_data_parallel_rank() == 0:
         print(' > number of parameters on model parallel rank {}: {}'.format(
             mpu.get_model_parallel_rank(),
             sum([p.nelement() for p in model.parameters()])), flush=True)
-
+    else:
+        print("Total num params is", sum([p.nelement() for p in model.parameters()]), flush=True)
     # GPU allocation.
     model.cuda(torch.cuda.current_device())
 
-    # Fp16 conversion.
-    if args.fp16:
-        model = FP16_Module(model)
-
-    # Wrap model for distributed training."""
-    if args.DDP_impl == 'torch':
-        i = torch.cuda.current_device()
-        model = torchDDP(model, device_ids=[i], output_device=i,
-                         process_group=mpu.get_data_parallel_group())
-        return model
-    if args.DDP_impl == 'local':
-        model = LocalDDP(model)
-        return model
-
-    raise NotImplementedError('Unknown DDP implementation specified: {}. '
-                              'Exiting.'.format(args.DDP_impl))
+    return model
 
 
 def get_optimizer(model):
@@ -158,23 +184,17 @@ def get_optimizer(model):
     param_groups = get_params_for_weight_decay_optimization(model)
 
     # Add model parallel attribute if it is not set.
-    for param_group in param_groups:
-        for param in param_group['params']:
-            if not hasattr(param, 'model_parallel'):
-                param.model_parallel = False
+    if mpu.model_parallel_is_initialized():
+        for param_group in param_groups:
+            for param in param_group['params']:
+                if not hasattr(param, 'model_parallel'):
+                    param.model_parallel = False
 
-    # Use Adam.
-    optimizer = Adam(param_groups, lr=args.lr, weight_decay=args.weight_decay)
-
-    # Wrap into fp16 optimizer.
-    if args.fp16:
-        optimizer = FP16_Optimizer(optimizer,
-                                   static_loss_scale=args.loss_scale,
-                                   dynamic_loss_scale=args.dynamic_loss_scale,
-                                   dynamic_loss_args={
-                                       'scale_window': args.loss_scale_window,
-                                       'min_scale': args.min_scale,
-                                       'delayed_shift': args.hysteresis})
+    # Use LAMB/Adam.
+    if args.use_adam:
+        optimizer = Adam(param_groups, lr=args.lr, weight_decay=args.weight_decay)
+    else:    
+        optimizer = LAMB(param_groups, lr=args.lr, weight_decay=args.weight_decay)
 
     return optimizer
 
@@ -213,23 +233,67 @@ def setup_model_and_optimizer(model_provider_func):
     optimizer = get_optimizer(model)
     lr_scheduler = get_learning_rate_scheduler(optimizer)
 
+    if args.fp16:
+        if args.dynamic_loss_scale:
+            model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale="dynamic",min_loss_scale=args.min_scale)
+            amp._amp_state.loss_scalers[0]._loss_scale = 2**20
+        else:
+            model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale=args.loss_scale, min_loss_scale=args.min_scale)
+    
+    # fp32 param names for checkpointing
+    optimizer._amp_lazy_init()
+    parameter_names_ = dict()
+    for n,p in model.named_parameters():
+        parameter_names_[p] = n
+    fp16_model_params = optimizer._amp_stash.all_fp16_params
+    fp32_master_params = optimizer._amp_stash.all_fp32_from_fp16_params
+    print("stash lens",len(fp16_model_params), len(fp32_master_params))
+    count = 0
+    parameter_names = dict()
+    for p_model, p_master in zip(fp16_model_params, fp32_master_params):
+        if p_model in parameter_names_:
+            parameter_names[p_master] = parameter_names_.pop(p_model)
+            count += 1
+    print(count, "params found in rank", args.rank)
+
+    # Wrap model for distributed training."""
+    if args.DDP_impl == 'torch':
+        i = torch.cuda.current_device()
+        assert i == args.local_rank, "Local rank and device should be same!"
+        process_group = mpu.get_data_parallel_group() if mpu.model_parallel_is_initialized() else None
+        model = torchDDP(model, device_ids=[i], output_device=i,
+                         process_group=process_group)
+    if args.DDP_impl == 'local':
+        model = LocalDDP(model)
+
     if args.load is not None:
-        args.iteration = load_checkpoint(model, optimizer, lr_scheduler)
+        args.iteration = load_checkpoint(model, optimizer, lr_scheduler, parameter_names)
     else:
         args.iteration = 0
 
-    return model, optimizer, lr_scheduler
+    # this needs to be fixed asap
+    if args.varuna and args.stage == args.partitions - 1:
+        param = None
+        for p in parameter_names:
+            if parameter_names[p] == "lm_head_weight":
+                param = p
+                break
+        with torch.no_grad():
+            model.lm_head_weight.data.copy_(param.data) 
+
+    return model, optimizer, lr_scheduler, parameter_names
 
 
-def backward_step(optimizer, model, loss):
+def backward_step(optimizer, model, loss, iteration):
     """Backward step."""
     args = get_args()
     timers = get_timers()
 
-    # Backward pass.
-    optimizer.zero_grad(set_grads_to_None=True)
+    loss = loss / args.gradient_accumulation_steps
+
     if args.fp16:
-        optimizer.backward(loss, update_master_grads=False)
+        with amp.scale_loss(loss, optimizer, delay_overflow_check=False, last_microbatch=bool((iteration+1) % args.gradient_accumulation_steps == 0), last_partition=True) as scaled_loss:
+            scaled_loss.backward()
     else:
         loss.backward()
 
@@ -240,42 +304,78 @@ def backward_step(optimizer, model, loss):
                                fp32_allreduce=args.fp32_allreduce)
         timers('allreduce').stop()
 
-    # Update master gradients.
-    if args.fp16:
-        optimizer.update_master_grads()
-
     # Clipping gradients helps prevent the exploding gradient.
-    if args.clip_grad > 0:
+    if args.clip_grad > 0 and (iteration+1) % args.gradient_accumulation_steps == 0:
         if not args.fp16:
             mpu.clip_grad_norm(model.parameters(), args.clip_grad)
         else:
-            optimizer.clip_master_grads(args.clip_grad)
+            mpu.clip_grad_norm(amp.master_params(optimizer), args.clip_grad)
 
 
 def train_step(forward_step_func, data_iterator,
-               model, optimizer, lr_scheduler):
+               model, optimizer, lr_scheduler, iteration):
     """Single training step."""
     args = get_args()
     timers = get_timers()
 
     # Forward model for one step.
     timers('forward').start()
-    loss, loss_reduced = forward_step_func(data_iterator, model)
+    if isinstance(model,torchDDP) and ((iteration+1) % args.gradient_accumulation_steps != 0):
+        with model.no_sync():
+            loss, loss_reduced = forward_step_func(data_iterator, model)
+    else:
+        loss, loss_reduced = forward_step_func(data_iterator, model)
     timers('forward').stop()
 
     # Calculate gradients, reduce across processes, and clip.
     timers('backward').start()
-    backward_step(optimizer, model, loss)
+    backward_step(optimizer, model, loss, iteration)
     timers('backward').stop()
+
+    skipped_iter = 0
+    if (iteration+1) % args.gradient_accumulation_steps == 0:
+        # Update parameters
+        timers('optimizer').start()
+        overflow = optimizer.step()
+        timers('optimizer').stop()
+        for param in model.parameters():
+            param.grad = None
+
+        # Update learning rate.
+        if not (args.fp16 and overflow):
+            lr_scheduler.step()
+        else:
+            skipped_iter = 1
+
+    return loss_reduced, skipped_iter
+
+def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler, iteration):
+    """Single training step varuna."""
+    args = get_args()
+    timers = get_timers()
+
+    # Forward model for one step.
+    # timers('forward').start()
+    loss, loss_reduced = varuna_step(data_iterator, model)
+    # timers('forward').stop()
+
+    if args.clip_grad > 0:
+        if not args.fp16:
+            mpu.clip_grad_norm(model.parameters(), args.clip_grad)
+        else:
+            mpu.clip_grad_norm(amp.master_params(optimizer), args.clip_grad)
 
     # Update parameters.
     timers('optimizer').start()
-    optimizer.step()
+    overflow = optimizer.step()
     timers('optimizer').stop()
+
+    for param in model.parameters():
+        param.grad = None
 
     # Update learning rate.
     skipped_iter = 0
-    if not (args.fp16 and optimizer.overflow):
+    if not (args.fp16 and overflow):
         lr_scheduler.step()
     else:
         skipped_iter = 1
@@ -284,7 +384,8 @@ def train_step(forward_step_func, data_iterator,
 
 
 def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
-                 loss_scale, report_memory_flag):
+                 loss_scale, step_time, report_memory_flag, loss_file=None):
+    global accumulated_loss
     """Log training information such as losses, timing, ...."""
     args = get_args()
     timers = get_timers()
@@ -307,7 +408,9 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     add_to_logging('batch generator')
 
     # Tensorboard values.
-    if writer and torch.distributed.get_rank() == 0:
+    should_log = (args.stage == args.partitions - 1) if args.varuna \
+        else torch.distributed.get_rank() == 0
+    if writer and should_log:
         writer.add_scalar('learning_rate', learning_rate, iteration)
         for key in loss_dict:
             writer.add_scalar(key, loss_dict[key], iteration)
@@ -319,9 +422,19 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         timers.write(timers_to_log, writer, iteration,
                      normalizer=normalizer)
 
+    complete_steps = iteration // args.gradient_accumulation_steps
+    lm_loss = loss_dict["lm loss"].item() if isinstance(loss_dict["lm loss"], torch.Tensor) else loss_dict["lm loss"]
+    accumulated_loss += lm_loss
+    if (loss_file is not None) and iteration % args.gradient_accumulation_steps == 0:
+        accumulated_loss = accumulated_loss / args.gradient_accumulation_steps
+        loss_file.write("{}, {}, {}, {}\n".format(step_time, loss_scale, learning_rate, accumulated_loss))
+        if complete_steps % 50:
+            loss_file.flush()
+        accumulated_loss = 0
+
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval time').elapsed()
-        if writer and torch.distributed.get_rank() == 0:
+        if writer and should_log:
             writer.add_scalar('iteration_time',
                               elapsed_time / args.log_interval, iteration)
         log_string = ' iteration {:8d}/{:8d} |'.format(iteration,
@@ -335,7 +448,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             total_loss_dict[key] = 0.0
         if args.fp16:
             log_string += ' loss scale: {:.1f} |'.format(loss_scale)
-        print_rank_0(log_string)
+        if should_log:
+            print(log_string)
         if report_memory_flag:
             report_memory('after {} iterations'.format(iteration))
             report_memory_flag = False
@@ -345,7 +459,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
 
 
 def train(forward_step_func, model, optimizer, lr_scheduler,
-          train_data_iterator, valid_data_iterator):
+          train_data_iterator, valid_data_iterator, parameter_names, eval_step_varuna=None):
     """Train the model function."""
     args = get_args()
     timers = get_timers()
@@ -357,28 +471,55 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     total_loss_dict = {}
 
     # Iterations.
-    iteration = args.iteration
+    iteration = args.iteration * args.gradient_accumulation_steps
     skipped_iters = 0
+    complete_steps = args.iteration
+
+    loss_file = None
+    eval_loss_file = None
+    if (args.varuna and args.stage == args.partitions - 1) or (not args.varuna and torch.distributed.get_rank() == 0):
+        loss_filename = "{}-{}.txt".format(args.loss_file, torch.distributed.get_rank() )
+        eval_loss_filename = "eval-" + loss_filename
+        if iteration == 0:
+            if os.path.isfile(loss_filename):
+                raise RuntimeError("loss file {} already exists!".format(loss_filename))
+            loss_file = open(loss_filename,"w")
+            loss_file.write("Loss scale, loss\n")
+            eval_loss_file = open(eval_loss_filename, "w")
+            eval_loss_file.write("Iteration, loss keys")
+        else:
+            loss_file = open(loss_filename,"a")
+            loss_file.write("resumed to config {}x{} at step {}\n".format(args.partitions, args.data_depth, args.iteration))
+            eval_loss_file = open(eval_loss_filename, "a")
+            eval_loss_file.write("resumed\n")
 
     timers('interval time').start()
     report_memory_flag = True
+
+    step_func = train_step_varuna if args.varuna else train_step
+
     while iteration < args.train_iters:
-        loss_dict, skipped_iter = train_step(forward_step_func,
+        step_time = time.time()
+        loss_dict, skipped_iter = step_func(forward_step_func,
                                              train_data_iterator,
                                              model,
                                              optimizer,
-                                             lr_scheduler)
+                                             lr_scheduler,
+                                             iteration)
+        step_time = time.time() - step_time
         skipped_iters += skipped_iter
         iteration += 1
+        if iteration % args.gradient_accumulation_steps == 0:
+            complete_steps += 1
 
         # Logging.
         loss_scale = None
         if args.fp16:
-            loss_scale = optimizer.loss_scale
+            loss_scale = _amp_state.loss_scalers[0].loss_scale()
         report_memory_flag = training_log(loss_dict, total_loss_dict,
                                           optimizer.param_groups[0]['lr'],
-                                          iteration, loss_scale,
-                                          report_memory_flag)
+                                          iteration, loss_scale, step_time,
+                                          report_memory_flag, loss_file)
 
         # Autoresume
         if args.adlr_autoresume and \
@@ -387,27 +528,29 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                               lr_scheduler)
 
         # Checkpointing
-        if args.save and args.save_interval and \
-           iteration % args.save_interval == 0:
-            save_checkpoint(iteration, model, optimizer, lr_scheduler)
-
+        if args.save and args.save_interval and complete_steps > 0 and \
+           complete_steps % args.save_interval == 0:
+            save_checkpoint(complete_steps, model, optimizer, lr_scheduler, parameter_names)
+            
         # Evaluation
-        if args.eval_interval and iteration % args.eval_interval == 0 and \
+        if args.eval_interval and complete_steps > 0 and complete_steps % args.eval_interval == 0 and \
            args.do_valid:
-            prefix = 'iteration {}'.format(iteration)
-            evaluate_and_print_results(prefix, forward_step_func,
+            prefix = 'iteration {}'.format(complete_steps)
+            evaluate_and_print_results(prefix, forward_step_func if not args.varuna else eval_step_varuna,
                                        valid_data_iterator, model,
-                                       iteration, False)
+                                       complete_steps, False, eval_loss_file)
 
-        if args.exit_interval and iteration % args.exit_interval == 0:
+        if args.exit_interval and complete_steps > 0 and complete_steps % args.exit_interval == 0:
             torch.distributed.barrier()
             time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             rank = torch.distributed.get_rank()
             print_rank_0('rank: {} | time: {} | exiting the program at '
-                         'iteration {}'.format(rank, time_str, iteration))
+                         'iteration {}'.format(rank, time_str, complete_steps))
             sys.exit()
 
-    return iteration, skipped_iters
+    if loss_file is not None:
+        loss_file.close()
+    return complete_steps, skipped_iters
 
 
 def evaluate(forward_step_func, data_iterator, model, verbose=False):
@@ -429,40 +572,57 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
             # Forward evaluation.
             _, loss_dict = forward_step_func(data_iterator, model)
             # Reduce across processes.
-            for key in loss_dict:
-                total_loss_dict[key] = total_loss_dict.get(key, 0.) + \
-                    loss_dict[key]
+            if not args.varuna or args.stage == args.partitions - 1:
+                for key in loss_dict:
+                    total_loss_dict[key] = total_loss_dict.get(key, 0.) + \
+                        loss_dict[key]
+    
     # Move model back to the train mode.
     model.train()
 
-    for key in total_loss_dict:
-        total_loss_dict[key] /= args.eval_iters
+    if not args.varuna or args.stage == args.partitions - 1:
+        for key in total_loss_dict:
+            total_loss_dict[key] /= args.eval_iters
 
     return total_loss_dict
 
 
 def evaluate_and_print_results(prefix, forward_step_func,
                                data_iterator, model,
-                               iteration, verbose=False):
+                               iteration, verbose=False, loss_file=None):
     """Helper function to evaluate and dump results on screen."""
     writer = get_tensorboard_writer()
+    args = get_args()
 
     total_loss_dict = evaluate(forward_step_func, data_iterator, model, verbose)
+
+    # print results
+    should_log = (args.stage == args.partitions - 1) if args.varuna \
+        else torch.distributed.get_rank() == 0
+    if should_log:
+        if loss_file is not None:
+            loss_file.write(str(iteration) + ": ")
     string = ' validation loss at {} | '.format(prefix)
     for key in total_loss_dict:
         string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
         ppl = math.exp(min(20, total_loss_dict[key].item()))
         string += '{} PPL: {:.6E} | '.format(key, ppl)
-        if writer and torch.distributed.get_rank() == 0:
+        if writer:
             writer.add_scalar('{} value'.format(key),
-                              total_loss_dict[key].item(),
-                              iteration)
+                            total_loss_dict[key].item(),
+                            iteration)
             writer.add_scalar('{} ppl'.format(key), ppl, iteration)
+        if loss_file is not None:
+            loss_file.write("{}: {}, ".format(key, total_loss_dict[key].item()))
 
-    length = len(string) + 1
-    print_rank_0('-' * length)
-    print_rank_0(string)
-    print_rank_0('-' * length)
+    if loss_file is not None:
+        loss_file.write("\n")
+ 
+    if should_log:
+        length = len(string) + 1
+        print('-' * length)
+        print(string)
+        print('-' * length)
 
 
 def build_train_valid_test_data_iterators(
@@ -474,9 +634,14 @@ def build_train_valid_test_data_iterators(
 
     print_rank_0('> building train, validation, and test datasets ...')
     # Data loader only on rank 0 of each model parallel group.
-    if mpu.get_model_parallel_rank() == 0:
+    if (not mpu.model_parallel_is_initialized()) or mpu.get_model_parallel_rank() == 0:
         # Rank, size, and global batch size.
-        data_parallel_size = mpu.get_data_parallel_world_size()
+        if args.varuna:
+            data_parallel_size = args.data_depth
+        elif mpu.model_parallel_is_initialized():
+            data_parallel_size = mpu.get_data_parallel_world_size()
+        else:
+            data_parallel_size = torch.distributed.get_world_size()
         global_batch_size = args.batch_size * data_parallel_size
 
         # Number of train/valid/test samples.
@@ -495,6 +660,8 @@ def build_train_valid_test_data_iterators(
         train_ds, valid_ds, test_ds = build_train_valid_test_datasets_provider(
             train_val_test_num_samples)
 
+        dry_run_input = train_ds[0]
+
         # Build dataloders.
         train_dataloader = make_data_loader(train_ds)
         valid_dataloader = make_data_loader(valid_ds)
@@ -511,9 +678,10 @@ def build_train_valid_test_data_iterators(
         flags = torch.cuda.LongTensor([0, 0, 0])
 
     # Broadcast num tokens.
-    torch.distributed.broadcast(flags,
-                                mpu.get_model_parallel_src_rank(),
-                                group=mpu.get_model_parallel_group())
+    if mpu.model_parallel_is_initialized():
+        torch.distributed.broadcast(flags,
+                                    mpu.get_model_parallel_src_rank(),
+                                    group=mpu.get_model_parallel_group())
     args.do_train = flags[0].item()
     args.do_valid = flags[1].item()
     args.do_test = flags[2].item()
@@ -548,4 +716,85 @@ def build_train_valid_test_data_iterators(
     else:
         test_data_iterator = None
 
-    return train_data_iterator, valid_data_iterator, test_data_iterator
+    return train_data_iterator, valid_data_iterator, test_data_iterator, dry_run_input
+
+
+def get_eval_numbers(train_valid_test_dataset_provider, model_provider,
+             eval_step_varuna):
+    # Initalize and get arguments, timers, and Tensorboard writer.
+    initialize_megatron(args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+    args = get_args()
+
+    print("WS",args.world_size, torch.distributed.get_world_size())
+
+    shared_weights = [("language_model.embedding.word_embeddings.weight","lm_head_weight")]
+    model, _opt, _lrs, _pn = setup_model_and_optimizer(model_provider)
+
+    ckpt_iters = sorted([int(f.split("_")[-1]) for f in os.listdir(args.save) if "model_ckpt_" in f])
+    ckpts = ["model_ckpt_{}".format(i) for i in ckpt_iters]
+    print(ckpts)
+    
+    train_data_iterator, valid_data_iterator, test_data_iterator, dry_run_input \
+        = build_train_valid_test_data_iterators(
+            train_valid_test_dataset_provider)
+
+    device = args.local_rank
+
+    tokens_ = torch.Tensor(dry_run_input['text']).view(1,-1).long()
+    labels = tokens_[:,1:].contiguous()
+    tokens = tokens_[:,:-1].contiguous()
+
+    # Get the masks and postition ids.
+    tokenizer = get_tokenizer()
+    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+        tokens,
+        tokenizer.eod,
+        args.reset_position_ids,
+        args.reset_attention_mask,
+        args.eod_mask_loss)
+
+    dry_run_input = dict({
+        "input_ids": tokens.to(device),
+        "position_ids": position_ids.to(device),
+        "attention_mask": attention_mask.to(device),
+        "loss_mask": loss_mask.to(device),
+        "labels": labels.to(device)
+    })
+
+    # eval_samples = len(ckpts) * args.batch_size * args.eval_iters
+    # _tr, valid_ds, _te = train_valid_test_dataset_provider([0,eval_samples,0])
+
+    # valid_dataloader = make_data_loader(valid_ds)
+    # valid_data_iterator = iter(valid_dataloader)
+
+    model = Varuna(model, args.stage_to_rank_map, dry_run_input, args.batch_size * args.data_depth, _opt, args.chunk_size, args.fp16, local_rank=args.local_rank, device=args.local_rank, shared_weights=shared_weights)            
+
+    loss_file = None
+    if args.stage == args.partitions - 1:
+        loss_file = open("eval_loss_varuna_350m_32k-2.txt", "w")
+
+    for model_ckpt in ckpts:
+        iteration = int(model_ckpt.split("_")[-1])
+        print("Evaluating checkpoint", iteration)
+
+        model_state_dict = load_varuna_checkpoint(args.stage, args.partitions, args.num_layers, os.path.join(args.save,model_ckpt))
+        model.model.module.load_state_dict(model_state_dict, strict = False)
+        print("loaded checkpoint!")
+        opt_state_dict = torch.load(os.path.join(args.save,"opt_ckpt_{}/opt-fp32-params-{}".format(iteration, args.num_layers-1)), map_location="cpu")
+        lm_head_weight = opt_state_dict["lm_head_weight"].to(args.local_rank)
+        if args.stage == 0:
+            model.model.module.language_model.embedding.word_embeddings.weight.data.copy_(lm_head_weight.data)
+        if args.stage == args.partitions - 1:
+            model.model.module.lm_head_weight.data.copy_(lm_head_weight.data)
+        total_loss_dict = evaluate(eval_step_varuna, valid_data_iterator, model, verbose=True)
+        if args.stage == args.partitions - 1:
+            loss_file.write(str(iteration) + " ")
+            for key in total_loss_dict: 
+                loss = total_loss_dict[key].item()
+                ppl = math.exp(min(20, loss))
+                if loss_file is not None:
+                    loss_file.write("{}: {}, {};".format(key, loss, ppl))
+
+        if loss_file is not None:
+            loss_file.write("\n")
+

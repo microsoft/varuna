@@ -20,6 +20,7 @@ import os
 
 import numpy as np
 import torch
+import datetime
 
 from megatron import get_adlr_autoresume
 from megatron import get_args
@@ -51,7 +52,7 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
     args = get_args()
     if args.rank == 0:
         print('> setting random seeds to {} ...'.format(args.seed))
-    _set_random_seed(args.seed)
+    _set_random_seed(args.seed, args.model_parallel_size > 1)
 
     # Write arguments to tensorboard.
     _write_args_to_tensorboard()
@@ -93,13 +94,14 @@ def _initialize_distributed():
         master_ip = os.getenv('MASTER_ADDR', 'localhost')
         master_port = os.getenv('MASTER_PORT', '6000')
         init_method += master_ip + ':' + master_port
+        connect_timeout = datetime.timedelta(minutes=10)
         torch.distributed.init_process_group(
             backend=args.distributed_backend,
-            world_size=args.world_size, rank=args.rank,
+            world_size=args.world_size, timeout=connect_timeout, rank=args.rank,
             init_method=init_method)
 
     # Set the model-parallel / data-parallel communicators.
-    if device_count > 0:
+    if device_count > 0 and args.model_parallel_size > 1:
         mpu.initialize_model_parallel(args.model_parallel_size)
 
 
@@ -112,13 +114,13 @@ def _init_autoresume():
         torch.distributed.barrier()
 
 
-def _set_random_seed(seed):
+def _set_random_seed(seed, model_parallel=False):
     """Set random seed for reproducability."""
     if seed is not None and seed > 0:
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        if torch.cuda.device_count() > 0:
+        if torch.cuda.device_count() > 0 and model_parallel:
             mpu.model_parallel_cuda_manual_seed(seed)
     else:
         raise ValueError('Seed ({}) should be a positive integer.'.format(seed))

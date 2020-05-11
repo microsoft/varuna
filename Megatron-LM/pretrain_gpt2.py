@@ -24,10 +24,11 @@ from megatron import mpu
 from megatron import print_rank_0
 from megatron.data.gpt2_dataset import build_train_valid_test_datasets
 from megatron.model import GPT2Model
-from megatron.training import pretrain
+from megatron.training import pretrain, get_eval_numbers
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import reduce_losses
 
+import signal
 
 def model_provider():
     """Build the model."""
@@ -52,7 +53,12 @@ def get_batch(data_iterator):
         data = next(data_iterator)
     else:
         data = None
-    data_b = mpu.broadcast_data(keys, data, datatype)
+    if args.model_parallel_size > 1:
+        data_b = mpu.broadcast_data(keys, data, datatype)  
+    else:
+        data_b = dict()
+        for k in data:
+            data_b[k] = data[k].cuda()
 
     # Unpack.
     tokens_ = data_b['text'].long()
@@ -70,6 +76,23 @@ def get_batch(data_iterator):
     return tokens, labels, loss_mask, attention_mask, position_ids
 
 
+def eval_step_varuna(data_iterator, model):
+    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator)
+
+    inputs = {tokens, position_ids, attention_mask, loss_mask, labels}
+    inputs = dict({
+        "input_ids": tokens,
+        "position_ids": position_ids,
+        "attention_mask": attention_mask,
+        "loss_mask": loss_mask,
+        "labels": labels
+    })
+    output = model.evaluate(inputs)
+    loss = output[0] if isinstance(output,list) else output
+
+    # Reduce loss for logging.
+    return loss, {'lm loss': loss}
+
 def forward_step(data_iterator, model):
     """Forward step."""
     timers = get_timers()
@@ -81,17 +104,44 @@ def forward_step(data_iterator, model):
     timers('batch generator').stop()
 
     # Forward model.
-    output = model(tokens, position_ids, attention_mask)
-    losses = mpu.vocab_parallel_cross_entropy(output.contiguous().float(),
-                                              labels)
-    loss_mask = loss_mask.view(-1)
-    loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+    output = model(tokens, position_ids, attention_mask, loss_mask, labels)
+    loss = output[0] if isinstance(output,list) else output
 
     # Reduce loss for logging.
     reduced_loss = reduce_losses([loss])
 
     return loss, {'lm loss': reduced_loss[0]}
 
+def varuna_step(data_iterator, model):
+    timers = get_timers()
+
+    # Get the batch.
+    timers('batch generator').start()
+    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
+        data_iterator)
+    timers('batch generator').stop()
+
+    # Pipeline model.
+    inputs = dict({
+        "input_ids": tokens,
+        "position_ids": position_ids,
+        "attention_mask": attention_mask,
+        "loss_mask": loss_mask,
+        "labels": labels
+    })
+
+    loss = model(inputs)
+
+    # Reduce loss for logging.
+    # reduced_loss = reduce_losses([loss])
+    return loss, {'lm loss': torch.Tensor([loss])}
+
+def cond_forward_step(data_iterator, model):
+    args = get_args()
+    if args.varuna:
+        return varuna_step(data_iterator, model)
+    else:
+        return forward_step(data_iterator, model)
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid, and test datasets."""
@@ -114,5 +164,14 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 if __name__ == "__main__":
 
-    pretrain(train_valid_test_datasets_provider, model_provider, forward_step,
-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+    def handler(signum,_):
+        print(torch.distributed.get_rank(), 'signal handler called with signal', signum)
+        exit()
+
+    signal.signal(signal.SIGUSR1, handler) 
+
+    pretrain(train_valid_test_datasets_provider, model_provider, cond_forward_step,
+             eval_step_varuna, args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+
+    # get_eval_numbers(train_valid_test_datasets_provider, model_provider,eval_step_varuna)
+
