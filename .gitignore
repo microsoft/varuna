@@ -12,8 +12,8 @@ ssh_out*
 parent_process
 args
 ssh_err*
-old_partitioned_model*
-varuna_for_finetuning*
+available_machines.out
+setup_remote.sh
 varuna
 # Byte-compiled / optimized / DLL files
 *__pycache__/

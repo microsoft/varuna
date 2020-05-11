@@ -209,6 +209,8 @@ def _add_training_args(parser):
                        'by this value.')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
+    group.add_argument('--debug-eval', action='store_true', default=False,
+                        help="whether to use eval mode, for debugging")
 
     return parser
 
