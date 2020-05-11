@@ -137,7 +137,7 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
                                  model, optimizer, lr_scheduler,
                                  train_data_iterator, valid_data_iterator, parameter_names, eval_step_varuna)
 
-    if (not args.varuna) and args.do_valid:
+    if args.do_valid:
         prefix = 'the end of training for val data'
         evaluate_and_print_results(prefix, forward_step_func if not args.varuna else eval_step_varuna,
                                    valid_data_iterator, model,
