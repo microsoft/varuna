@@ -8,11 +8,6 @@ import pickle
 
 from collections import OrderedDict 
 
-blob_store_folder = "~/myblobcontainer"
-
-cp_partition_prefix = "cp-partition"
-
-
 class CutPoint(Module):
     def __init__(self):
         super(CutPoint, self).__init__()
@@ -25,7 +20,10 @@ class CutPoint(Module):
         self.send_fn = self.recv_fn = None
         self.stage = -1
         self.fp16 = False
-        self.pruning = True
+        self.pruning = False
+    
+    def set_pruning(self, boolean):
+        self.pruning = boolean
 
     def forward(self, *inputs, **kwargs):
         # not set by ModelParallel, pass through as is
@@ -379,7 +377,12 @@ class PartitionedModel(Module):
         self.module.eval()
         for p in self.module.parameters():
             p.grad = None
-        
+
+        for n in self.ordered_modules:
+            m = self.ordered_modules[n]
+            if isinstance(m,CutPoint):
+                m.set_pruning(True)
+
         # forward
         self.set_recv_fn(lambda grads=False: torch.zeros(self.forward_input_shapes[0], dtype=torch.float32))     
         try:
@@ -391,26 +394,22 @@ class PartitionedModel(Module):
             ret_val = self.ret_val
         
         # backward
-        try:
-            self.set_recv_fn(None)
-            if self.stage != self.num_stages - 1:
-                ret_val.backward(torch.ones(list(ret_val.size()), dtype=torch.float32))
-            else:
-                ret_val.backward()
-        except Exception as e:
-            print("Rank {} received error {}".format(dist.get_rank(), e))
+        self.set_recv_fn(None)
+        if self.stage != self.num_stages - 1:
+            ret_val.backward(torch.ones(list(ret_val.size()), dtype=torch.float32))
+        else:
+            ret_val.backward()
 
         self.ret_val = None
         to_remove = []
-        with open("remove_params-{}".format(dist.get_rank()), "w") as f:
-            for n,p in self.module.named_parameters():
-                if p.grad is None:
-                    to_remove.append(n)
-                    path = n.split(".")
-                    parent = self.module
-                    for i in range(len(path) - 1):
-                        parent = getattr(parent, path[i])
-                    setattr(parent,path[-1], None)
+        for n,p in self.module.named_parameters():
+            if p.grad is None:
+                to_remove.append(n)
+                path = n.split(".")
+                parent = self.module
+                for i in range(len(path) - 1):
+                    parent = getattr(parent, path[i])
+                setattr(parent,path[-1], None)
         
         # reset grads and train mode
         for p in self.module.parameters():
@@ -419,9 +418,10 @@ class PartitionedModel(Module):
             self.module.train()
 
         for m in self.ordered_modules:
-            m = self.ordered_modules[m] 
+            m = self.ordered_modules[m]
             if isinstance(m,CutPoint):
-                m.pruning = False
+                m.set_pruning(False)
+
         self.model_pruned = True
 
         

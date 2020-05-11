@@ -31,7 +31,7 @@ from megatron import get_tensorboard_writer
 from megatron import mpu
 from megatron import print_rank_0
 from megatron import get_tokenizer
-from megatron.checkpointing import load_checkpoint
+from megatron.checkpointing import load_checkpoint, parse_last_ckpt_iteration
 from megatron.checkpointing import save_checkpoint
 from megatron.fp16 import FP16_Module
 from megatron.fp16 import FP16_Optimizer
@@ -44,13 +44,11 @@ from megatron.utils import make_data_loader
 from megatron.utils import report_memory
 from megatron.utils import get_ltor_masks_and_position_ids
 
-from varuna import Varuna
+from varuna import Varuna, PartitionedModel
 from varuna import load_varuna_checkpoint
 
 from apex import amp
 from apex.amp import _amp_state
-
-import numpy
 
 accumulated_loss = 0
 
@@ -86,24 +84,47 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
     args = get_args()
     timers = get_timers()
 
-    # Data stuff.
-    dry_run_input = dummy_build_train_valid_test_data_iterators(
-            train_valid_test_dataset_provider)
-    # dry_run_input = None
-
-    # Model, optimizer, and learning rate.
-    timers('model and optimizer').start()
-    model, optimizer, lr_scheduler, parameter_names = setup_model_and_optimizer(model_provider, dry_run_input)
-    timers('model and optimizer').stop()
+    if args.load is not None:
+        args.iteration, _ = parse_last_ckpt_iteration()
+    else:
+        args.iteration = 0
 
     # Data stuff.
-    torch.cuda.synchronize()
     timers('train/valid/test data iterators').start()
     train_data_iterator, valid_data_iterator, test_data_iterator, dry_run_input \
         = build_train_valid_test_data_iterators(
             train_valid_test_dataset_provider)
     timers('train/valid/test data iterators').stop()
 
+    if args.varuna:
+        device = args.local_rank
+
+        # Unpack.
+        tokens_ = torch.Tensor(dry_run_input['text']).view(1,-1).long()
+        labels = tokens_[:,1:].contiguous()
+        tokens = tokens_[:,:-1].contiguous()
+
+        # Get the masks and postition ids.
+        tokenizer = get_tokenizer()
+        attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+            tokens,
+            tokenizer.eod,
+            args.reset_position_ids,
+            args.reset_attention_mask,
+            args.eod_mask_loss)
+
+        dry_run_input = dict({
+            "input_ids": tokens,
+            "position_ids": position_ids,
+            "attention_mask": attention_mask,
+            "loss_mask": loss_mask,
+            "labels": labels
+        })
+        
+    # Model, optimizer, and learning rate.    
+    timers('model and optimizer').start()
+    model, optimizer, lr_scheduler, parameter_names = setup_model_and_optimizer(model_provider, dry_run_input if args.varuna else None)
+    timers('model and optimizer').stop()
     
     # Print setup timing.
     print_rank_0('done with setups ...')
@@ -117,7 +138,7 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
                                  model, optimizer, lr_scheduler,
                                  train_data_iterator, valid_data_iterator, parameter_names, eval_step_varuna)
 
-    if (not args.varuna) and args.do_valid:
+    if args.do_valid:
         prefix = 'the end of training for val data'
         evaluate_and_print_results(prefix, forward_step_func if not args.varuna else eval_step_varuna,
                                    valid_data_iterator, model,
@@ -134,23 +155,28 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
                                    0, True)
 
 
-def get_model(model_provider_func):
+def get_model(model_provider_func, dry_run_input=None):
     """Build the model."""
     args = get_args()
 
     # Build model on cpu.
     model = model_provider_func()
 
+    if args.varuna:
+        shared_weights = [("language_model.embedding.word_embeddings.weight","lm_head_weight")]
+        model = Varuna(model, args.stage_to_rank_map, dry_run_input, args.batch_size * args.data_depth, args.chunk_size, args.fp16, local_rank=args.local_rank, device=args.local_rank, shared_weights=shared_weights)            
+    if args.local_rank == 0:
+        print('get_model() post varuna init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())            
+    
     # Print number of parameters.
     if mpu.model_parallel_is_initialized() and  mpu.get_data_parallel_rank() == 0:
         print(' > number of parameters on model parallel rank {}: {}'.format(
             mpu.get_model_parallel_rank(),
             sum([p.nelement() for p in model.parameters()])), flush=True)
     else:
-        print("Total num params is", sum([p.nelement() for p in model.parameters()]), flush=True)
+        print(args.rank, ": total num params is", sum([p.nelement() for p in model.parameters()]), flush=True)
     # GPU allocation.
-    # model.cuda(torch.cuda.current_device())
-
+    model.cuda(torch.cuda.current_device())
     return model
 
 
@@ -205,76 +231,44 @@ def get_learning_rate_scheduler(optimizer):
     return lr_scheduler
 
 
-def setup_model_and_optimizer(model_provider_func, dry_run_input):
+def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
     """Setup model and optimizer."""
     args = get_args()
 
-    model = get_model(model_provider_func)
-    optimizer = None#get_optimizer(model)
-    # lr_scheduler = get_learning_rate_scheduler(optimizer)
-
-    if args.varuna:
-        device = torch.device("cuda", args.local_rank)
-
-        if dry_run_input is not None:
-            # Unpack.
-            tokens_ = torch.Tensor(dry_run_input['text']).view(1,-1).long()
-            labels = tokens_[:,1:].contiguous()
-            tokens = tokens_[:,:-1].contiguous()
-
-            # Get the masks and postition ids.
-            tokenizer = get_tokenizer()
-            attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
-                tokens,
-                tokenizer.eod,
-                args.reset_position_ids,
-                args.reset_attention_mask,
-                args.eod_mask_loss)
-
-            dry_run_input = dict({
-                "input_ids": tokens,
-                "position_ids": position_ids,
-                "attention_mask": attention_mask,
-                "loss_mask": loss_mask,
-                "labels": labels
-            })
-        else:
-            dry_run_input = {}
-
-
-        shared_weights = [("language_model.embedding.word_embeddings.weight","lm_head_weight")]
-        model = Varuna(model, args.stage_to_rank_map, dry_run_input, args.batch_size * args.data_depth, optimizer, args.chunk_size, args.fp16, local_rank=args.local_rank, device=args.local_rank, shared_weights=shared_weights)
-        # model.cuda(torch.cuda.current_device())
-        if args.local_rank==0:
-            # print("setup_model() post varuna init: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
-            print('setup_model() post varuna init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())            
-        # model.to(device)
-    
+    model = get_model(model_provider_func, dry_run_input)
     optimizer = get_optimizer(model)
-    model.optimizer = optimizer
     if args.local_rank==0:
-        # print("setup_model() post optimizer init: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
         print('setup_model() post optimizer init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
     lr_scheduler = get_learning_rate_scheduler(optimizer)
 
+    basemodel = model
+    while isinstance(basemodel, (Varuna,PartitionedModel, torchDDP)):
+        basemodel = basemodel.module if hasattr(basemodel, "module") else basemodel.model
+
     if args.fp16:
         if args.dynamic_loss_scale:
-            model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale="dynamic",min_loss_scale=args.min_scale)
+            basemodel, optimizer = amp.initialize(basemodel, optimizer, opt_level="O2", loss_scale="dynamic",min_loss_scale=args.min_scale)
             amp._amp_state.loss_scalers[0]._loss_scale = 2**20
         else:
-            model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale=args.loss_scale, min_loss_scale=args.min_scale)
+            basemodel, optimizer = amp.initialize(basemodel, optimizer, opt_level="O2", loss_scale=args.loss_scale, min_loss_scale=args.min_scale)
     
-    # '''
     if args.local_rank==0:
-        # print("setup_model() post amp init: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
         print('setup_model() post amp init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
+        if args.varuna:
+            if args.data_depth > 1:
+                model.model.module.module = basemodel
+            else:
+                model.model.module = basemodel
+
+    if args.varuna:
+        model.set_optimizer(optimizer)
+
     # fp32 param names for checkpointing
     optimizer._amp_lazy_init()
     if args.local_rank==0:
-        # print("setup_model() post amp opt init: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
         print('setup_model() post amp opt init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
     parameter_names_ = dict()
-    for n,p in model.named_parameters():
+    for n,p in basemodel.named_parameters():
         parameter_names_[p] = n
     fp16_model_params = optimizer._amp_stash.all_fp16_params
     fp32_master_params = optimizer._amp_stash.all_fp32_from_fp16_params
@@ -293,33 +287,29 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input):
     # '''
 
     # Wrap model for distributed training."""
-    # if args.DDP_impl == 'torch':
-    #     i = torch.cuda.current_device()
-    #     assert i == args.local_rank, "Local rank and device should be same!"
-    #     process_group = mpu.get_data_parallel_group() if mpu.model_parallel_is_initialized() else None
-    #     model = torchDDP(model, device_ids=[i], output_device=i,
-    #                      process_group=process_group)
-    # if args.DDP_impl == 'local':
-    #     model = LocalDDP(model)
-
+    if args.DDP_impl == 'torch':
+        i = torch.cuda.current_device()
+        assert i == args.local_rank, "Local rank and device should be same!"
+        process_group = mpu.get_data_parallel_group() if mpu.model_parallel_is_initialized() else None
+        model = torchDDP(model, device_ids=[i], output_device=i,
+                         process_group=process_group)
+    if args.DDP_impl == 'local':
+        model = LocalDDP(model)
+        
     if args.load is not None:
-        args.iteration = load_checkpoint(model, optimizer, lr_scheduler, parameter_names)
+        args.iteration = load_checkpoint(basemodel, optimizer, lr_scheduler, parameter_names)
     else:
         args.iteration = 0
 
     # this needs to be fixed asap
-    # print(args.rank, model)
-    # if args.varuna and args.stage == args.partitions - 1:
-    #     param = None
-    #     for p in parameter_names:
-    #         if parameter_names[p] == "lm_head_weight":
-    #             param = p
-    #             break
-    #     with torch.no_grad():
-    #         model.model.module.module.lm_head_weight.data.copy_(param.data) 
-
-    # model.optimizer = optimizer
-    print(model)
+    if args.varuna and args.stage == args.partitions - 1:
+        param = None
+        for p in parameter_names:
+            if parameter_names[p] == "lm_head_weight":
+                param = p
+                break
+        with torch.no_grad():
+            basemodel.lm_head_weight.data.copy_(param.data) 
 
     return model, optimizer, lr_scheduler, parameter_names
 
@@ -431,7 +421,7 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
 
 
 def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
-                 loss_scale, report_memory_flag, loss_file=None):
+                 loss_scale, step_time, report_memory_flag, loss_file=None):
     global accumulated_loss
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -474,7 +464,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     accumulated_loss += lm_loss
     if (loss_file is not None) and iteration % args.gradient_accumulation_steps == 0:
         accumulated_loss = accumulated_loss / args.gradient_accumulation_steps
-        loss_file.write("{}, {}, {}\n".format(loss_scale, learning_rate, accumulated_loss))
+        loss_file.write("{}, {}, {}, {}\n".format(step_time, loss_scale, learning_rate, accumulated_loss))
         if complete_steps % 50:
             loss_file.flush()
         accumulated_loss = 0
@@ -512,7 +502,10 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     timers = get_timers()
 
     # Turn on training mode which enables dropout.
-    model.train()
+    if args.debug_eval:
+        model.eval()
+    else:
+        model.train()
 
     # Tracking loss.
     total_loss_dict = {}
@@ -546,12 +539,14 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     step_func = train_step_varuna if args.varuna else train_step
 
     while iteration < args.train_iters:
+        step_time = time.time()
         loss_dict, skipped_iter = step_func(forward_step_func,
                                              train_data_iterator,
                                              model,
                                              optimizer,
                                              lr_scheduler,
                                              iteration)
+        step_time = time.time() - step_time
         skipped_iters += skipped_iter
         iteration += 1
         if iteration % args.gradient_accumulation_steps == 0:
@@ -623,7 +618,8 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
                         loss_dict[key]
     
     # Move model back to the train mode.
-    model.train()
+    if not args.debug_eval():
+        model.train()
 
     if not args.varuna or args.stage == args.partitions - 1:
         for key in total_loss_dict:
@@ -669,45 +665,6 @@ def evaluate_and_print_results(prefix, forward_step_func,
         print(string)
         print('-' * length)
 
-import copy
-def dummy_build_train_valid_test_data_iterators(
-        build_train_valid_test_datasets_provider):
-    """XXX"""
-    args = get_args()
-
-    (train_dataloader, valid_dataloader, test_dataloader) = (None, None, None)
-
-    print_rank_0('> building train, validation, and test datasets ...')
-    # Data loader only on rank 0 of each model parallel group.
-    if (not mpu.model_parallel_is_initialized()) or mpu.get_model_parallel_rank() == 0:
-        # Rank, size, and global batch size.
-        # if args.varuna:
-        #     data_parallel_size = args.data_depth
-        # elif mpu.model_parallel_is_initialized():
-        #     data_parallel_size = mpu.get_data_parallel_world_size()
-        # else:
-        #     data_parallel_size = torch.distributed.get_world_size()
-        global_batch_size = args.batch_size #* data_parallel_size
-
-        # Number of train/valid/test samples.
-        train_iters = 1#args.train_iters
-        eval_iters = 0#(train_iters // args.eval_interval + 1) * args.eval_iters
-        test_iters = 0#args.eval_iters
-        train_val_test_num_samples = [train_iters * global_batch_size,
-                                      eval_iters * global_batch_size,
-                                      test_iters * global_batch_size]
-        # print_rank_0(' > datasets target sizes (minimum size):')
-        # print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
-        # print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
-        # print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
-
-        # Build the datasets.
-        train_ds, valid_ds, test_ds = build_train_valid_test_datasets_provider(
-            train_val_test_num_samples)
-
-        dry_run_input = copy.deepcopy(train_ds[0])
-        del train_ds, valid_ds, test_ds
-        return dry_run_input
 
 def build_train_valid_test_data_iterators(
         build_train_valid_test_datasets_provider):
@@ -811,9 +768,9 @@ def get_eval_numbers(train_valid_test_dataset_provider, model_provider,
 
     print("WS",args.world_size, torch.distributed.get_world_size())
 
-    # shared_weights = [("language_model.embedding.word_embeddings.weight","lm_head_weight")]
+    shared_weights = [("language_model.embedding.word_embeddings.weight","lm_head_weight")]
     model, _opt, _lrs, _pn = setup_model_and_optimizer(model_provider, None)
-    # model = Varuna(model, args.stage_to_rank_map, {}, args.batch_size * args.data_depth, _opt, args.chunk_size, args.fp16, local_rank=args.local_rank, device=args.local_rank, shared_weights=shared_weights)            
+    model = Varuna(model, args.stage_to_rank_map, {}, args.batch_size * args.data_depth, _opt, args.chunk_size, args.fp16, local_rank=args.local_rank, device=args.local_rank, shared_weights=shared_weights)            
 
     ckpt_iters = sorted([int(f.split("_")[-1]) for f in os.listdir(args.load) if "model_ckpt_" in f])
     ckpts = ["model_ckpt_{}".format(i) for i in ckpt_iters]

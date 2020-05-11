@@ -24,6 +24,36 @@ Module = nn.Module
 
 TASK = ["fwd", "rec", "bwd"]
 
+def share_weights(model):
+    baseModule = model.model.module if not model.data_parallel else model.model.module.module
+    rank_within_stage = model.stage_to_rank_map[model.stage].index(model.rank)
+    for i,w in enumerate(model.shared_weights):
+        recv_stage, send_stage = model.shared_weight_stages[i]
+        if recv_stage == send_stage:
+            continue
+        if model.stage == send_stage:
+            recv_rank = model.stage_to_rank_map[recv_stage][rank_within_stage]
+            for n,p in baseModule.named_parameters():
+                if n == w[1]:
+                    send_weight = p
+                    break
+            # print("sending", w[1])
+            dist.send(send_weight.cpu(), recv_rank)
+        elif model.stage == recv_stage:
+            send_rank = model.stage_to_rank_map[send_stage][rank_within_stage]
+            for n,p in baseModule.named_parameters():
+                if n == w[0]:
+                    recv_weight = p
+                    break
+            # print("receiving", w[0])
+            recv_weight = torch.zeros(list(recv_weight.size()),dtype=torch.float16 if model.fp16 else toch.float32)
+            dist.recv(recv_weight, send_rank)
+            attr_names = w[0].split(".")
+            param = baseModule
+            for a in attr_names:
+                param = getattr(param,a)
+            param.data.copy_(recv_weight.data)       
+
 class Varuna(Module):
     """
     model = nn.Sequential(a,b,c,d)
@@ -38,7 +68,6 @@ class Varuna(Module):
                 stage_to_rank_map,
                 dummy_inputs,
                 batch_size,
-                optimizer,
                 chunk_size,
                 fp16 = False, 
                 local_rank=-1,
@@ -63,13 +92,14 @@ class Varuna(Module):
                 i += 1
         if self.stage == -1:
             raise ValueError("Rank " + str(self.rank) + " not found in stage to rank map!")
+        self.data_parallel = data_depth > 1
 
         if device == -1:
             device = self.local_rank
         torch.cuda.set_device(device)
         self.device = torch.device("cuda", device)
 
-        self.optimizer = optimizer
+        self.optimizer = None
         self.fp16 = fp16
         self.shared_weights = shared_weights
 
@@ -115,8 +145,6 @@ class Varuna(Module):
             "dp_process_group": self.process_group, 
             "make_logfile": bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
             "last_chunk_size": self.last_chunk_size,
-            # "embedding_recv_rank": self.embedding_recv_rank,
-            # "embedding_send_rank": self.embedding_send_rank,
             "shared_weights": self.shared_weights,
             "shared_weight_stages": self.shared_weight_stages,
             "stage_to_rank_map": self.stage_to_rank_map,
@@ -127,14 +155,6 @@ class Varuna(Module):
         self.step = 0
 
     def init_communication(self, rank_within_stage):
-        
-        # self.embedding_recv_rank = None
-        # self.embedding_send_rank = None
-        # if self.stage == 0:
-        #     self.embedding_recv_rank = self.stage_to_rank_map[self.partitions-1][rank_within_stage]
-        # if self.stage == self.partitions - 1:
-        #     self.embedding_send_rank = self.stage_to_rank_map[0][rank_within_stage]
-
         self.send_rank = None; self.receive_rank = None
 
         # send ranks
@@ -173,8 +193,10 @@ class Varuna(Module):
             # self.partitioned_model = self.model.module
             self.process_group = process_groups[self.stage]
 
-    def forward(self, inputs):        
-        # torch.cuda.empty_cache()
+    def forward(self, inputs):
+        if self.fp16:
+            assert self.optimizer is not None, "For fp16, you must set the optimizer using set_optimizer()"        
+        
         # Divide a mini-batch into micro-batches.
         batches = scatter(inputs, int(self.batch_size),self.micro_batch_size)
         
@@ -191,7 +213,9 @@ class Varuna(Module):
     def evaluate(self, inputs):
         assert isinstance(inputs, dict), "input must be a dictionary!"
 
-        self.partitioned_model.eval()
+        share_weights(self)
+
+        # self.partitioned_model.eval()
         def send(x, grads=False):
             # print("sending to rank", self.send_rank, x.size())
             dist.send(x.cpu(), self.send_rank)
@@ -234,6 +258,9 @@ class Varuna(Module):
     
     def train(self):
         self.model.train()
+
+    def set_optimizer(self, optimizer):
+        self.optimizer = optimizer
 
     def zero_grad(self):
         self.model.zero_grad()
@@ -355,8 +382,8 @@ class Pipeline:
         
         if self.partitions > 1 and self.shared_weights is not None:
             embed_comm_start = time.time()
-            self.share_weights()
-            torch.cuda.synchronize(self.device)
+            share_weights(self)
+            # torch.cuda.synchronize(self.device)
             embed_comm_time = time.time() - embed_comm_start
             if self.make_logfile:
                 self.logfile.write("{} {} {} {}\n".format("embedcomm", 0, embed_comm_start, embed_comm_time))
@@ -388,34 +415,6 @@ class Pipeline:
         # stores output of recompute(/forward) pass to be used by backward()
         self.loss = None
         self.average_loss = 0
-
-    def share_weights(self):
-        baseModule = self.model.module #if not self.data_parallel else self.model.module.module
-        rank_within_stage = self.stage_to_rank_map[self.stage].index(self.rank)
-        for i,w in enumerate(self.shared_weights):
-            recv_stage, send_stage = self.shared_weight_stages[i]
-            if recv_stage == send_stage:
-                continue
-            if self.stage == send_stage:
-                recv_rank = self.stage_to_rank_map[recv_stage][rank_within_stage]
-                for n,p in baseModule.named_parameters():
-                    if n == w[1]:
-                        send_weight = p
-                        break
-                dist.send(send_weight.cpu(), recv_rank)
-            elif self.stage == recv_stage:
-                send_rank = self.stage_to_rank_map[send_stage][rank_within_stage]
-                for n,p in baseModule.named_parameters():
-                    if n == w[0]:
-                        recv_weight = p
-                        break
-                recv_weight = torch.zeros(list(recv_weight.size()),dtype=torch.float16 if self.fp16 else toch.float32)
-                dist.recv(recv_weight, send_rank)
-                attr_names = w[0].split(".")
-                param = baseModule
-                for a in attr_names:
-                    param = getattr(param,a)
-                param.data.copy_(recv_weight.data)       
 
     def spawn_receive_workers(self):
         if self.stage > 0:
@@ -654,9 +653,6 @@ class Pipeline:
                     task_time_start = time.time()
                     with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=True) as scaled_loss:
                         scaled_loss.backward()
-                        # if lastub:
-                        #     for p in self.optimizer.state:
-                        #         assert p.grad is None,"why is the optimizer getting grads"
                     if self.make_logfile:
                         torch.cuda.synchronize(self.device)
                     task_time = time.time() - task_time_start
@@ -752,16 +748,14 @@ class Pipeline:
             overflow_buf,
             [allreduced_views, master_grads],
             1./scaler.loss_scale())
-        with open("grads-{}".format(dist.get_rank()),"a") as f:
-            f.write(str(master_grads[0]))
+        # with open("grads-{}".format(dist.get_rank()),"a") as f:
+        #     f.write(str(master_grads[0]))
         # 5. update loss scale
         scaler = _amp_state.loss_scalers[0]
 
         # all-reduce to sync overflow
-        print(self.rank, ': before all_reduce: overflow_buf = ', overflow_buf)
         # improve this - should only happen for corresponding dp ranks in each pipeline stream
         torch.distributed.all_reduce(overflow_buf)
-        print(self.rank, ': after all_reduce: overflow_buf = ', overflow_buf)
         if overflow_buf.item()==0:
             overflow_buf = torch.cuda.IntTensor([0])
         else:
