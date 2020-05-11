@@ -165,6 +165,8 @@ def get_model(model_provider_func, dry_run_input=None):
     if args.varuna:
         shared_weights = [("language_model.embedding.word_embeddings.weight","lm_head_weight")]
         model = Varuna(model, args.stage_to_rank_map, dry_run_input, args.batch_size * args.data_depth, args.chunk_size, args.fp16, local_rank=args.local_rank, device=args.local_rank, shared_weights=shared_weights)            
+    if args.local_rank == 0:
+        print('get_model() post varuna init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())            
     
     # Print number of parameters.
     if mpu.model_parallel_is_initialized() and  mpu.get_data_parallel_rank() == 0:
@@ -235,6 +237,8 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
 
     model = get_model(model_provider_func, dry_run_input)
     optimizer = get_optimizer(model)
+    if args.local_rank==0:
+        print('setup_model() post optimizer init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
     lr_scheduler = get_learning_rate_scheduler(optimizer)
 
     basemodel = model
@@ -248,6 +252,8 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
         else:
             basemodel, optimizer = amp.initialize(basemodel, optimizer, opt_level="O2", loss_scale=args.loss_scale, min_loss_scale=args.min_scale)
     
+    if args.local_rank==0:
+        print('setup_model() post amp init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
         if args.varuna:
             if args.data_depth > 1:
                 model.model.module.module = basemodel
@@ -259,6 +265,8 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
 
     # fp32 param names for checkpointing
     optimizer._amp_lazy_init()
+    if args.local_rank==0:
+        print('setup_model() post amp opt init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
     parameter_names_ = dict()
     for n,p in basemodel.named_parameters():
         parameter_names_[p] = n
@@ -272,8 +280,11 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
             parameter_names[p_master] = parameter_names_.pop(p_model)
             count += 1
     print(count, "params found in rank", args.rank)
-
-    
+    # if args.local_rank==0:
+        # print("setup_model() post opt init: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
+        # print('setup_model() post opt int:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
+    # print(args.rank, parameter_names)
+    # '''
 
     # Wrap model for distributed training."""
     if args.DDP_impl == 'torch':
@@ -386,7 +397,13 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
 
     # Update parameters.
     timers('optimizer').start()
+    if args.local_rank==0:
+        # print("setup_model() pre opt step: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
+        print('setup_model() pre opt step:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
     overflow = optimizer.step()
+    if args.local_rank==0:
+        # print("setup_model() post opt step: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
+        print('setup_model() post opt step:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())        
     timers('optimizer').stop()
 
     for param in model.parameters():
@@ -540,7 +557,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             loss_scale = _amp_state.loss_scalers[0].loss_scale()
         report_memory_flag = training_log(loss_dict, total_loss_dict,
                                           optimizer.param_groups[0]['lr'],
-                                          iteration, loss_scale, step_time,
+                                          iteration, loss_scale,
                                           report_memory_flag, loss_file)
 
         # Autoresume
@@ -751,7 +768,7 @@ def get_eval_numbers(train_valid_test_dataset_provider, model_provider,
     print("WS",args.world_size, torch.distributed.get_world_size())
 
     shared_weights = [("language_model.embedding.word_embeddings.weight","lm_head_weight")]
-    model, _opt, _lrs, _pn = setup_model_and_optimizer(model_provider)
+    model, _opt, _lrs, _pn = setup_model_and_optimizer(model_provider, None)
     model = Varuna(model, args.stage_to_rank_map, {}, args.batch_size * args.data_depth, _opt, args.chunk_size, args.fp16, local_rank=args.local_rank, device=args.local_rank, shared_weights=shared_weights)            
 
     ckpt_iters = sorted([int(f.split("_")[-1]) for f in os.listdir(args.load) if "model_ckpt_" in f])

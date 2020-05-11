@@ -7,18 +7,16 @@ WORLD_SIZE=2
 NNODES=$1
 NODE_RANK=$2
 MASTER_ADDR=$3
-ckpt=$4
 
-date
-echo $NNODES $NODE_RANK $MASTER_ADDR $ckpt
+echo $NNODES $NODE_RANK $MASTER_ADDR
 
-DATA_PATH=/home/varuna/bert-large-blob/openwebtext_text_document
-CHECKPOINT_PATH=/home/varuna/bert-large-blob/varuna_gpt2_350m_32k_8x32_cont_morph/
+DATA_PATH=/home/varuna/bert-large-blob/openwebtext-subset_text_document
+CHECKPOINT_PATH=/home/varuna/bert-large-blob/megaperf
 
-python3 run_varuna.py --nstages 8 --batch_size 32768 --chunk_size 10 --total_num_stages 24 --ngpus_per_server 4 --nservers $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR  pretrain_gpt2.py \
-       --num-layers 24 \
-       --hidden-size 1024 \
-       --num-attention-heads 16 \
+python3 run_varuna.py --nstages 48 --batch_size 8096 --chunk_size 2 --total_num_stages 96 --ngpus_per_server 4 --nservers $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR  pretrain_gpt2.py \
+       --num-layers 96 \
+       --hidden-size 4200 \
+       --num-attention-heads 42 \
        --seq-length 1024 \
        --max-position-embeddings 1024 \
        --train-iters 7813 \
@@ -37,13 +35,12 @@ python3 run_varuna.py --nstages 8 --batch_size 32768 --chunk_size 10 --total_num
        --weight-decay 1e-2 \
        --clip-grad 1.0 \
        --warmup .2 \
-       --log-interval 10 \
+       --log-interval 1 \
        --save-interval 15 \
        --max-num-ckpts 3 \
-       --min-ckpt-iter-to-remove 3400 \
-       --eval-interval 300 \
+       --eval-interval 10 \
        --eval-iters 10 \
-       --loss-file varuna_gpt2_350m_32k_cont_morph_fresh \
-       --fp16 --varuna \
-       --load-iteration $ckpt
+       --loss-file testing \
+       --fp16 --varuna
+# num params = 20,753,384,400
 set +x
