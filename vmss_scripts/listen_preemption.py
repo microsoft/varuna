@@ -41,7 +41,7 @@ def main():
     while True:
         data = get_scheduled_events()
         handle_scheduled_events(data, ip, port)
-        time.sleep(8)
+        time.sleep(30)
 
 if __name__ == '__main__':
     main()
