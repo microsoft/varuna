@@ -4,6 +4,6 @@ echo "triggering stop signal"
 i=0
 while [ $i -lt ${#machines[@]} ]
 do
-    ssh -i ~/.ssh/vdummy.pem "varuna@${machines[i]}" "cd t-nisar/Megatron-LM; echo 0 >nservers; kill -10 \$(cat parent_process)"
+    ssh -i ~/.ssh/vdummy.pem "varuna@${machines[i]}" "cd t-nisar/Megatron-LM; echo \"0\" >nservers; kill -10 \$(cat parent_process)"
     i=$(($i+1))
 done

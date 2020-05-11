@@ -268,8 +268,6 @@ class LossScaler(object):
             should_skip = False
 
         if last_microbatch:
-            # print('last microbatch')
-            # '''
             # myedits: for synchronized loss_scaling;  Can be optimized?. Implement boolean all-reduce (reduce_op.ANY)
             tensor_overflow = torch.tensor(self._has_overflow_global, dtype=torch.int8, device='cuda')  # int8 caps number of machines to 256
             torch.distributed.all_reduce(tensor_overflow)
@@ -278,9 +276,9 @@ class LossScaler(object):
             else:
                 self._has_overflow_global = True
             # myedits end
-            # '''
 
-            if self._has_overflow_global: # once. at the end of a mini-batch (last micro-batch)
+            # once. at the end of a mini-batch (last micro-batch)
+            if self._has_overflow_global:
                 print('scaler.py: halving loss scale')
                 if(self._min_loss_scale):
                     self._loss_scale = max(self._min_loss_scale, self._loss_scale/2.)
@@ -290,15 +288,12 @@ class LossScaler(object):
             else:
                 self._unskipped += 1
 
-            # print('self._unskipped = ', self._unskipped, ', self._scale_seq_len = ', self._scale_seq_len)
         
             if self._unskipped == self._scale_seq_len and self.dynamic:
-                print('scaler.py: doubling loss scale')
+                print('scaler.py: doubling loss scale after {} unskipped steps'.format(self._scale_seq_len))
                 self._loss_scale = min(self._max_loss_scale, self._loss_scale*2.)
                 self._unskipped = 0 
 
-            # if should_skip == False:
-            #     should_skip = self._has_overflow_global  
             if self._has_overflow_global and not should_skip:
                 should_skip = True
 
