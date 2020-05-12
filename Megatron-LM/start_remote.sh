@@ -1,5 +1,5 @@
 # machines=($(az vmss nic list --vmss-name megatron --subscription a947bb9f-f570-40a9-82cc-2fdd09f1553a --resource-group Varuna --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
-reachable_machines=($(cat /home/varuna/t-nisar/Megatron-LM/available_machines.out))
+reachable_machines=($(cat /home/varuna/t-nisar/Varuna/Megatron-LM/available_machines.out))
 
 
 reachable_count=${#reachable_machines[@]}
@@ -45,6 +45,6 @@ while [ $i -lt ${#reachable_machines[@]} ]
 do
     map="$i ${reachable_machines[i]}"
     echo $map
-    sudo ssh -o StrictHostKeyChecking=no -i /home/varuna/.ssh/vdummy.pem "varuna@${reachable_machines[i]}" "echo sshed; cd /home/varuna/t-nisar/Megatron-LM ; bash examples/pretrain_gpt2.sh $reachable_count $i $master_addr $ckpt" >> my_ssh_out_${reachable_machines[i]}  2>>my_ssh_err_${reachable_machines[i]} &
+    sudo ssh -o StrictHostKeyChecking=no -i /home/varuna/.ssh/vdummy.pem "varuna@${reachable_machines[i]}" "echo sshed; cd /home/varuna/t-nisar/Varuna/Megatron-LM ; bash examples/pretrain_gpt2.sh $reachable_count $i $master_addr $ckpt" >> my_ssh_out_$i  2>my_ssh_err_$i &
     i=$(($i+1))
 done

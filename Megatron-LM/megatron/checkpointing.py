@@ -149,7 +149,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
             while not (os.path.exists(model_cp_dir) and os.path.exists(opt_cp_dir)):
                 pass
             param_name_to_pstage = model.checkpoint(model_cp_dir)
-            param_name_to_pstage["lm_head_weight"] = args.num_layers - 1
+            param_name_to_pstage["lm_head_weight"] = args.num_layers + 1
             model.checkpoint_optimizer(optimizer, parameter_names, param_name_to_pstage, opt_cp_dir)
             
         # remove old checkpoints
@@ -189,34 +189,34 @@ def parse_last_ckpt_iteration():
     if args.load_iteration != -1:
         return args.load_iteration, False
 
-        # Read the tracker file and set the iteration.
-        tracker_filename = get_checkpoint_tracker_filename(args.load)
+    # Read the tracker file and set the iteration.
+    tracker_filename = get_checkpoint_tracker_filename(args.load)
 
-        # If no tracker file, return iretation zero.
-        if not os.path.isfile(tracker_filename):
-            print_rank_0('WARNING: could not find the metadata file {} '.format(
-                tracker_filename))
-            print_rank_0('    will not load any checkpoints and will start from '
-                        'random')
-            return 0, False
+    # If no tracker file, return iretation zero.
+    if not os.path.isfile(tracker_filename):
+        print_rank_0('WARNING: could not find the metadata file {} '.format(
+            tracker_filename))
+        print_rank_0('    will not load any checkpoints and will start from '
+                    'random')
+        return 0, False
 
-        # Otherwise, read the tracker file and either set the iteration or
-        # mark it as a release checkpoint.
-        iteration = 0
-        release = False
-        with open(tracker_filename, 'r') as f:
-            metastring = f.read().strip()
-            try:
-                iteration = int(metastring)
-            except ValueError:
-                release = metastring == 'release'
-                if not release:
-                    print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
-                        tracker_filename))
-                    sys.exit()
+    # Otherwise, read the tracker file and either set the iteration or
+    # mark it as a release checkpoint.
+    iteration = 0
+    release = False
+    with open(tracker_filename, 'r') as f:
+        metastring = f.read().strip()
+        try:
+            iteration = int(metastring)
+        except ValueError:
+            release = metastring == 'release'
+            if not release:
+                print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
+                    tracker_filename))
+                sys.exit()
 
-        assert iteration > 0 or release, 'error parsing metadata file {}'.format(
-            tracker_filename)
+    assert iteration > 0 or release, 'error parsing metadata file {}'.format(
+        tracker_filename)
 
     return iteration, release
 
@@ -282,7 +282,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
     if args.varuna:
         model_cp_dir = os.path.join(args.load, "model_ckpt_{}".format(iteration))
         print("loading varuna ckpt", iteration)
-        model_state_dict = load_varuna_checkpoint(args.stage, args.partitions, args.num_layers, model_cp_dir)
+        model_state_dict = load_varuna_checkpoint(args.stage, args.partitions, args.num_layers + 2, model_cp_dir)
         model.load_state_dict(model_state_dict, strict = False)
     else:
         model.load_state_dict(state_dict['model'])

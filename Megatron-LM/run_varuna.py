@@ -24,11 +24,18 @@ def calculate_config(args):
     print(gpus_per_stage, "per stage")
     dist_world_size = gpus_per_stage * args.nstages
     assert dist_world_size <= gpus_available, "Too many gpus_per_stage - {}!".format(gpus_per_stage)
-    unused_gpus = (gpus_available - dist_world_size)
 
-    # one whole server is unused
-    if unused_gpus > args.ngpus_per_server:
-        raise ValueError("Wrong number of servers - too many unused GPUs")
+    # some servers unused
+    # if unused_gpus > args.ngpus_per_server:
+    #     raise ValueError("Wrong number of servers - too many unused GPUs")
+    num_servers = math.ceil(dist_world_size / args.ngpus_per_server)
+    if args.node_rank >= num_servers:
+        print(args.node_rank, num_servers, "I am of no use!")
+        exit()
+    args.nservers = num_servers
+    gpus_available = args.nservers * args.ngpus_per_server
+    unused_gpus = args.ngpus_per_server - (dist_world_size % args.ngpus_per_server)
+
 
     stage_to_rank_map = {}
     rank_to_stage_map = {}
@@ -173,15 +180,6 @@ if __name__ == "__main__":
     if args.chunk_size == -1:
         args.chunk_size = max_micro_batch_size_per_gpu
 
-    with open('ngpus', 'w') as f:
-        f.write(str(args.ngpus_per_server))
-    with open('nservers', 'w') as f:
-        f.write(str(args.nservers))
-    with open('nstages', 'w') as f:
-        f.write(str(args.nstages))
-    with open('gpus_per_stage', 'w') as f:
-        f.write(str(args.gpus_per_stage))
-
     def handler(signum,_):
         global loop_pending
         print('Signal handler called with signal', signum, flush=True)
@@ -229,6 +227,16 @@ if __name__ == "__main__":
         loop_pending = False
 
         dist_world_size, stage_to_rank_map_str, ranks_in_server, total_batch_size, gpus_per_stage = calculate_config(args)
+        
+        with open('ngpus', 'w') as f:
+            f.write(str(args.ngpus_per_server))
+        with open('nservers', 'w') as f:
+            f.write(str(args.nservers))
+        with open('nstages', 'w') as f:
+            f.write(str(args.nstages))
+        with open('gpus_per_stage', 'w') as f:
+            f.write(str(args.gpus_per_stage))
+
         current_env["WORLD_SIZE"] = str(dist_world_size)
         print("World size is",dist_world_size)
         
@@ -266,7 +274,7 @@ if __name__ == "__main__":
             #     cmd.append("--resume_step={}".format(resume_step))
 
             cmd.extend(args.training_script_args)
-            print(" ".join(cmd))
+            print(" ".join(cmd), flush=True)
 
             # print(current_env["WORLD_SIZE"], current_env["RANK"], current_env["LOCAL_RANK"])
             process = subprocess.Popen(cmd, env=current_env)
