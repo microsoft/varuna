@@ -763,7 +763,6 @@ class Pipeline:
         # 3. sum gradient across ranks. Because of the predivision, this averages the gradient
         allred_time_start = time.time()
         torch.distributed.all_reduce(flat_raw, group=self.process_group)
-        torch.cuda.synchronize()
         allred_time = time.time() - allred_time_start
         if self.make_logfile:
             self.logfile.write("SYNC! all_reduce {} {} {}\n".format(flat_grad_size,allred_time_start,allred_time))
@@ -778,8 +777,11 @@ class Pipeline:
         scaler = _amp_state.loss_scalers[0]
 
         # all-reduce to sync overflow
-        # improve this - should only happen for corresponding dp ranks in each pipeline stream
+        osync_time_start = time.time()
         torch.distributed.all_reduce(overflow_buf, group=self.pipeline_group)
+        osync_time = time.time() - osync_time_start
+        if self.make_logfile:
+            self.logfile.write("overflow sync {} {}\n".format(osync_time_start,osync_time))
         if overflow_buf.item()==0:
             overflow_buf = torch.cuda.IntTensor([0])
         else:
