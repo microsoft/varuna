@@ -122,14 +122,14 @@ class Varuna(Module):
         self.init_communication(rank_within_stage)
 
         self.model.to(self.device)
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         if self.local_rank==0:
             # print("varuna_init() post model.to: ", self.local_rank, torch.cuda.memory_summary(self.device))
             print('varuna init() post model.to:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
         self.init_distributed()
-        if self.local_rank==0:
-            # print("varuna_init() post ddp init: ", self.local_rank, torch.cuda.memory_summary(self.device))
-            print('varuna init() post ddp init:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
+        # if self.local_rank==0:
+        #     # print("varuna_init() post ddp init: ", self.local_rank, torch.cuda.memory_summary(self.device))
+        #     print('varuna init() post ddp init:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
 
 
         self.config = {
@@ -143,7 +143,8 @@ class Varuna(Module):
             "device": self.device,
             "data_depth": len(self.stage_to_rank_map[self.stage]),
             "dp_process_group": self.process_group, 
-            "make_logfile": bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
+            "pipeline_process_group": self.pipeline_group,
+            "make_logfile": True, # bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
             "last_chunk_size": self.last_chunk_size,
             "shared_weights": self.shared_weights,
             "shared_weight_stages": self.shared_weight_stages,
@@ -207,8 +208,9 @@ class Varuna(Module):
         pipeline_groups = {}
         for stream in range(depth):
             ranks = stream_to_rank_map[stream]
+            # ranks = [stage_to_rank_map[s][stream] for s in range(self.partitions) ]
             if len(ranks) > 1:
-                pipeline_groups[stream] = dist.new_group(ranks=ranks, backend='nccl')
+                pipeline_groups[stream] = dist.new_group(ranks=ranks)
             else:
                 pipeline_groups[stream] = None
             
@@ -381,6 +383,7 @@ class Pipeline:
         self.data_depth = config["data_depth"]
         self.data_parallel = bool(self.data_depth > 1)
         self.process_group = config["dp_process_group"]
+        self.pipeline_group = config["pipeline_process_group"]
 
         self.model = model
         self.partitioned_model = self.model#.module if self.data_parallel else self.model
@@ -610,7 +613,6 @@ class Pipeline:
 
     def worker(self, task, grad_mode, inputs_as_dict):
         """ Main body of worker loop """
-
         if task == 0:       
             torch.set_grad_enabled(grad_mode)
 
@@ -623,8 +625,8 @@ class Pipeline:
             acts = self.set_model_recv_fn(recompute = False)
             task_time_start = time.time()
             output = self.model(**inputs_as_dict)
-            if self.make_logfile:
-                torch.cuda.synchronize(self.device)
+            # if self.make_logfile:
+            #     torch.cuda.synchronize(self.device)
             task_time = time.time() - task_time_start
             if self.make_logfile:
                 self.logfile.write("{} {} {} {}\n".format(TASK[0], 0, str(task_time_start), str(task_time)))
@@ -644,8 +646,8 @@ class Pipeline:
             self.set_model_recv_fn(recompute = True)
             task_time_start = time.time()
             output = self.model(**inputs_as_dict)
-            if self.make_logfile:
-                torch.cuda.synchronize(self.device)
+            # if self.make_logfile:
+            #     torch.cuda.synchronize(self.device)
             task_time = time.time() - task_time_start
             if self.make_logfile:
                self.logfile.write("{} {} {} {}\n".format(TASK[1], 0, str(task_time_start), str(task_time)))
@@ -659,8 +661,8 @@ class Pipeline:
                     # task_time_start = time.time()
                     with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=True, last_partition=False) as scaled_loss:
                         scaled_loss.backward(grads)
-                    if self.make_logfile:
-                        torch.cuda.synchronize(self.device)
+                    # if self.make_logfile:
+                    #     torch.cuda.synchronize(self.device)
                     task_time_start = self.back_start_times.get()
                     task_time = time.time() - task_time_start
                     if self.make_logfile:
@@ -677,8 +679,8 @@ class Pipeline:
                     task_time_start = time.time()
                     with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=True) as scaled_loss:
                         scaled_loss.backward()
-                    if self.make_logfile:
-                        torch.cuda.synchronize(self.device)
+                    # if self.make_logfile:
+                    #     torch.cuda.synchronize(self.device)
                     task_time = time.time() - task_time_start
                     if self.make_logfile:
                         self.logfile.write("{} {} {} {}\n".format(TASK[2], 0, str(task_time_start), str(task_time)))
@@ -717,7 +719,7 @@ class Pipeline:
         if self.fp16 and self.data_parallel:
             sync_time = time.time()
             overflow = self.all_reduce_opt_grads()
-            torch.cuda.synchronize(self.device)
+            # torch.cuda.synchronize(self.device)
             sync_time =  time.time() - sync_time
             if self.make_logfile:
                 self.logfile.write("SYNC! all-reduce time {}".format(sync_time))
@@ -741,18 +743,12 @@ class Pipeline:
 
     def all_reduce_opt_grads(self):
         # 1. allocate an uninitialized buffer for flattened gradient
-        # if self.local_rank==0:
-            # print("all_reduce() start: ", self.local_rank, torch.cuda.memory_summary(self.device))
-            # print('all_reduce() start:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
         scaler = _amp_state.loss_scalers[0]
         master_grads = [p.grad for p in amp.master_params(self.optimizer) if p.grad is not None]
         # print("all_reduce_opt_grads() grad details: ", self.stage, len(master_grads), numpy.array([numpy.array(x.size()).prod() for x in master_grads]).sum())
         flat_grad_size = sum(p.numel() for p in master_grads)
         flat_raw = torch.empty(flat_grad_size, device=self.device, dtype=torch.float32)
-        # print("all_reduce_opt_grads(): flat_raw initialized, memory ", self.device, torch.cuda.max_memory_allocated(self.device))
-        # if self.local_rank==0:
-            # print("all_reduce() flat_raw initialized: ", self.local_rank, torch.cuda.memory_summary(self.device))
-            # print('all_reduce() flat raw initialized:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
+        
         # 2. combine unflattening and predivision of unscaled 'raw' gradient
         allreduced_views = apex_C.unflatten(flat_raw, master_grads)
         overflow_buf = torch.cuda.IntTensor([0]) # not checking for overflow manually
@@ -760,20 +756,21 @@ class Pipeline:
             overflow_buf,
             [master_grads, allreduced_views],
             scaler.loss_scale() / self.data_depth)
+        
         # 3. sum gradient across ranks. Because of the predivision, this averages the gradient
         allred_time_start = time.time()
         torch.distributed.all_reduce(flat_raw, group=self.process_group)
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         allred_time = time.time() - allred_time_start
         if self.make_logfile:
             self.logfile.write("SYNC! all_reduce {} {} {}\n".format(flat_grad_size,allred_time_start,allred_time))
+        
         # 4. combine unscaling and unflattening of allreduced gradient
         amp_C.multi_tensor_scale(65536,
             overflow_buf,
             [allreduced_views, master_grads],
             1./scaler.loss_scale())
-        # with open("grads-{}".format(dist.get_rank()),"a") as f:
-        #     f.write(str(master_grads[0]))
+            
         # 5. update loss scale
         scaler = _amp_state.loss_scalers[0]
 
@@ -788,7 +785,7 @@ class Pipeline:
         old_overflow_buf = scaler._overflow_buf
         scaler._overflow_buf = overflow_buf
         had_overflow = scaler.update_scale()
-        scaler._overfloat_buf = old_overflow_buf
+        scaler._overflow_buf = old_overflow_buf
 
         return had_overflow
 

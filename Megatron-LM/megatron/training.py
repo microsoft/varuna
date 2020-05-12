@@ -406,8 +406,11 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
     # if args.local_rank==0:
         # print("setup_model() pre opt step: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
         # print('setup_model() pre opt step:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
-    if overflow:
+    if not overflow:
         optimizer.step()
+    else:
+        for param in optimizer._amp_stash.all_fp32_from_fp16_params:
+            param.grad = None
     # if args.local_rank==0:
         # print("setup_model() post opt step: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
         # print('setup_model() post opt step:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())        
@@ -471,7 +474,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     if (loss_file is not None) and iteration % args.gradient_accumulation_steps == 0:
         accumulated_loss = accumulated_loss / args.gradient_accumulation_steps
         loss_file.write("{}, {}, {}, {}\n".format(step_time, loss_scale, learning_rate, accumulated_loss))
-        if complete_steps % 10:
+        if complete_steps % 50:
             loss_file.flush()
         accumulated_loss = 0
 
@@ -520,6 +523,8 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     iteration = args.iteration * args.gradient_accumulation_steps
     skipped_iters = 0
     complete_steps = args.iteration
+    if args.varuna:
+        model.step = args.iteration
 
     loss_file = None
     eval_loss_file = None

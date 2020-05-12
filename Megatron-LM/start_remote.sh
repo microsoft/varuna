@@ -45,6 +45,6 @@ while [ $i -lt ${#reachable_machines[@]} ]
 do
     map="$i ${reachable_machines[i]}"
     echo $map
-    sudo ssh -o StrictHostKeyChecking=no -i /home/varuna/.ssh/vdummy.pem "varuna@${reachable_machines[i]}" "echo sshed; cd /home/varuna/t-nisar/Varuna/Megatron-LM ; bash examples/pretrain_gpt2.sh $reachable_count $i $master_addr $ckpt" >> my_ssh_out_$i  2>my_ssh_err_$i &
+    sudo ssh -o StrictHostKeyChecking=no -i /home/varuna/.ssh/vdummy.pem "varuna@${reachable_machines[i]}" "echo sshed; cd /home/varuna/t-nisar/Varuna/Megatron-LM ; bash examples/pretrain_gpt2.sh $reachable_count $i $master_addr $ckpt" >> ssh_logs/my_ssh_out_$i  2>ssh_logs/my_ssh_err_$i &
     i=$(($i+1))
 done
