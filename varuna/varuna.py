@@ -188,10 +188,34 @@ class Varuna(Module):
                 process_groups[stage] = None
 
         if process_groups[self.stage] is not None:
-            # self.partitioned_model = self.model
-            # self.model = torch.nn.parallel.DistributedDataParallel(self.model, process_group=process_groups[self.stage], device_ids=[self.device], find_unused_parameters=True)    
-            # self.partitioned_model = self.model.module
             self.process_group = process_groups[self.stage]
+
+        # get stream to rank map
+        depth = len(self.stage_to_rank_map[self.stage])
+        world_size = depth * self.partitions
+        stream_to_rank_map = {}
+        if depth > 1 and self.partitions > 1:
+            if int(self.stage_to_rank_map[self.stage][1]) - int(self.stage_to_rank_map[self.stage][0]) == 1:    # scattered, if ranks in a stage are consecutive
+                for i in range(depth):
+                    stream_to_rank_map[i] = [ j for j in range(i, world_size, depth)]
+            else:
+                for i in range(0, world_size, self.partitions):
+                    stream_to_rank_map[int(i//self.partitions)] = [j for j in range(i, i+self.partitions)]
+
+        print("stream to rank map = ", stream_to_rank_map)
+        self.pipeline_group = None
+        pipeline_groups = {}
+        for stream in range(depth):
+            ranks = stream_to_rank_map[stream]
+            if len(ranks) > 1:
+                pipeline_groups[stream] = dist.new_group(ranks=ranks, backend='nccl')
+            else:
+                pipeline_groups[stream] = None
+            
+        current_stream = self.stage_to_rank_map[self.stage].index(self.rank)
+        print("this rank ", self.rank, "is part of pipeline stream ", current_stream)
+        if pipeline_groups[current_stream] is not None:
+            self.pipeline_group = pipeline_groups[current_stream]
 
     def forward(self, inputs):
         if self.fp16:
@@ -755,7 +779,7 @@ class Pipeline:
 
         # all-reduce to sync overflow
         # improve this - should only happen for corresponding dp ranks in each pipeline stream
-        torch.distributed.all_reduce(overflow_buf)
+        torch.distributed.all_reduce(overflow_buf, group=self.pipeline_group)
         if overflow_buf.item()==0:
             overflow_buf = torch.cuda.IntTensor([0])
         else:
