@@ -130,11 +130,11 @@ def varuna_step(data_iterator, model):
         "labels": labels
     })
 
-    loss = model(inputs)
+    loss, overflow = model(inputs)
 
     # Reduce loss for logging.
     # reduced_loss = reduce_losses([loss])
-    return loss, {'lm loss': torch.Tensor([loss])}
+    return loss, {'lm loss': torch.Tensor([loss])}, overflow
 
 def cond_forward_step(data_iterator, model):
     args = get_args()
