@@ -366,7 +366,7 @@ class PartitionedModel(Module):
             torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
             for p in temp_param_names:
                 param_name_to_pstage[p] = stage_index
-            # param_name_to_pstage["cls.predictions.bias"] = 23
+            # param_name_to_pstage["lm_head_weight"] = stage_index
             
         print("checkpointed!!")
         return param_name_to_pstage
@@ -470,6 +470,10 @@ def load_varuna_checkpoint(my_stage, num_stages, total_num_pstages, common_store
     stages_per_worker = total_num_pstages // num_stages
     pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
     for i in pstages_to_read:
-        state_dict_ = torch.load(os.path.join(common_store, "cp-pstage-{}".format(i)),map_location="cpu")
+        cp_file = os.path.join(common_store, "cp-pstage-{}".format(i))
+        if not os.path.exists(cp_file):
+            print("WARNING: DID NOT FIND CKPT FILE",cp_file,"!!!!")
+            continue
+        state_dict_ = torch.load(cp_file,map_location="cpu")
         state_dict.update(state_dict_)
     return state_dict

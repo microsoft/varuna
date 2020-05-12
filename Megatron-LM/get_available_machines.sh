@@ -1,4 +1,4 @@
-machines=($(az vmss nic list --vmss-name megatron --subscription a947bb9f-f570-40a9-82cc-2fdd09f1553a --resource-group Varuna --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv | shuf) )
+machines=($(az vmss nic list --vmss-name megatron --subscription a947bb9f-f570-40a9-82cc-2fdd09f1553a --resource-group Varuna --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
 
 reachable_machines=( )
 i=0
@@ -16,8 +16,8 @@ done
 
 # echo "$reachable_count reachable"
 # morphable=$(($reachable_count-2))
-available=$((20 + RANDOM))
-available=$(($available % $reachable_count))
+# available=$((20 + RANDOM))
+# available=$(($available % $reachable_count))
 # echo "$available available"
 i=0
 while [ $i -lt $reachable_count ]

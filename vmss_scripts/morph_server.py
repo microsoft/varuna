@@ -47,9 +47,9 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                 if sleep_time > 0:
                     time.sleep(sleep_time)
                 #get number of machines
-                num_running_nodes = int(open("/home/varuna/t-nisar/Megatron-LM/nservers").read())       
+                num_running_nodes = int(open("/home/varuna/t-nisar/Varuna/Megatron-LM/nservers").read())       
                 print('Trigger morph! {}'.format(num_running_nodes), flush=True)
-                os.system("bash /home/varuna/t-nisar/Megatron-LM/send_signal.sh")       # trigger checkpointing in all node                
+                os.system("bash /home/varuna/t-nisar/Varuna/Megatron-LM/send_signal.sh")       # trigger checkpointing in all node                
             else:
                 print('Morph already triggered!',flush=True)
             self.triggermorph.release()
@@ -67,11 +67,11 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                     time.sleep(120)
                     # double checking that all pretraining processes are killed 
                     # - not clean and should be removed ideally
-                    os.system("bash /home/varuna/t-nisar/Megatron-LM/kill_all.sh")
+                    os.system("bash /home/varuna/t-nisar/Varuna/Megatron-LM/kill_all.sh")
                     # get available machines
-                    os.system("bash /home/varuna/t-nisar/Megatron-LM/get_available_machines.sh > /home/varuna/t-nisar/Megatron-LM/available_machines.out")
+                    os.system("bash /home/varuna/t-nisar/Varuna/Megatron-LM/get_available_machines.sh > /home/varuna/t-nisar/Varuna/Megatron-LM/available_machines.out")
                     # resume model in available machines
-                    os.system("bash /home/varuna/t-nisar/Megatron-LM/start_remote.sh {}".format(last_iter))
+                    os.system("bash /home/varuna/t-nisar/Varuna/Megatron-LM/start_remote.sh {}".format(last_iter))
             self.trackcheckpoints.release()
         elif 'checkpoint failed' in data:
             print('checkpoint failed in ', self.client_address[0])

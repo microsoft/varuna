@@ -25,7 +25,7 @@ Module = nn.Module
 TASK = ["fwd", "rec", "bwd"]
 
 def share_weights(model):
-    baseModule = model.model.module if not model.data_parallel else model.model.module.module
+    baseModule = model.model.module
     rank_within_stage = model.stage_to_rank_map[model.stage].index(model.rank)
     for i,w in enumerate(model.shared_weights):
         recv_stage, send_stage = model.shared_weight_stages[i]
@@ -696,8 +696,8 @@ class Pipeline:
 
         batchstart = time.time()
         for index, task in enumerate(self.schedule):
-            if self.local_rank==0  and (task[1]%200==0 or task[1]<10):
-                print(TASK[task[0]], 'iteration memory at micro-step', task[1], ':', torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
+            # if self.local_rank==0  and (task[1]%200==0 or task[1]<10):
+            #     print(TASK[task[0]], 'iteration memory at micro-step', task[1], ':', torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
             grad_mode = False
             if task[0] == 0:
                 if self.schedule[index+1][0] == 2:      
@@ -741,18 +741,18 @@ class Pipeline:
 
     def all_reduce_opt_grads(self):
         # 1. allocate an uninitialized buffer for flattened gradient
-        if self.local_rank==0:
+        # if self.local_rank==0:
             # print("all_reduce() start: ", self.local_rank, torch.cuda.memory_summary(self.device))
-            print('all_reduce() start:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
+            # print('all_reduce() start:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
         scaler = _amp_state.loss_scalers[0]
         master_grads = [p.grad for p in amp.master_params(self.optimizer) if p.grad is not None]
-        print("all_reduce_opt_grads() grad details: ", self.stage, len(master_grads), numpy.array([numpy.array(x.size()).prod() for x in master_grads]).sum())
+        # print("all_reduce_opt_grads() grad details: ", self.stage, len(master_grads), numpy.array([numpy.array(x.size()).prod() for x in master_grads]).sum())
         flat_grad_size = sum(p.numel() for p in master_grads)
         flat_raw = torch.empty(flat_grad_size, device=self.device, dtype=torch.float32)
         # print("all_reduce_opt_grads(): flat_raw initialized, memory ", self.device, torch.cuda.max_memory_allocated(self.device))
-        if self.local_rank==0:
+        # if self.local_rank==0:
             # print("all_reduce() flat_raw initialized: ", self.local_rank, torch.cuda.memory_summary(self.device))
-            print('all_reduce() flat raw initialized:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
+            # print('all_reduce() flat raw initialized:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
         # 2. combine unflattening and predivision of unscaled 'raw' gradient
         allreduced_views = apex_C.unflatten(flat_raw, master_grads)
         overflow_buf = torch.cuda.IntTensor([0]) # not checking for overflow manually
