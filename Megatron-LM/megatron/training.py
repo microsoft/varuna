@@ -309,13 +309,6 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
         with torch.no_grad():
             basemodel.lm_head_weight.data.copy_(param.data) 
 
-    # named_parameters = dict()
-    # for n,p in model.model.module.named_parameters():
-    #     named_parameters[n] = p
-    # for p in parameter_names:
-    #     name = parameter_names[p]
-    #     diff = torch.sum(p - named_parameters[name])
-    #     print(name, diff, flush = True)
 
     return model, optimizer, lr_scheduler, parameter_names
 

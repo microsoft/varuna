@@ -40,6 +40,8 @@ ckpt=$1
 master_addr=${reachable_machines[0]}
 echo "master_addr: $master_addr"
 
+cd t-nisar/Varuna/Megatron-LM/
+
 i=0
 while [ $i -lt ${#reachable_machines[@]} ]
 do

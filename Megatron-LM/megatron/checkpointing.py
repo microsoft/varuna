@@ -298,7 +298,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
                             if k != 'params':
                                 optimizer.param_groups[i][k] = v
                     opt_cp_dir = os.path.join(args.load, "opt_ckpt_{}".format(iteration))
-                    load_varuna_optimizer(optimizer, args.stage, args.partitions, args.num_layers, parameter_names, opt_cp_dir, args.fp16)
+                    load_varuna_optimizer(optimizer, args.stage, args.partitions, args.num_layers + 2, parameter_names, opt_cp_dir, args.fp16)
                     device = args.local_rank
                     for state in optimizer.state.values():
                         for k, v in state.items():

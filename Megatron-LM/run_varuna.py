@@ -34,8 +34,10 @@ def calculate_config(args):
         exit()
     args.nservers = num_servers
     gpus_available = args.nservers * args.ngpus_per_server
-    unused_gpus = args.ngpus_per_server - (dist_world_size % args.ngpus_per_server)
-
+    if (dist_world_size % args.ngpus_per_server) != 0:
+        unused_gpus = args.ngpus_per_server - (dist_world_size % args.ngpus_per_server)
+    else:
+        unused_gpus = 0
 
     stage_to_rank_map = {}
     rank_to_stage_map = {}

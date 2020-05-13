@@ -194,6 +194,11 @@ class Varuna(Module):
         # get stream to rank map
         depth = len(self.stage_to_rank_map[self.stage])
         world_size = depth * self.partitions
+
+        if depth == 1:
+            self.pipeline_group = None
+            return
+
         stream_to_rank_map = {}
         if depth > 1 and self.partitions > 1:
             if int(self.stage_to_rank_map[self.stage][1]) - int(self.stage_to_rank_map[self.stage][0]) == 1:    # scattered, if ranks in a stage are consecutive
@@ -230,7 +235,7 @@ class Varuna(Module):
         # avoid dataloader compute in machines other than the first
         # ask the model writer to pass the input batch generating dataloader function to Varuna::__init__
         # and Varuna can take care of input dataloader explicitly
-        self.config["make_logfile"] = bool(self.config["make_logfile"] and self.step < 10)
+        self.config["make_logfile"] = bool(self.config["make_logfile"] and self.step < 310)
         pipeline = Pipeline(batches, self.model, self.config, self.schedule, self.optimizer)
         loss, overflow = pipeline.run()
         self.step += 1
@@ -402,8 +407,9 @@ class Pipeline:
 
         self.make_logfile = config["make_logfile"]
         if self.make_logfile:
+            replica_num = self.stage_to_rank_map[self.stage].index(self.rank)
             microBS = self.fwd_inp_shape[0] if self.bwd_grad_shape is None else self.bwd_grad_shape[0]
-            logfilename = "varuna_logs-mBS" + str(microBS) + "-stage" + str(self.stage) + "of" + str(self.partitions)
+            logfilename = "varuna_logs-mBS" + str(microBS) + "-stage" + str(self.stage) + "of" + str(self.partitions) + "_" + str(replica_num)
             self.logfile = open(logfilename,"a")
             self.logfile.write("start time {}\n".format(time.time()))
         
@@ -625,8 +631,8 @@ class Pipeline:
             acts = self.set_model_recv_fn(recompute = False)
             task_time_start = time.time()
             output = self.model(**inputs_as_dict)
-            # if self.make_logfile:
-            #     torch.cuda.synchronize(self.device)
+            if self.make_logfile:
+                torch.cuda.synchronize(self.device)
             task_time = time.time() - task_time_start
             if self.make_logfile:
                 self.logfile.write("{} {} {} {}\n".format(TASK[0], 0, str(task_time_start), str(task_time)))
@@ -646,8 +652,8 @@ class Pipeline:
             self.set_model_recv_fn(recompute = True)
             task_time_start = time.time()
             output = self.model(**inputs_as_dict)
-            # if self.make_logfile:
-            #     torch.cuda.synchronize(self.device)
+            if self.make_logfile:
+                torch.cuda.synchronize(self.device)
             task_time = time.time() - task_time_start
             if self.make_logfile:
                self.logfile.write("{} {} {} {}\n".format(TASK[1], 0, str(task_time_start), str(task_time)))
@@ -661,8 +667,8 @@ class Pipeline:
                     # task_time_start = time.time()
                     with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=True, last_partition=False) as scaled_loss:
                         scaled_loss.backward(grads)
-                    # if self.make_logfile:
-                    #     torch.cuda.synchronize(self.device)
+                    if self.make_logfile:
+                        torch.cuda.synchronize(self.device)
                     task_time_start = self.back_start_times.get()
                     task_time = time.time() - task_time_start
                     if self.make_logfile:
@@ -679,8 +685,8 @@ class Pipeline:
                     task_time_start = time.time()
                     with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=True) as scaled_loss:
                         scaled_loss.backward()
-                    # if self.make_logfile:
-                    #     torch.cuda.synchronize(self.device)
+                    if self.make_logfile:
+                        torch.cuda.synchronize(self.device)
                     task_time = time.time() - task_time_start
                     if self.make_logfile:
                         self.logfile.write("{} {} {} {}\n".format(TASK[2], 0, str(task_time_start), str(task_time)))
