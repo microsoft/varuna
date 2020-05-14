@@ -200,6 +200,7 @@ class Varuna(Module):
             return
 
         stream_to_rank_map = {}
+        '''
         if depth > 1 and self.partitions > 1:
             if int(self.stage_to_rank_map[self.stage][1]) - int(self.stage_to_rank_map[self.stage][0]) == 1:    # scattered, if ranks in a stage are consecutive
                 for i in range(depth):
@@ -207,6 +208,15 @@ class Varuna(Module):
             else:
                 for i in range(0, world_size, self.partitions):
                     stream_to_rank_map[int(i//self.partitions)] = [j for j in range(i, i+self.partitions)]
+        # '''
+
+        # assuming only clustered config for now
+        if depth > 1 and self.partitions > 1:
+            for stream in range(depth):
+                stream_to_rank_map[stream]=[stream]
+        
+                rank1 = int(math.ceil(depth / 4.0)*4) + stream*(self.partitions-1) 
+                stream_to_rank_map[stream].extend( [ j for j in range( rank1,  rank1+self.partitions-1 ) ] )
 
         print("stream to rank map = ", stream_to_rank_map)
         self.pipeline_group = None

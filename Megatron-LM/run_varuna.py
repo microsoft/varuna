@@ -42,8 +42,12 @@ def calculate_config(args):
     stage_to_rank_map = {}
     rank_to_stage_map = {}
 
-    for i in range(args.nstages):
-        stage_to_rank_map[i]= range(i,dist_world_size,args.nstages)
+    stage_to_rank_map[0] = range(0, gpus_per_stage)
+    avail_world_size = int(math.ceil(gpus_per_stage * args.nstages /4.0)*4)
+    for i in range(1, args.nstages):
+        stage_to_rank_map[i]= \
+        range( int(math.ceil(gpus_per_stage / 4.0)*4)-1+i, \
+        avail_world_size, args.nstages-1)
 #    for i in range(0,dist_world_size,gpus_per_stage):
 #        stage_to_rank_map[int(i//gpus_per_stage)] = range(i,i+gpus_per_stage)
     stage_to_rank_map_str = ""
