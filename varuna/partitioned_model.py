@@ -465,12 +465,12 @@ class PassThroughModule(Module):
         return None
 
 
-def load_varuna_checkpoint(my_stage, num_stages, total_num_pstages, common_store):
+def load_varuna_checkpoint(my_stage, num_stages, total_num_pstages, common_store,prefix="cp-pstage"):
     state_dict = {}
     stages_per_worker = total_num_pstages // num_stages
     pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
     for i in pstages_to_read:
-        cp_file = os.path.join(common_store, "cp-pstage-{}".format(i))
+        cp_file = os.path.join(common_store, "{}-{}".format(prefix,i))
         if not os.path.exists(cp_file):
             print("WARNING: DID NOT FIND CKPT FILE",cp_file,"!!!!")
             continue

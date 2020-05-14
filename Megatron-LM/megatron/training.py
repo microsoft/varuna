@@ -29,6 +29,7 @@ from apex.optimizers import FusedLAMB as LAMB
 from megatron import get_args
 from megatron import get_timers
 from megatron import get_tensorboard_writer
+from megatron import get_preempt_signal
 from megatron import mpu
 from megatron import print_rank_0
 from megatron import get_tokenizer
@@ -423,7 +424,7 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
 
 
 def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
-                 loss_scale, step_time, report_memory_flag, loss_file=None):
+                 loss_scale, step_time, total_train_time, report_memory_flag, loss_file=None):
     global accumulated_loss
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -466,7 +467,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     accumulated_loss += lm_loss
     if (loss_file is not None) and iteration % args.gradient_accumulation_steps == 0:
         accumulated_loss = accumulated_loss / args.gradient_accumulation_steps
-        loss_file.write("{}, {}, {}, {}\n".format(step_time, loss_scale, learning_rate, accumulated_loss))
+        loss_file.write("{}, {}, {}, {}, {}\n".format(step_time, total_train_time, loss_scale, learning_rate, accumulated_loss))
         if complete_steps % 50:
             loss_file.flush()
         accumulated_loss = 0
@@ -480,6 +481,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                                                        args.train_iters)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time * 1000.0 / args.log_interval)
+        log_string += 'total train time(s): {:.1f}'.format(total_train_time)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
         for key in total_loss_dict:
             avg = total_loss_dict[key].item() / args.log_interval
@@ -538,9 +540,12 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             loss_file.write("resumed to config {}x{} at step {}\n".format(args.partitions, args.data_depth, args.iteration))
             eval_loss_file = open(eval_loss_filename, "a")
             eval_loss_file.write("resumed\n")
-
+        loss_file.write(str(datetime.now())+ "\n")
+    
     timers('interval time').start()
     report_memory_flag = True
+
+    train_start_time = time.time()
 
     step_func = train_step_varuna if args.varuna else train_step
 
@@ -559,12 +564,13 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             complete_steps += 1
 
         # Logging.
+        total_train_time = time.time() - train_start_time
         loss_scale = None
         if args.fp16:
             loss_scale = _amp_state.loss_scalers[0].loss_scale()
         report_memory_flag = training_log(loss_dict, total_loss_dict,
                                           optimizer.param_groups[0]['lr'],
-                                          iteration, loss_scale, step_time,
+                                          iteration, loss_scale, step_time, total_train_time,
                                           report_memory_flag, loss_file)
 
         # Autoresume
@@ -576,7 +582,10 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         # Checkpointing
         if args.save and args.save_interval and complete_steps > 0 and \
            complete_steps % args.save_interval == 0:
+            ckpt_time = time.time()           
             save_checkpoint(complete_steps, model, optimizer, lr_scheduler, parameter_names)
+            ckpt_time = time.time() - ckpt_time
+            print(args.rank, "ckpt time", ckpt_time)
             
         # Evaluation
         if args.eval_interval and complete_steps > 0 and complete_steps % args.eval_interval == 0 and \
