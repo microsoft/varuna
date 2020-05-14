@@ -200,6 +200,7 @@ class Varuna(Module):
             return
 
         stream_to_rank_map = {}
+        '''
         if depth > 1 and self.partitions > 1:
             if int(self.stage_to_rank_map[self.stage][1]) - int(self.stage_to_rank_map[self.stage][0]) == 1:    # scattered, if ranks in a stage are consecutive
                 for i in range(depth):
@@ -207,6 +208,15 @@ class Varuna(Module):
             else:
                 for i in range(0, world_size, self.partitions):
                     stream_to_rank_map[int(i//self.partitions)] = [j for j in range(i, i+self.partitions)]
+        # '''
+
+        # assuming only clustered config for now
+        if depth > 1 and self.partitions > 1:
+            for stream in range(depth):
+                stream_to_rank_map[stream]=[stream]
+        
+                rank1 = int(math.ceil(depth / 4.0)*4) + stream*(self.partitions-1) 
+                stream_to_rank_map[stream].extend( [ j for j in range( rank1,  rank1+self.partitions-1 ) ] )
 
         print("stream to rank map = ", stream_to_rank_map)
         self.pipeline_group = None
@@ -703,6 +713,7 @@ class Pipeline:
         self.spawn_receive_workers()
 
         batchstart = time.time()
+        '''
         for index, task in enumerate(self.schedule):
             # if self.local_rank==0  and (task[1]%200==0 or task[1]<10):
             #     print(TASK[task[0]], 'iteration memory at micro-step', task[1], ':', torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
@@ -712,8 +723,6 @@ class Pipeline:
                     # if next task in schedule is backward  -- no recomputation
                     grad_mode=True
 
-            # For data parallel, sync only when doing last microbatch fwd/bwd
-            # and for fp16, directly just all reduce optimizer master param grads
             self.worker(task[0], grad_mode, self.batches[task[1]])
 
             # torch.cuda.synchronize(self.device)
@@ -721,6 +730,37 @@ class Pipeline:
             
             # if self.make_logfile:
             #     self.logfile.write("{} {} {} {}\n".format(TASK[task[0]],task[1], str(task_time_start), str(task_time)))
+        '''
+
+        # dynamic schedule - run forward if gradients for backward are not ready yet
+        # '''
+        schedule = [s for s in enumerate(self.schedule)]
+        i=0
+        count_fwd = 0
+        while (i<len(schedule)):
+            grad_mode = False
+            index, task = schedule[i]
+            if (task[0]==1 and count_fwd<len(self.batches) and self.grads_queue.empty()):
+            # if (task[0]==1 and count_fwd<len(self.batches) and not self.acts_queue.empty()):
+                j=i
+                while (j<len(schedule)):
+                    if (schedule[j][1][0]==0):
+                        index, task = schedule[j]
+                        schedule.insert(i, schedule[j])
+                        del schedule[j+1]
+                        break
+                    j+=1
+            if (task[0]==0):
+                count_fwd+=1
+                if (self.schedule[index+1][0]==2):      # if next task in schedule is backward  -- no recomputation
+                    grad_mode=True
+            
+            self.worker(task[0], grad_mode, self.batches[task[1]])
+
+            i+=1
+        # '''
+
+
         
         if self.fp16 and self.data_parallel:
             sync_time = time.time()
