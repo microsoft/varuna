@@ -200,24 +200,12 @@ class Varuna(Module):
             return
 
         stream_to_rank_map = {}
-        '''
-        if depth > 1 and self.partitions > 1:
-            if int(self.stage_to_rank_map[self.stage][1]) - int(self.stage_to_rank_map[self.stage][0]) == 1:    # scattered, if ranks in a stage are consecutive
-                for i in range(depth):
-                    stream_to_rank_map[i] = [ j for j in range(i, world_size, depth)]
-            else:
-                for i in range(0, world_size, self.partitions):
-                    stream_to_rank_map[int(i//self.partitions)] = [j for j in range(i, i+self.partitions)]
-        # '''
-
-        # assuming only clustered config for now
-        if depth > 1 and self.partitions > 1:
-            for stream in range(depth):
-                stream_to_rank_map[stream]=[stream]
+        for i in range(depth):
+            stream = []
+            for stage in range(self.partitions):
+                stream.append(self.stage_to_rank_map[stage][i])
+            stream_to_rank_map[i] = stream
         
-                rank1 = int(math.ceil(depth / 4.0)*4) + stream*(self.partitions-1) 
-                stream_to_rank_map[stream].extend( [ j for j in range( rank1,  rank1+self.partitions-1 ) ] )
-
         print("stream to rank map = ", stream_to_rank_map)
         self.pipeline_group = None
         pipeline_groups = {}
@@ -245,7 +233,7 @@ class Varuna(Module):
         # avoid dataloader compute in machines other than the first
         # ask the model writer to pass the input batch generating dataloader function to Varuna::__init__
         # and Varuna can take care of input dataloader explicitly
-        self.config["make_logfile"] = bool(self.config["make_logfile"] and self.step < 10)
+        self.config["make_logfile"] = bool(self.config["make_logfile"] and self.step < 730)
         pipeline = Pipeline(batches, self.model, self.config, self.schedule, self.optimizer)
         loss, overflow = pipeline.run()
         self.step += 1
@@ -309,7 +297,7 @@ class Varuna(Module):
     def checkpoint(self, cp_dir_name):
         return self.partitioned_model.checkpoint(cp_dir_name)
 
-    def checkpoint_optimizer(self, optimizer, parameter_to_name, param_name_to_pstage, cp_dir_name):
+    def checkpoint_optimizer(self, optimizer, parameter_to_name, param_name_to_pstage, cp_dir_name, tempdir=None):
         cp_time = time.time()
 
         # one worker from each partition
@@ -327,8 +315,15 @@ class Varuna(Module):
                 assert param_name in param_name_to_pstage, "param {} not found in rank {}".format(param_name,dist.get_rank())
                 pstage = param_name_to_pstage[param_name]
                 pstage_state_dicts[pstage][param_name] = optimizer.state[key]
-            for i in pstages:
-                torch.save(pstage_state_dicts[i], os.path.join(cp_dir_name,"opt-state-" + str(i)))
+            
+            if tempdir is not None:
+                for i in pstages:
+                    temp_name =  os.path.join(tempdir,"opt-state-" + str(i))
+                    torch.save(pstage_state_dicts[i], temp_name)
+                    os.system("mv {} {} &".format(temp_name, cp_dir_name))
+            else:
+                for i in pstages:
+                    torch.save(pstage_state_dicts[i], os.path.join(cp_dir_name,"opt-state-" + str(i)))
 
             # also store optimizer master params for mixed precision training
             if self.fp16:
@@ -346,9 +341,16 @@ class Varuna(Module):
                     if pstage not in pstages:
                         continue
                     pstage_state_dicts[pstage][param_name] = p
-                for i in pstages:
-                    torch.save(pstage_state_dicts[i], os.path.join(cp_dir_name,"opt-fp32-params-" + str(i)))
             
+                if tempdir is not None:
+                    for i in pstages:
+                        temp_name =  os.path.join(tempdir,"opt-fp32-params-" + str(i))
+                        torch.save(pstage_state_dicts[i], temp_name)
+                        os.system("mv {} {} &".format(temp_name, cp_dir_name))
+                else:
+                    for i in pstages:
+                        torch.save(pstage_state_dicts[i], os.path.join(cp_dir_name,"opt-fp32-params-" + str(i)))
+
         cp_time = time.time() - cp_time
         print("Opt ckpt time", cp_time)
 
@@ -713,7 +715,7 @@ class Pipeline:
         self.spawn_receive_workers()
 
         batchstart = time.time()
-        '''
+        
         for index, task in enumerate(self.schedule):
             # if self.local_rank==0  and (task[1]%200==0 or task[1]<10):
             #     print(TASK[task[0]], 'iteration memory at micro-step', task[1], ':', torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
@@ -730,10 +732,10 @@ class Pipeline:
             
             # if self.make_logfile:
             #     self.logfile.write("{} {} {} {}\n".format(TASK[task[0]],task[1], str(task_time_start), str(task_time)))
-        '''
+        
 
         # dynamic schedule - run forward if gradients for backward are not ready yet
-        # '''
+        '''
         schedule = [s for s in enumerate(self.schedule)]
         i=0
         count_fwd = 0
@@ -758,7 +760,7 @@ class Pipeline:
             self.worker(task[0], grad_mode, self.batches[task[1]])
 
             i+=1
-        # '''
+        '''
 
 
         

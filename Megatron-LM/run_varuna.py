@@ -28,7 +28,9 @@ def calculate_config(args):
     # some servers unused
     # if unused_gpus > args.ngpus_per_server:
     #     raise ValueError("Wrong number of servers - too many unused GPUs")
-    num_servers = math.ceil(dist_world_size / args.ngpus_per_server)
+    servers_for_embeddings = math.ceil(gpus_per_stage / args.ngpus_per_server)
+    other_servers = math.ceil((dist_world_size - gpus_per_stage) / args.ngpus_per_server)
+    num_servers = other_servers + servers_for_embeddings
     if args.node_rank >= num_servers:
         print(args.node_rank, num_servers, "I am of no use!")
         exit()
@@ -42,12 +44,11 @@ def calculate_config(args):
     stage_to_rank_map = {}
     rank_to_stage_map = {}
 
+    # seperate VMs for embeddings
     stage_to_rank_map[0] = range(0, gpus_per_stage)
-    avail_world_size = int(math.ceil(gpus_per_stage * args.nstages /4.0)*4)
     for i in range(1, args.nstages):
-        stage_to_rank_map[i]= \
-        range( int(math.ceil(gpus_per_stage / 4.0)*4)-1+i, \
-        avail_world_size, args.nstages-1)
+        stage_to_rank_map[i] = \
+            range( gpus_per_stage + i-1, dist_world_size, args.nstages-1)
 #    for i in range(0,dist_world_size,gpus_per_stage):
 #        stage_to_rank_map[int(i//gpus_per_stage)] = range(i,i+gpus_per_stage)
     stage_to_rank_map_str = ""
@@ -76,13 +77,26 @@ def calculate_config(args):
     # # we want to keep the micro BS same
     # args.chunks = args.chunks * gradient_accumulation_steps
 
-    first_rank_in_server = args.node_rank * args.ngpus_per_server
-    if args.node_rank == args.nservers - 1:
-        ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server - unused_gpus)
-    else:
+    last_embedding_node_rank = math.ceil(gpus_per_stage / args.ngpus_per_server) - 1
+    # unused_gpus = (args.nservers - last_embedding_node_rank - 1) * args.ngpus_per_server
+    if args.node_rank == last_embedding_node_rank:
+        first_rank_in_server = args.node_rank * args.ngpus_per_server
+        ranks_in_server = range(first_rank_in_server, first_rank_in_server + (gpus_per_stage % args.ngpus_per_server))
+    elif args.node_rank < last_embedding_node_rank:
+        first_rank_in_server = args.node_rank * args.ngpus_per_server
         ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
+    else:
+        first_rank_in_server = (args.node_rank * args.ngpus_per_server) - (gpus_per_stage % args.ngpus_per_server)
+        ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
+    
+    # first_rank_in_server = args.node_rank * args.ngpus_per_server
+    # if args.node_rank == args.nservers - 1:
+    #     ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server - unused_gpus)
+    # else:
+    #     ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
 
     print("Config:")
+    print("ranks:", ranks_in_server)
     print("train batch size:",args.batch_size)
     print("partitions:", args.nstages)
     print("chunk_size:", args.chunk_size)

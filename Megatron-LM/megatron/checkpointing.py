@@ -99,6 +99,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
     
     if data_parallel_rank == 0:
 
+        tempdir = "/mnt/nitika/varuna_ckpts/"
         checkpoint_name = get_checkpoint_name(args.save, iteration)
         model_cp_dir = os.path.join(args.save, "model_ckpt_{}".format(iteration))
         opt_cp_dir = os.path.join(args.save, "opt_ckpt_{}".format(iteration))
@@ -108,6 +109,9 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
                 os.makedirs(model_cp_dir)
             if not os.path.exists(opt_cp_dir):
                 os.makedirs(opt_cp_dir)
+        if args.local_rank:
+            if not os.path.exists(tempdir):
+                os.makedirs(tempdir)
 
         # Arguments, iteration, and model.
         state_dict = {}
@@ -150,11 +154,11 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
                 pass
             param_name_to_pstage = model.checkpoint(model_cp_dir)
             param_name_to_pstage["lm_head_weight"] = args.num_layers + 1
-            model.checkpoint_optimizer(optimizer, parameter_names, param_name_to_pstage, opt_cp_dir)
+            model.checkpoint_optimizer(optimizer, parameter_names, param_name_to_pstage, opt_cp_dir, tempdir=tempdir)
             
         # remove old checkpoints
         if args.max_num_ckpts is not None and torch.distributed.get_rank() == 0:
-            all_ckpted_iters = sorted([int(f.split("_")[-1]) for f in os.listdir(args.save) if f.startswith("model_ckpt")])
+            all_ckpted_iters = sorted([int(f.split("_")[-1]) for f in os.listdir(args.save) if f.startswith("opt_ckpt")])
             # assert all_ckpted_iters[-1] == iteration, "The latest checkpoint is corrupted?"
             if len(all_ckpted_iters) > args.max_num_ckpts:
                 to_remove = all_ckpted_iters[:-args.max_num_ckpts]
@@ -163,9 +167,9 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
                     if it <= args.min_ckpt_iter_to_remove:
                         continue
                     try:
-                        shutil.rmtree(os.path.join(args.save,"model_ckpt_{}".format(it)))
-                        shutil.rmtree(os.path.join(args.save, "opt_ckpt_{}".format(it)))
-                        shutil.rmtree(os.path.join(args.save,'iter_{:07d}'.format(it)))
+                        os.system("rm -rf {} &".format(os.path.join(args.save,"model_ckpt_{}".format(it))))
+                        os.system("rm -rf {} &".format(os.path.join(args.save, "opt_ckpt_{}".format(it))))
+                        os.system("rm -rf {} &".format(os.path.join(args.save,'iter_{:07d}'.format(it))))
                     except Exception as e:
                         print("Error while removing checkpoint {}: {}".format(it,str(e)))
         print('  successfully saved {}'.format(checkpoint_name))
@@ -282,7 +286,8 @@ def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
     if args.varuna:
         model_cp_dir = os.path.join(args.load, "model_ckpt_{}".format(iteration))
         print("loading varuna ckpt", iteration)
-        model_state_dict = load_varuna_checkpoint(args.stage, args.partitions, args.num_layers + 2, model_cp_dir)
+        opt_cp_dir = os.path.join(args.load, "opt_ckpt_{}".format(iteration))
+        model_state_dict = load_varuna_checkpoint(args.stage, args.partitions, args.num_layers + 2, opt_cp_dir, prefix="opt-fp32-params")
         model.load_state_dict(model_state_dict, strict = False)
     else:
         model.load_state_dict(state_dict['model'])

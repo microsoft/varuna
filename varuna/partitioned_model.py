@@ -341,7 +341,7 @@ class PartitionedModel(Module):
                 continue
             if isinstance(module, CutPoint):
                 if len(state_dict.keys()) > 0:
-                    torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
+                    # torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
                     for p in temp_param_names:
                         param_name_to_pstage[p] = stage_index
                     temp_param_names = []
@@ -363,7 +363,7 @@ class PartitionedModel(Module):
         # last cutpoint
         if len(state_dict.keys()) > 0 and (cp_count < self.cuts_per_stage):
             state_dict["lm_head_weight"] = self.module.lm_head_weight
-            torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
+            # torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
             for p in temp_param_names:
                 param_name_to_pstage[p] = stage_index
             # param_name_to_pstage["lm_head_weight"] = stage_index
