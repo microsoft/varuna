@@ -29,7 +29,6 @@ from apex.optimizers import FusedLAMB as LAMB
 from megatron import get_args
 from megatron import get_timers
 from megatron import get_tensorboard_writer
-from megatron import get_preempt_signal
 from megatron import mpu
 from megatron import print_rank_0
 from megatron import get_tokenizer
