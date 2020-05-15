@@ -604,6 +604,7 @@ class Pipeline:
     def set_model_recv_fn(self, recompute = False):
         if recompute:
             ctx, acts = self.recompute_queue.get()
+            acts = acts.to(self.device)
             restore_rng_states(ctx, self.device)
 
         else:
@@ -652,6 +653,7 @@ class Pipeline:
                 self.logfile.write("{} {} {} {}\n".format(TASK[0], 0, str(task_time_start), str(task_time)))
 
             if grad_mode == False:
+                acts = acts.cpu()
                 ctx = (rng_states, acts)
                 self.recompute_queue.put(ctx)
             else:
