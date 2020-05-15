@@ -10,10 +10,12 @@ training_output
 train_reports
 ssh_out*
 parent_process
+gantt_logs/
 args
 ssh_err*
+morph.*
 available_machines.out
-setup_remote.sh
+Megatron-LM/setup_remote.sh
 varuna
 # Byte-compiled / optimized / DLL files
 *__pycache__/
