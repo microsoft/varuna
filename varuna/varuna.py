@@ -506,11 +506,11 @@ class Pipeline:
                 if recv_handles.qsize()>4:
                     handle, tensor = recv_handles.get()
                     handle.wait()
-                    self.acts_queue.put(tensor.to(self.device))
+                    self.acts_queue.put(tensor)
         while not recv_handles.empty():
             handle, tensor = recv_handles.get()
             handle.wait()
-            self.acts_queue.put(tensor.to(self.device))
+            self.acts_queue.put(tensor)
         del acts_tensor
     
     def grads_receiver(self):
@@ -530,11 +530,11 @@ class Pipeline:
                 if recv_handles.qsize()>4:
                     handle, tensor = recv_handles.get()
                     handle.wait()
-                    self.grads_queue.put(tensor.to(self.device))
+                    self.grads_queue.put(tensor)
         while not recv_handles.empty():
             handle, tensor = recv_handles.get()
             handle.wait()
-            self.grads_queue.put(tensor.to(self.device))
+            self.grads_queue.put(tensor)
         del grads_tensor
 
     def acts_sender(self):
@@ -604,11 +604,13 @@ class Pipeline:
     def set_model_recv_fn(self, recompute = False):
         if recompute:
             ctx, acts = self.recompute_queue.get()
+            acts = acts.to(self.device)
             restore_rng_states(ctx, self.device)
 
         else:
             recv_time_start = time.time()
             acts = self.acts_queue.get() if self.stage > 0 else None
+            acts = acts.to(self.device)
             recv_time = time.time() - recv_time_start
             if self.make_logfile:
                 self.logfile.write("{} {} {} {}\n".format("recvacts", 0, recv_time_start, recv_time))
@@ -617,6 +619,7 @@ class Pipeline:
             if grads:
                 recv_time_start = time.time()
                 g = self.grads_queue.get()
+                g = g.to(self.device)
                 recv_time = time.time() - recv_time_start
                 if self.make_logfile:   
                     self.logfile.write("{} {} {} {}\n".format("recvgrads", 0, recv_time_start, recv_time))
@@ -650,6 +653,7 @@ class Pipeline:
                 self.logfile.write("{} {} {} {}\n".format(TASK[0], 0, str(task_time_start), str(task_time)))
 
             if grad_mode == False:
+                acts = acts.cpu()
                 ctx = (rng_states, acts)
                 self.recompute_queue.put(ctx)
             else:
@@ -715,7 +719,7 @@ class Pipeline:
         self.spawn_receive_workers()
 
         batchstart = time.time()
-        
+        '''
         for index, task in enumerate(self.schedule):
             # if self.local_rank==0  and (task[1]%200==0 or task[1]<10):
             #     print(TASK[task[0]], 'iteration memory at micro-step', task[1], ':', torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
@@ -732,10 +736,10 @@ class Pipeline:
             
             # if self.make_logfile:
             #     self.logfile.write("{} {} {} {}\n".format(TASK[task[0]],task[1], str(task_time_start), str(task_time)))
-        
+        # '''
 
         # dynamic schedule - run forward if gradients for backward are not ready yet
-        '''
+        # '''
         schedule = [s for s in enumerate(self.schedule)]
         i=0
         count_fwd = 0
@@ -760,7 +764,7 @@ class Pipeline:
             self.worker(task[0], grad_mode, self.batches[task[1]])
 
             i+=1
-        '''
+        # '''
 
 
         
