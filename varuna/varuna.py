@@ -604,11 +604,14 @@ class Pipeline:
     def set_model_recv_fn(self, recompute = False):
         if recompute:
             ctx, acts = self.recompute_queue.get()
+            if self.stage > 0:
+                acts = acts.to(self.device)
             restore_rng_states(ctx, self.device)
 
         else:
             recv_time_start = time.time()
             acts = self.acts_queue.get() if self.stage > 0 else None
+            acts = acts.to(self.device) if self.stage > 0 else None
             recv_time = time.time() - recv_time_start
             if self.make_logfile:
                 self.logfile.write("{} {} {} {}\n".format("recvacts", 0, recv_time_start, recv_time))
@@ -650,6 +653,8 @@ class Pipeline:
                 self.logfile.write("{} {} {} {}\n".format(TASK[0], 0, str(task_time_start), str(task_time)))
 
             if grad_mode == False:
+                if self.stage > 0:
+                    acts = acts.cpu()
                 ctx = (rng_states, acts)
                 self.recompute_queue.put(ctx)
             else:
