@@ -81,7 +81,7 @@ def calculate_config(args):
     # unused_gpus = (args.nservers - last_embedding_node_rank - 1) * args.ngpus_per_server
     if args.node_rank == last_embedding_node_rank:
         first_rank_in_server = args.node_rank * args.ngpus_per_server
-        ranks_in_server = range(first_rank_in_server, first_rank_in_server + (gpus_per_stage % args.ngpus_per_server))
+        ranks_in_server = range(first_rank_in_server, first_rank_in_server + (args.ngpus_per_server - (gpus_per_stage % args.ngpus_per_server)))
     elif args.node_rank < last_embedding_node_rank:
         first_rank_in_server = args.node_rank * args.ngpus_per_server
         ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
