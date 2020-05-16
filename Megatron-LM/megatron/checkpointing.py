@@ -27,6 +27,8 @@ from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from megatron import mpu
 from megatron import get_args
 from megatron import print_rank_0
+import concurrent.futures
+
 
 from varuna import load_varuna_checkpoint, load_varuna_optimizer
 
@@ -148,13 +150,14 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
                 format(torch.distributed.get_rank(), iteration, checkpoint_name))
             torch.save(state_dict, checkpoint_name)
 
+        mv_futures = None
         if args.varuna:
             assert parameter_names is not None, "No parameter names given!"
             while not (os.path.exists(model_cp_dir) and os.path.exists(opt_cp_dir)):
                 pass
             param_name_to_pstage = model.checkpoint(model_cp_dir)
             param_name_to_pstage["lm_head_weight"] = args.num_layers + 1
-            model.checkpoint_optimizer(optimizer, parameter_names, param_name_to_pstage, opt_cp_dir, tempdir=tempdir)
+            mv_futures = model.checkpoint_optimizer(optimizer, parameter_names, param_name_to_pstage, opt_cp_dir, tempdir=None)
             
         # remove old checkpoints
         if args.max_num_ckpts is not None and torch.distributed.get_rank() == 0:
@@ -173,6 +176,16 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
                     except Exception as e:
                         print("Error while removing checkpoint {}: {}".format(it,str(e)))
         print('  successfully saved {}'.format(checkpoint_name))
+
+    if mv_futures is not None and len(mv_futures) > 0:
+        done, notdone = concurrent.futures.wait(mv_futures)
+        if len(notdone) > 0:
+            print("{} ckpts not moved\n".format(notdone))
+        for future in done:
+            try:
+                data = future.result()
+            except Exception as exc:
+                print('future generated an exception: %s' % ( exc))
 
     # Wait so everyone is done (necessary)
     torch.distributed.barrier()

@@ -26,20 +26,18 @@ def calculate_config(args):
     assert dist_world_size <= gpus_available, "Too many gpus_per_stage - {}!".format(gpus_per_stage)
 
     # some servers unused
-    # if unused_gpus > args.ngpus_per_server:
-    #     raise ValueError("Wrong number of servers - too many unused GPUs")
-    servers_for_embeddings = math.ceil(gpus_per_stage / args.ngpus_per_server)
-    other_servers = math.ceil((dist_world_size - gpus_per_stage) / args.ngpus_per_server)
+    servers_for_embeddings = math.ceil(gpus_per_stage / float(args.ngpus_per_server))
+    other_servers = math.ceil((dist_world_size - gpus_per_stage) / float(args.ngpus_per_server))
     num_servers = other_servers + servers_for_embeddings
     if args.node_rank >= num_servers:
         print(args.node_rank, num_servers, "I am of no use!")
         exit()
     args.nservers = num_servers
     gpus_available = args.nservers * args.ngpus_per_server
-    if (dist_world_size % args.ngpus_per_server) != 0:
-        unused_gpus = args.ngpus_per_server - (dist_world_size % args.ngpus_per_server)
-    else:
-        unused_gpus = 0
+
+    last_unused_gpus = 0
+    if ((dist_world_size - gpus_per_stage) % args.ngpus_per_server) != 0:
+        last_unused_gpus = args.ngpus_per_server - ((dist_world_size - gpus_per_stage) % args.ngpus_per_server)
 
     stage_to_rank_map = {}
     rank_to_stage_map = {}
@@ -49,8 +47,10 @@ def calculate_config(args):
     for i in range(1, args.nstages):
         stage_to_rank_map[i] = \
             range( gpus_per_stage + i-1, dist_world_size, args.nstages-1)
+
 #    for i in range(0,dist_world_size,gpus_per_stage):
 #        stage_to_rank_map[int(i//gpus_per_stage)] = range(i,i+gpus_per_stage)
+    
     stage_to_rank_map_str = ""
     for stage in stage_to_rank_map:
         ranks = ",".join([str(r) for r in stage_to_rank_map[stage]])
@@ -58,42 +58,22 @@ def calculate_config(args):
 
     # # batch size should be divisible by num of data parallel workers
     per_gpu_batch_size = args.batch_size // gpus_per_stage
-    total_batch_size = per_gpu_batch_size * gpus_per_stage
-    # train_batch_size = args.batch_size
-    
-    # per_gpu_micro_batch_size = math.ceil(per_gpu_batch_size / (1.0 * args.chunks))
-    # gradient_accumulation_steps = 1
-    # max_gradient_accumulation_steps = per_gpu_micro_batch_size // max_micro_batch_size_per_gpu
-
-    # # shouldn't ceil(max_grad_acc_steps) just be the actual one we use??
-    # while per_gpu_micro_batch_size > max_micro_batch_size_per_gpu and gradient_accumulation_steps <= max_gradient_accumulation_steps :
-    #     gradient_accumulation_steps += 1
-    #     per_gpu_micro_batch_size_ = per_gpu_micro_batch_size // gradient_accumulation_steps 
-    #     if per_gpu_micro_batch_size_ <= max_micro_batch_size_per_gpu:
-    #         per_gpu_micro_batch_size = per_gpu_micro_batch_size_
-    #         break
-
-    # # for pipelining, we don't really need gradient accumalation steps - just increase the number of chunks
-    # # we want to keep the micro BS same
-    # args.chunks = args.chunks * gradient_accumulation_steps
+    total_batch_size = per_gpu_batch_size * gpus_per_stage     
 
     last_embedding_node_rank = math.ceil(gpus_per_stage / args.ngpus_per_server) - 1
     # unused_gpus = (args.nservers - last_embedding_node_rank - 1) * args.ngpus_per_server
     if args.node_rank == last_embedding_node_rank:
         first_rank_in_server = args.node_rank * args.ngpus_per_server
-        ranks_in_server = range(first_rank_in_server, first_rank_in_server + (args.ngpus_per_server - (gpus_per_stage % args.ngpus_per_server)))
+        ranks_in_server = range(first_rank_in_server, gpus_per_stage)
     elif args.node_rank < last_embedding_node_rank:
         first_rank_in_server = args.node_rank * args.ngpus_per_server
         ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
-    else:
+    elif args.node_rank < (args.nservers - 1):
         first_rank_in_server = (args.node_rank * args.ngpus_per_server) - (gpus_per_stage % args.ngpus_per_server)
         ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
-    
-    # first_rank_in_server = args.node_rank * args.ngpus_per_server
-    # if args.node_rank == args.nservers - 1:
-    #     ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server - unused_gpus)
-    # else:
-    #     ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
+    else:
+        first_rank_in_server = (args.node_rank * args.ngpus_per_server) - (gpus_per_stage % args.ngpus_per_server)
+        ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server - last_unused_gpus)
 
     print("Config:")
     print("ranks:", ranks_in_server)
@@ -105,7 +85,6 @@ def calculate_config(args):
 
     return dist_world_size, stage_to_rank_map_str, ranks_in_server, total_batch_size, gpus_per_stage
     
-
 
 def parse_args():
     """
@@ -174,32 +153,6 @@ if __name__ == "__main__":
 
     args = parse_args()
 
-    # max_micro_batch_size_per_gpu = -1
-    # cutpoints_per_stage = args.total_num_stages // args.nstages
-    # with open(args.profile, 'r') as f:
-    #     # skip line with column names
-    #     f.readline()
-    #     for line in f:
-    #         if line == "":
-    #             continue
-    #         batch_size, _f, _b, max_mem_usage, _i , _m, _acts_size, _ = line.split(",")
-    #         # profile is for single stage, so scale acc
-    #         max_mem_usage = int(max_mem_usage) * cutpoints_per_stage
-    #         batch_size = int(batch_size)
-    #         if max_mem_usage > MAX_GPU_MEM:
-    #             break
-    #         else:
-    #             max_micro_batch_size_per_gpu = batch_size
-
-    # print("max_micro_batch_size_per_gpu:",max_micro_batch_size_per_gpu)
-
-    # if max_micro_batch_size_per_gpu <= 0:
-    #     raise ValueError("No micro-batch can fit for the model! Calculated max micro BS per gpu is " + str(max_micro_batch_size_per_gpu))
-
-    # for max GPU util
-    if args.chunk_size == -1:
-        args.chunk_size = max_micro_batch_size_per_gpu
-
     def handler(signum,_):
         global loop_pending
         print('Signal handler called with signal', signum, flush=True)
@@ -220,8 +173,12 @@ if __name__ == "__main__":
         args.nservers = nservers
         args.gpus_per_stage = gpus_per_stage
         args.nstages = nstages
-        for p in processes:
-            p.send_signal(signal.SIGUSR1)
+        try:
+            for p in processes:
+                p.send_signal(signal.SIGUSR1)
+        except Exception as e:
+            print("run_varuna: error while sending signal:- ", e)
+            
         print("\n\n CONFIG CHANGED TO ",args.nservers, "x",args.ngpus_per_server,"!!\n\n\n", flush=True)
 
     signal.signal(signal.SIGUSR1, handler)

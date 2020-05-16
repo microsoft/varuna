@@ -10,6 +10,7 @@ MASTER_ADDR=$3
 ckpt=$4
 
 echo $NNODES $NODE_RANK $MASTER_ADDR $ckpt
+date
 
 DATA_PATH=/home/varuna/bert-large-blob/openwebtext_text_document
 CHECKPOINT_PATH=/home/varuna/bert-large-blob/varuna_20b_8k_1.25e-3
@@ -39,7 +40,7 @@ NCCL_SOCKET_IFNAME=eth0 NCCL_SOCKET_NTHREADS=4 NCCL_NSOCKS_PERTHREAD=4 python3 r
        --log-interval 1 \
        --save-interval 15 \
        --max-num-ckpts 3 \
-       --min-ckpt-iter-to-remove 375 \
+       --min-ckpt-iter-to-remove 1410 \
        --load-iteration $ckpt \
        --eval-interval 100 \
        --eval-iters 10 \

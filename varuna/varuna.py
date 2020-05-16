@@ -10,6 +10,8 @@ from apex import amp
 import time
 from apex.amp import _amp_state
 import amp_C, apex_C
+import concurrent.futures
+import shutil
 
 from .partitioned_model import PartitionedModel
 import gc
@@ -102,6 +104,9 @@ class Varuna(Module):
         self.optimizer = None
         self.fp16 = fp16
         self.shared_weights = shared_weights
+
+        if self.data_parallel and not self.fp16:
+            raise RuntimeError("Data parallel for fp32 is currently broken")
 
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
         self.model = PartitionedModel(model, self.rank, self.local_rank, device, self.stage_to_rank_map, self.fp16, shared_weights)
@@ -233,7 +238,7 @@ class Varuna(Module):
         # avoid dataloader compute in machines other than the first
         # ask the model writer to pass the input batch generating dataloader function to Varuna::__init__
         # and Varuna can take care of input dataloader explicitly
-        self.config["make_logfile"] = bool(self.config["make_logfile"] and self.step < 730)
+        self.config["make_logfile"] = bool(self.config["make_logfile"] and self.step < 10)
         pipeline = Pipeline(batches, self.model, self.config, self.schedule, self.optimizer)
         loss, overflow = pipeline.run()
         self.step += 1
@@ -299,6 +304,9 @@ class Varuna(Module):
 
     def checkpoint_optimizer(self, optimizer, parameter_to_name, param_name_to_pstage, cp_dir_name, tempdir=None):
         cp_time = time.time()
+        mv_futures = []
+        if tempdir is not None:
+            executor = concurrent.futures.ThreadPoolExecutor()
 
         # one worker from each partition
         if self.rank == self.stage_to_rank_map[self.stage][0]:
@@ -319,8 +327,9 @@ class Varuna(Module):
             if tempdir is not None:
                 for i in pstages:
                     temp_name =  os.path.join(tempdir,"opt-state-" + str(i))
+                    cp_name = os.path.join(cp_dir_name,"opt-state-" + str(i))
                     torch.save(pstage_state_dicts[i], temp_name)
-                    os.system("mv {} {} &".format(temp_name, cp_dir_name))
+                    mv_futures.append(executor.submit(shutil.move, temp_name, cp_name))
             else:
                 for i in pstages:
                     torch.save(pstage_state_dicts[i], os.path.join(cp_dir_name,"opt-state-" + str(i)))
@@ -345,14 +354,16 @@ class Varuna(Module):
                 if tempdir is not None:
                     for i in pstages:
                         temp_name =  os.path.join(tempdir,"opt-fp32-params-" + str(i))
+                        cp_name = os.path.join(cp_dir_name,"opt-fp32-params-" + str(i))
                         torch.save(pstage_state_dicts[i], temp_name)
-                        os.system("mv {} {} &".format(temp_name, cp_dir_name))
+                        mv_futures.append(executor.submit(shutil.move, temp_name, cp_name))
                 else:
                     for i in pstages:
                         torch.save(pstage_state_dicts[i], os.path.join(cp_dir_name,"opt-fp32-params-" + str(i)))
 
         cp_time = time.time() - cp_time
         print("Opt ckpt time", cp_time)
+        return mv_futures
 
     
     def to(self, device):
@@ -428,9 +439,9 @@ class Pipeline:
         if self.partitions > 1 and self.shared_weights is not None:
             embed_comm_start = time.time()
             share_weights(self)
-            # torch.cuda.synchronize(self.device)
-            embed_comm_time = time.time() - embed_comm_start
             if self.make_logfile:
+                torch.cuda.synchronize(self.device)
+                embed_comm_time = time.time() - embed_comm_start
                 self.logfile.write("{} {} {} {}\n".format("embedcomm", 0, embed_comm_start, embed_comm_time))
 
 
@@ -646,8 +657,8 @@ class Pipeline:
             acts = self.set_model_recv_fn(recompute = False)
             task_time_start = time.time()
             output = self.model(**inputs_as_dict)
-            # if self.make_logfile:
-            #     torch.cuda.synchronize(self.device)
+            if self.make_logfile:
+                torch.cuda.synchronize(self.device)
             task_time = time.time() - task_time_start
             if self.make_logfile:
                 self.logfile.write("{} {} {} {}\n".format(TASK[0], 0, str(task_time_start), str(task_time)))
@@ -669,8 +680,8 @@ class Pipeline:
             self.set_model_recv_fn(recompute = True)
             task_time_start = time.time()
             output = self.model(**inputs_as_dict)
-            # if self.make_logfile:
-            #     torch.cuda.synchronize(self.device)
+            if self.make_logfile:
+                torch.cuda.synchronize(self.device)
             task_time = time.time() - task_time_start
             if self.make_logfile:
                self.logfile.write("{} {} {} {}\n".format(TASK[1], 0, str(task_time_start), str(task_time)))
@@ -684,8 +695,8 @@ class Pipeline:
                     # task_time_start = time.time()
                     with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=True, last_partition=False) as scaled_loss:
                         scaled_loss.backward(grads)
-                    # if self.make_logfile:
-                    #     torch.cuda.synchronize(self.device)
+                    if self.make_logfile:
+                        torch.cuda.synchronize(self.device)
                     task_time_start = self.back_start_times.get()
                     task_time = time.time() - task_time_start
                     if self.make_logfile:
@@ -702,8 +713,8 @@ class Pipeline:
                     task_time_start = time.time()
                     with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=True) as scaled_loss:
                         scaled_loss.backward()
-                    # if self.make_logfile:
-                    #     torch.cuda.synchronize(self.device)
+                    if self.make_logfile:
+                        torch.cuda.synchronize(self.device)
                     task_time = time.time() - task_time_start
                     if self.make_logfile:
                         self.logfile.write("{} {} {} {}\n".format(TASK[2], 0, str(task_time_start), str(task_time)))
@@ -737,10 +748,9 @@ class Pipeline:
             
             # if self.make_logfile:
             #     self.logfile.write("{} {} {} {}\n".format(TASK[task[0]],task[1], str(task_time_start), str(task_time)))
-        
+        '''        
 
         # dynamic schedule - run forward if gradients for backward are not ready yet
-        '''
         schedule = [s for s in enumerate(self.schedule)]
         i=0
         count_fwd = 0
@@ -766,15 +776,13 @@ class Pipeline:
 
             i+=1
         '''
-
-
         
         if self.fp16 and self.data_parallel:
             sync_time = time.time()
             overflow = self.all_reduce_opt_grads()
-            # torch.cuda.synchronize(self.device)
-            sync_time =  time.time() - sync_time
             if self.make_logfile:
+                torch.cuda.synchronize(self.device)
+                sync_time =  time.time() - sync_time
                 self.logfile.write("SYNC! all-reduce time {}".format(sync_time))
 
         batchtime = time.time()-batchstart

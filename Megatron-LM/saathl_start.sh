@@ -1,6 +1,6 @@
 # machines=($(az vmss nic list --vmss-name megatron --subscription a947bb9f-f570-40a9-82cc-2fdd09f1553a --resource-group Varuna --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
 reachable_machines=($(cat /home/varuna/t-nisar/Varuna/Megatron-LM/available_machines.out))
-
+reachable_machines=( "${reachable_machines[@]:0:74}" )
 
 reachable_count=${#reachable_machines[@]}
 echo $reachable_count > nservers
@@ -16,7 +16,7 @@ ckpt=$1
 master_addr=${reachable_machines[0]}
 echo "master_addr: $master_addr"
 
-cd /home/varuna/t-nisar/Varuna/Megatron-LM/
+cd ~/t-nisar/Varuna/Megatron-LM/
 
 i=0
 while [ $i -lt ${#reachable_machines[@]} ]
