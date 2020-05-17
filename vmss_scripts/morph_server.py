@@ -61,11 +61,12 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                     # resume model in available machines
                     os.system("bash /home/varuna/t-nisar/Varuna/Megatron-LM/start_remote.sh {}".format(last_iter))
                 else:
-                    last_iter = int(str(data).split(" ")[-1])
-                    os.system("bash /home/varuna/t-nisar/Varuna/Megatron-LM/kill_all.sh")
-                    os.system("bash /home/varuna/t-nisar/Varuna/Megatron-LM/get_available_machines.sh > /home/varuna/t-nisar/Varuna/Megatron-LM/available_machines.out")
-                    os.system("bash /home/varuna/t-nisar/Varuna/Megatron-LM/start_remote.sh {}".format(last_iter))
-                    os.system('(echo "Subject: Job stopped"; echo "the job has stopped :/") | ssmtp -F "Varuna" nitika.saran@gmail.com')
+                #     last_iter = int(str(data).split(" ")[-1])
+                #     os.system("bash /home/varuna/t-nisar/Varuna/Megatron-LM/kill_all.sh")
+                #     os.system("bash /home/varuna/t-nisar/Varuna/Megatron-LM/get_available_machines.sh > /home/varuna/t-nisar/Varuna/Megatron-LM/available_machines.out")
+                #     os.system("bash /home/varuna/t-nisar/Varuna/Megatron-LM/start_remote.sh {}".format(last_iter))
+                    os.system('(echo "Subject: Job stopped"; echo "the job has stopped :/") | ssmtp -F "Varuna" "nitika.saran@gmail.com, t-saathl@microsoft.com"')
+                    time.sleep(120)
                 checkpointed = 0
             self.trackcheckpoints.release()
         elif 'checkpoint failed' in data:

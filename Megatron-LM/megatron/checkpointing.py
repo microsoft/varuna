@@ -99,6 +99,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
     else:
         data_parallel_rank = torch.distributed.get_rank()
     
+    mv_futures = None
     if data_parallel_rank == 0:
 
         tempdir = "/mnt/nitika/varuna_ckpts/"
@@ -150,7 +151,6 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
                 format(torch.distributed.get_rank(), iteration, checkpoint_name))
             torch.save(state_dict, checkpoint_name)
 
-        mv_futures = None
         if args.varuna:
             assert parameter_names is not None, "No parameter names given!"
             while not (os.path.exists(model_cp_dir) and os.path.exists(opt_cp_dir)):

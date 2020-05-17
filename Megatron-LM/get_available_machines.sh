@@ -1,4 +1,5 @@
-machines=($(az vmss nic list --vmss-name megatron --subscription a947bb9f-f570-40a9-82cc-2fdd09f1553a --resource-group Varuna --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
+cluster=${1:-"megatron"}
+machines=($(az vmss nic list --vmss-name $cluster --subscription a947bb9f-f570-40a9-82cc-2fdd09f1553a --resource-group Varuna --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
 
 reachable_machines=( )
 i=0

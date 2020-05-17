@@ -592,7 +592,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             prefix = 'iteration {}'.format(complete_steps)
             evaluate_and_print_results(prefix, forward_step_func if not args.varuna else eval_step_varuna,
                                        valid_data_iterator, model,
-                                       complete_steps, False, eval_loss_file)
+                                       complete_steps, False, loss_file=eval_loss_file)
 
         if args.exit_interval and complete_steps > 0 and complete_steps % args.exit_interval == 0:
             torch.distributed.barrier()
@@ -669,6 +669,7 @@ def evaluate_and_print_results(prefix, forward_step_func,
             writer.add_scalar('{} ppl'.format(key), ppl, iteration)
         if loss_file is not None:
             loss_file.write("{}: {}, ".format(key, total_loss_dict[key].item()))
+            loss_file.flush()
 
     if loss_file is not None:
         loss_file.write("\n")

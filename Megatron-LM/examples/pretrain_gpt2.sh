@@ -11,6 +11,7 @@ ckpt=$4
 
 echo $NNODES $NODE_RANK $MASTER_ADDR $ckpt
 date
+ifconfig eth0 | grep inet
 
 DATA_PATH=/home/varuna/bert-large-blob/openwebtext_text_document
 CHECKPOINT_PATH=/home/varuna/bert-large-blob/varuna_20b_8k_1.25e-3
