@@ -29,6 +29,7 @@ def calculate_config(args):
     servers_for_embeddings = math.ceil(gpus_per_stage / float(args.ngpus_per_server))
     other_servers = math.ceil((dist_world_size - gpus_per_stage) / float(args.ngpus_per_server))
     num_servers = other_servers + servers_for_embeddings
+    print(num_servers, "servers!")
     if args.node_rank >= num_servers:
         print(args.node_rank, num_servers, "I am of no use!")
         exit()
@@ -69,10 +70,10 @@ def calculate_config(args):
         first_rank_in_server = args.node_rank * args.ngpus_per_server
         ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
     elif args.node_rank < (args.nservers - 1):
-        first_rank_in_server = (args.node_rank * args.ngpus_per_server) - (gpus_per_stage % args.ngpus_per_server)
+        first_rank_in_server = (args.node_rank * args.ngpus_per_server) - (args.ngpus_per_server - gpus_per_stage % args.ngpus_per_server)
         ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
     else:
-        first_rank_in_server = (args.node_rank * args.ngpus_per_server) - (gpus_per_stage % args.ngpus_per_server)
+        first_rank_in_server = (args.node_rank * args.ngpus_per_server) - (args.ngpus_per_server - gpus_per_stage % args.ngpus_per_server)
         ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server - last_unused_gpus)
 
     print("Config:")

@@ -197,8 +197,9 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
     # Wait so everyone is done (not necessary)
     torch.distributed.barrier()
 
-    with open("/home/varuna/local_ckpt_tracker.txt","w") as f:
-        f.write(str(iteration))
+    if args.local_rank == 0:
+        with open("/home/varuna/local_ckpt_tracker.txt","w") as f:
+            f.write(str(iteration))
 
 def parse_last_ckpt_iteration():
 
@@ -350,6 +351,12 @@ def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
                          'attempting to load the optimizer state, '
                          'exiting ...'.format(checkpoint_name))
             sys.exit()
+
+    
+    if args.local_rank == 0:
+        with open("/home/varuna/local_ckpt_tracker.txt","w") as f:
+            print("writing", iteration)
+            f.write(str(iteration))
 
     torch.distributed.barrier()
     print('  successfully loaded {}'.format(checkpoint_name))

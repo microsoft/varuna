@@ -10,3 +10,4 @@ do
     ssh -o "StrictHostKeyChecking no" varuna@${machines[i]} -i /home/varuna/.ssh/vdummy.pem "sudo kill -9 \$(ps aux |grep pretrain | awk -F ' ' '{print \$2}')"
     i=$(($i+1))
 done
+echo "killed all"
