@@ -7,6 +7,8 @@ from random import randint
 counter = 0
 possibly_dead_nodes = []
 
+morph_path = "/home/varuna/t-saathl/mega1_5b/Megatron-LM/"
+
 def client(ip, port, message):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.connect((ip, port))
@@ -28,7 +30,8 @@ def poll_and_update():
         print(len(new_machines), flush=True)
 
 def get_current_machines():
-    f = open("/home/varuna/t-nisar/Varuna/Megatron-LM/available_machines.out","r")
+    machines_list = os.path.join(morph_path, "available_machines.out")
+    f = open(machines_list,"r")
     machines = f.read().split("\n")
     if machines[-1] == "":
         machines = machines[:-1]
@@ -36,7 +39,8 @@ def get_current_machines():
 
 def get_available_machines():
     # gets reachable machines
-    bash_out = os.popen("bash /home/varuna/t-nisar/Varuna/Megatron-LM/get_available_machines.sh").read()
+    ping_script = os.path.join(morph_path,"get_available_machines.sh")
+    bash_out = os.popen("bash {}".format(ping_script)).read()
     machines = bash_out.split("\n")
     if machines[-1] == "":
         machines = machines[:-1]
@@ -44,10 +48,11 @@ def get_available_machines():
 
 if __name__ == "__main__":
 
-    server_ip = "172.16.5.4"
+    server_ip = "10.0.3.4"
     server_port = 4200
 
     while True:
         poll_and_update()
+        break
         time.sleep(900)
 

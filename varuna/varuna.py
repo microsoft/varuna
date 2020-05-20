@@ -363,7 +363,6 @@ class Varuna(Module):
 
         cp_time = time.time() - cp_time
         print("Opt ckpt time", cp_time)
-        executor.shutdown(wait = False)
         return mv_futures
 
     
@@ -732,7 +731,7 @@ class Pipeline:
         self.spawn_receive_workers()
 
         batchstart = time.time()
-        
+        '''
         for index, task in enumerate(self.schedule):
             # if self.local_rank==0  and (task[1]%200==0 or task[1]<10):
             #     print(TASK[task[0]], 'iteration memory at micro-step', task[1], ':', torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
@@ -749,9 +748,11 @@ class Pipeline:
             
             # if self.make_logfile:
             #     self.logfile.write("{} {} {} {}\n".format(TASK[task[0]],task[1], str(task_time_start), str(task_time)))
-        '''        
+        '''
+
 
         # dynamic schedule - run forward if gradients for backward are not ready yet
+
         schedule = [s for s in enumerate(self.schedule)]
         i=0
         count_fwd = 0
@@ -776,7 +777,6 @@ class Pipeline:
             self.worker(task[0], grad_mode, self.batches[task[1]])
 
             i+=1
-        '''
         
         overflow = False
         if self.fp16 and self.data_parallel:
