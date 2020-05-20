@@ -111,9 +111,9 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
                 os.makedirs(model_cp_dir)
             if not os.path.exists(opt_cp_dir):
                 os.makedirs(opt_cp_dir)
-        if args.local_rank:
-            if not os.path.exists(tempdir):
-                os.makedirs(tempdir)
+        # if args.local_rank == 0:
+        #     if not os.path.exists(tempdir):
+        #         os.makedirs(tempdir)
 
         # Arguments, iteration, and model.
         state_dict = {}
