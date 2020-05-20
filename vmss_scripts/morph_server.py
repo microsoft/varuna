@@ -68,11 +68,11 @@ class Handler(socketserver.BaseRequestHandler):
                     os.system("bash /home/varuna/t-nisar/Varuna/Megatron-LM/kill_all.sh")
                     os.system("bash /home/varuna/t-nisar/Varuna/Megatron-LM/start_remote.sh {}".format(last_iter))
                     is_morphing = False
+                    is_restarting = False
                 elif not is_restarting:
                     if last_ckpt_signal is None or \
-                    (recv_time - last_ckpt_signal).seconds > 120:
+                    (recv_time - last_ckpt_signal).total_seconds() > 120:
                         print("Handling restart", last_ckpt_signal)
-                        last_ckpt_signal = recv_time
                         last_iter = int(str(data).split(" ")[-1])
                         is_restarting = True
                         os.system('(echo "Subject: Job stopped"; echo "the job has stopped :/") | ssmtp -F "Varuna" "nitika.saran@gmail.com, t-saathl@microsoft.com"')
@@ -82,6 +82,7 @@ class Handler(socketserver.BaseRequestHandler):
                         os.system("bash /home/varuna/t-nisar/Varuna/Megatron-LM/start_remote.sh {}".format(last_iter))
                         is_restarting = False
                         # restarted = True
+                last_ckpt_signal = recv_time
                 checkpointed = 0
             Handler.trackcheckpoints.release()
         elif 'morph' in data:
@@ -95,7 +96,7 @@ class Handler(socketserver.BaseRequestHandler):
                 response = os.system("bash /home/varuna/t-nisar/Varuna/Megatron-LM/send_signal.sh")
                 print("send signal response", response, flush=True)
             else:
-                print("morph change was already detected")
+                print("morph change was already detected", is_morphing, is_preempting, is_restarting)
             Handler.trackcheckpoints.release()
             Handler.triggermorph.release()
         print("handle done", flush=True)

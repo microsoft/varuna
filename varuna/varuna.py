@@ -363,6 +363,7 @@ class Varuna(Module):
 
         cp_time = time.time() - cp_time
         print("Opt ckpt time", cp_time)
+        executor.shutdown(wait = False)
         return mv_futures
 
     
@@ -777,6 +778,7 @@ class Pipeline:
             i+=1
         '''
         
+        overflow = False
         if self.fp16 and self.data_parallel:
             sync_time = time.time()
             overflow = self.all_reduce_opt_grads()

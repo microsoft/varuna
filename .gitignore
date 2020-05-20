@@ -14,6 +14,7 @@ gantt_logs/
 args
 ssh_err*
 morph.*
+poll.*
 available_machines.out
 Megatron-LM/setup_remote.sh
 varuna

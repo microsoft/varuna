@@ -1,5 +1,6 @@
 
 import os
+from datetime import datetime
 
 def remove_dead(ip_list):
     # get instance ids
@@ -61,11 +62,11 @@ def scale_out(max_size=87):
 if __name__ == "__main__":
 
     max_size = 74
-
+    print(datetime.now())
     current_machines, dead_machines = get_available_machines()
     if len(dead_machines) > 0:
         remove_dead(dead_machines)
-    if True:#len(current_machines) < max_size:
+    if len(current_machines) < max_size:
         try:
             success = scale_out(max_size)
             if success:
