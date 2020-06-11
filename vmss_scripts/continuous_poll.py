@@ -2,12 +2,14 @@ import socket
 from datetime import datetime
 import os
 import time
+import sys
 from random import randint
 
+# cluster = sys.argv[1]
 counter = 0
 possibly_dead_nodes = []
 
-morph_path = "/home/varuna/t-saathl/mega1_5b/Megatron-LM/"
+morph_path = "/home/varuna/t-saathl/Varuna/Megatron-LM/"
 
 def client(ip, port, message):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -53,6 +55,5 @@ if __name__ == "__main__":
 
     while True:
         poll_and_update()
-        break
         time.sleep(900)
 

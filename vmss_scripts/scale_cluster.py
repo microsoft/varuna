@@ -1,13 +1,15 @@
 
 import os
 from datetime import datetime
+import sys
 
+cluster = sys.argv[1]
 resource_group = "Varuna"
 subscription = "f3ebbda2-3d0f-468d-8e23-31a0796dcac1"
-cluster = "megatron"
-morph_path = "/home/varuna/t-saathl/mega1_5b/Megatron-LM/"
+# cluster = "megatron"
+morph_path = "/home/varuna/t-saathl/Varuna/Megatron-LM/"
 
-def remove_dead(ip_list):
+def remove_dead(ip_list, cluster):
     # get instance ids
     id_cmd = "az vmss nic list -g {} --subscription {} --vmss-name {} \
                 --query \"[?contains({}, ipConfigurations[0].privateIpAddress)].[ipConfigurations[0].privateIpAddress, virtualMachine.id]\"\
@@ -29,21 +31,24 @@ def remove_dead(ip_list):
 
     remove_ids = []
     for ip in ip_list:
+        if ip not in id_map:
+            continue
         cmd = status_cmd.format(cluster, resource_group, subscription, id_map[ip])
         status = os.popen(cmd).read()
         if "running" in status or "updating" in status:
             continue
         remove_ids.append(id_map[ip])
 
-    print("removing: ", remove_ids)
-    concat_ids = " ".join([ str(i) for i in remove_ids])
-    response = os.system( delete_cmd.format(resource_group, subscription, cluster, concat_ids) )
-    return response == 0
+    if len(remove_ids) > 0:
+        print("removing: ", remove_ids)
+        concat_ids = " ".join([ str(i) for i in remove_ids])
+        response = os.system( delete_cmd.format(resource_group, subscription, cluster, concat_ids) )
+        return response == 0
 
 def get_available_machines():
     # gets reachable machines
     ping_script = os.path.join(morph_path, "get_available_machines.sh")
-    bash_out = os.popen("bash {} 1 {}".format(ping_script, cluster)).read()
+    bash_out = os.popen("bash {} 1 {} 1".format(ping_script, cluster)).read()
     machines = bash_out.split("\n")
     if machines[-1] == "":
         machines = machines[:-1]
@@ -68,17 +73,30 @@ def scale_out(max_size=87):
 
 if __name__ == "__main__":
 
-    max_size = 20
-    print(datetime.now())
+    max_size = 25
+    dt = datetime.now()
+    print(dt, cluster)
+    print(dt, cluster, file=sys.stderr)
     current_machines, dead_machines = get_available_machines()
     if len(dead_machines) > 0:
         print("Dead:",dead_machines)
-        success = remove_dead(dead_machines)
+        success = remove_dead(dead_machines, cluster)
         print("remove success", success)
     if len(current_machines) < max_size:
         try:
-            success = scale_out(max_size)
-            if success:
-                print("Scaled out to max!")
+            success = False
+            current_size = len(current_machines)
+            scale_size = max_size
+            while scale_size > current_size and not success:
+                print("try scaling to {}".format(scale_size))
+                success = scale_out(scale_size)
+                if success:
+                    print("Scaled out to {}!".format(scale_size))
+                    break
+                scale_size -= 5
+            else:
+                print("Didn't scale, at {}".format(current_size))            
         except Exception as e:
             print("couldn't scale:", e)
+    else:
+        print("already at max!")

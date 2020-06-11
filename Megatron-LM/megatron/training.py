@@ -51,7 +51,23 @@ from varuna import load_varuna_checkpoint
 from apex import amp
 from apex.amp import _amp_state
 
+import socket
+
+def client(message, ip="10.0.3.4", port=3500):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.connect((ip, port))
+        sock.sendall(bytes(message, 'ascii'))
+
+def print_rank_0_client(msg):
+    print_rank_0(msg)
+    # client(msg)
+
 accumulated_loss = 0
+MODEL = None
+OPTIMIZER = None
+LR_SCHEDULER = None
+ITERATION = None
+PARAMETER_NAMES = None
 
 def pretrain(train_valid_test_dataset_provider, model_provider,
              forward_step_func, eval_step_varuna, extra_args_provider=None, args_defaults={}):
@@ -79,6 +95,9 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
             to set already parse arguments.
     """
 
+    global MODEL, OPTIMIZER, LR_SCHEDULER, PARAMETER_NAMES
+
+    setup_time = time.time()
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(extra_args_provider=extra_args_provider,
                         args_defaults=args_defaults)
@@ -126,18 +145,24 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
     timers('model and optimizer').start()
     model, optimizer, lr_scheduler, parameter_names = setup_model_and_optimizer(model_provider, dry_run_input if args.varuna else None)
     timers('model and optimizer').stop()
+
+    MODEL = model
+    OPTIMIZER = optimizer
+    LR_SCHEDULER = lr_scheduler
+    PARAMETER_NAMES = parameter_names
     
     # Print setup timing.
-    print_rank_0('done with setups ...')
+    print_rank_0_client('done with setups ...')
     timers.log(['model and optimizer', 'train/valid/test data iterators'])
-    print_rank_0('training ...')
+    print_rank_0_client('training ...')
+    setup_time = time.time() - setup_time
 
     iteration = 0
     if args.do_train and args.train_iters > 0:
         if args.do_train:
             iteration, _ = train(forward_step_func,
                                  model, optimizer, lr_scheduler,
-                                 train_data_iterator, valid_data_iterator, parameter_names, eval_step_varuna)
+                                 train_data_iterator, valid_data_iterator, parameter_names, eval_step_varuna, setup_time)
 
     if args.do_valid:
         prefix = 'the end of training for val data'
@@ -160,6 +185,9 @@ def get_model(model_provider_func, dry_run_input=None):
     """Build the model."""
     args = get_args()
 
+    #if args.local_rank % 2 != 0:
+    #    time.sleep(900)
+
     # Build model on cpu.
     model = model_provider_func()
 
@@ -175,7 +203,7 @@ def get_model(model_provider_func, dry_run_input=None):
             mpu.get_model_parallel_rank(),
             sum([p.nelement() for p in model.parameters()])), flush=True)
     else:
-        print(args.rank, ": total num params is", sum([p.nelement() for p in model.parameters()]), flush=True)
+        print(args.stage, ": total num params is", sum([p.nelement() for p in model.parameters()]), flush=True)
     # GPU allocation.
     model.cuda(torch.cuda.current_device())
     return model
@@ -499,8 +527,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
 
 
 def train(forward_step_func, model, optimizer, lr_scheduler,
-          train_data_iterator, valid_data_iterator, parameter_names, eval_step_varuna=None):
+          train_data_iterator, valid_data_iterator, parameter_names, eval_step_varuna=None,setup_time=0):
     """Train the model function."""
+    global ITERATION
+
     args = get_args()
     timers = get_timers()
 
@@ -517,6 +547,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     iteration = args.iteration * args.gradient_accumulation_steps
     skipped_iters = 0
     complete_steps = args.iteration
+    ITERATION = complete_steps
     if args.varuna:
         model.step = args.iteration
 
@@ -528,11 +559,11 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         loss_filename = os.path.join(args.save, "stats", loss_filename)
         eval_loss_filename = os.path.join(args.save, "stats", eval_loss_filename)
         if iteration == 0:
-            if os.path.isfile(loss_filename):
-                raise RuntimeError("loss file {} already exists!".format(loss_filename))
-            loss_file = open(loss_filename,"w")
+            # if os.path.isfile(loss_filename):
+            #     raise RuntimeError("loss file {} already exists!".format(loss_filename))
+            loss_file = open(loss_filename,"a")
             loss_file.write("Loss scale, loss\n")
-            eval_loss_file = open(eval_loss_filename, "w")
+            eval_loss_file = open(eval_loss_filename, "a")
             eval_loss_file.write("Iteration, loss keys")
         else:
             loss_file = open(loss_filename,"a")
@@ -540,6 +571,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             eval_loss_file = open(eval_loss_filename, "a")
             eval_loss_file.write("resumed\n")
         loss_file.write(str(datetime.now())+ "\n")
+        loss_file.write("Setup time" + str(setup_time) + "\n")
     
     timers('interval time').start()
     report_memory_flag = True
@@ -561,6 +593,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         iteration += 1
         if iteration % args.gradient_accumulation_steps == 0:
             complete_steps += 1
+            ITERATION += 1
 
         # Logging.
         total_train_time = time.time() - train_start_time
@@ -598,7 +631,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             torch.distributed.barrier()
             time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             rank = torch.distributed.get_rank()
-            print_rank_0('rank: {} | time: {} | exiting the program at '
+            print_rank_0_client('rank: {} | time: {} | exiting the program at '
                          'iteration {}'.format(rank, time_str, complete_steps))
             sys.exit()
 
@@ -621,7 +654,7 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
         while iteration < args.eval_iters:
             iteration += 1
             if verbose and iteration % args.log_interval == 0:
-                print_rank_0('Evaluating iter {}/{}'.format(iteration,
+                print_rank_0_client('Evaluating iter {}/{}'.format(iteration,
                                                             args.eval_iters))
             # Forward evaluation.
             _, loss_dict = forward_step_func(data_iterator, model)
@@ -688,7 +721,8 @@ def build_train_valid_test_data_iterators(
 
     (train_dataloader, valid_dataloader, test_dataloader) = (None, None, None)
 
-    print_rank_0('> building train, validation, and test datasets ...')
+    print_rank_0_client('> building train, validation, and test datasets ...')
+    print("Trying to build")
     # Data loader only on rank 0 of each model parallel group.
     if (not mpu.model_parallel_is_initialized()) or mpu.get_model_parallel_rank() == 0:
         # Rank, size, and global batch size.
@@ -707,10 +741,10 @@ def build_train_valid_test_data_iterators(
         train_val_test_num_samples = [train_iters * global_batch_size,
                                       eval_iters * global_batch_size,
                                       test_iters * global_batch_size]
-        print_rank_0(' > datasets target sizes (minimum size):')
-        print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
-        print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
-        print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
+        print(' > datasets target sizes (minimum size):')
+        print('    train:      {}'.format(train_val_test_num_samples[0]))
+        print('    validation: {}'.format(train_val_test_num_samples[1]))
+        print('    test:       {}'.format(train_val_test_num_samples[2]))
 
         # Build the datasets.
         train_ds, valid_ds, test_ds = build_train_valid_test_datasets_provider(
@@ -746,14 +780,14 @@ def build_train_valid_test_data_iterators(
     if train_dataloader is not None:
         train_dataloader.batch_sampler.start_iter = args.iteration % \
             len(train_dataloader)
-        print_rank_0('setting training data start iteration to {}'.
+        print('setting training data start iteration to {}'.
                      format(train_dataloader.batch_sampler.start_iter))
     if valid_dataloader is not None:
         start_iter_val = (args.iteration // args.eval_interval) * \
             args.eval_iters
         valid_dataloader.batch_sampler.start_iter = start_iter_val % \
             len(valid_dataloader)
-        print_rank_0('setting validation data start iteration to {}'.
+        print('setting validation data start iteration to {}'.
                      format(valid_dataloader.batch_sampler.start_iter))
 
     # Build iterators.
@@ -772,7 +806,18 @@ def build_train_valid_test_data_iterators(
     else:
         test_data_iterator = None
 
+    print(torch.distributed.get_rank(), ':completed train valid test data iterators')
+
     return train_data_iterator, valid_data_iterator, test_data_iterator, dry_run_input
+
+
+def on_demand_checkpoint():
+    global MODEL, OPTIMIZER, LR_SCHEDULER, PARAMETER_NAMES, ITERATION
+
+    ckpt_vars = [MODEL, OPTIMIZER, LR_SCHEDULER, PARAMETER_NAMES, ITERATION]
+    assert not any([v is None for v in ckpt_vars]), "CKPT VARS NOT SET!"
+    
+    save_checkpoint(ITERATION, MODEL, OPTIMIZER, LR_SCHEDULER, PARAMETER_NAMES, on_demand=True)
 
 
 def get_eval_numbers(train_valid_test_dataset_provider, model_provider,

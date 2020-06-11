@@ -26,6 +26,8 @@ from .language_model import get_language_model
 from .utils import init_method_normal
 from .utils import scaled_init_method_normal
 
+from varuna import CutPoint
+
 
 def gpt2_attention_mask_func(attention_scores, ltor_mask):
     attention_scores.masked_fill_(ltor_mask, -10000.0)
@@ -50,7 +52,7 @@ class GPT2Model(MegatronModule):
                                                          args.num_layers))
 
         self.lm_head_weight = torch.nn.Parameter(self.language_model.embedding.word_embeddings.weight)
-
+        self.last_cutpoint = CutPoint()
 
     def forward(self, input_ids, position_ids, attention_mask, loss_mask, labels,
                 tokentype_ids=None, layer_past=None, get_key_value=False,
@@ -63,6 +65,8 @@ class GPT2Model(MegatronModule):
                                         tokentype_ids=tokentype_ids,
                                         layer_past=layer_past,
                                         get_key_value=get_key_value)
+
+        lm_output = self.last_cutpoint(lm_output)
 
         if get_key_value:
             lm_output, presents = lm_output
