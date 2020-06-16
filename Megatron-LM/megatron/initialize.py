@@ -73,8 +73,8 @@ def _initialize_distributed():
         if device_count > 0:
             device = torch.cuda.current_device()
             local_rank = args.rank % device_count
-            assert local_rank == device, \
-                'expected local-rank to be the same as rank % device-count.'
+            # assert local_rank == device, \
+                # 'expected local-rank to be the same as rank % device-count.'
 
     else:
 
@@ -83,8 +83,9 @@ def _initialize_distributed():
         if device_count > 0:
             device = args.rank % device_count
             if args.local_rank is not None:
-                assert args.local_rank == device, \
-                    'expected local-rank to be the same as rank % device-count.'
+                pass
+                # assert args.local_rank == device, \
+                #     'expected local-rank to be the same as rank % device-count.'
             else:
                 args.local_rank = device
             torch.cuda.set_device(device)
@@ -93,7 +94,7 @@ def _initialize_distributed():
         master_ip = os.getenv('MASTER_ADDR', 'localhost')
         master_port = os.getenv('MASTER_PORT', '6000')
         init_method += master_ip + ':' + master_port
-        connect_timeout = datetime.timedelta(minutes=10)
+        connect_timeout = datetime.timedelta(minutes=30)
         # print(init_method, args.world_size, flush=True)
         torch.distributed.init_process_group(
             backend=args.distributed_backend,

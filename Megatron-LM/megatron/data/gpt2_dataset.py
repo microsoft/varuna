@@ -41,11 +41,11 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
     splits = get_train_valid_test_split_(splits_string, total_num_of_documents)
 
     # Print stats about the splits.
-    print_rank_0(' > dataset split:')
+    print(' > dataset split:')
 
     def print_split_stats(name, index):
-        print_rank_0('    {}:'.format(name))
-        print_rank_0('     document indices in [{}, {}) total of {} '
+        print('    {}:'.format(name))
+        print('     document indices in [{}, {}) total of {} '
                      'documents'.format(splits[index], splits[index + 1],
                                         splits[index + 1] - splits[index]))
     print_split_stats('train', 0)
@@ -63,9 +63,13 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                   seq_length, seed)
         return dataset
 
+    print("BUILDING 3 DATASETS")
     train_dataset = build_dataset(0, 'train')
+    print("train done",flush=True)
     valid_dataset = build_dataset(1, 'valid')
+    print("valid done",flush=True)
     test_dataset = build_dataset(2, 'test')
+    print("test done", flush=True)
 
     return (train_dataset, valid_dataset, test_dataset)
 
@@ -98,6 +102,7 @@ class GPT2Dataset(torch.utils.data.Dataset):
         assert np.min(documents) >= 0
         assert np.max(documents) < indexed_dataset.sizes.shape[0]
 
+        print("BUILD INDICES")
         # Build index mappings.
         self.doc_idx, self.sample_idx, self.shuffle_idx = _build_index_mappings(
             self.name, data_prefix, documents, self.indexed_dataset.sizes,
@@ -161,6 +166,8 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
     sample_idx_filename = _filename + '_sample_idx.npy'
     shuffle_idx_filename = _filename + '_shuffle_idx.npy'
 
+    print("Hey I'm here",flush=True)
+
     # Build the indexed mapping if not exist.
     if torch.distributed.get_rank() == 0:
         if (not os.path.isfile(doc_idx_filename)) or \
@@ -204,23 +211,26 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
     # device_index=rank which is not the case for model
     # parallel case
     if mpu.model_parallel_is_initialized():
+        assert False, "wtf?!"
         counts = torch.cuda.LongTensor([1])
         torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
         assert counts[0].item() == torch.distributed.get_world_size(
             group=mpu.get_data_parallel_group())
     else:
+        print("waiting here", torch.distributed.get_rank(),flush=True)
         torch.distributed.barrier()
+        print("barrier 1 done", flush=True)
 
     # Load mappings.
     start_time = time.time()
-    print_rank_0(' > loading doc-idx mapping from {}'.format(
+    print(' > loading doc-idx mapping from {}'.format(
         doc_idx_filename))
     doc_idx = np.load(doc_idx_filename, allow_pickle=True)
-    print_rank_0(' > loading sample-idx mapping from {}'.format(
+    print(' > loading sample-idx mapping from {}'.format(
         sample_idx_filename))
     sample_idx = np.load(sample_idx_filename, allow_pickle=True)
-    print_rank_0(' > loading shuffle-idx mapping from {}'.format(
-        shuffle_idx_filename))
+    print(' > loading shuffle-idx mapping from {}'.format(
+        shuffle_idx_filename), flush=True)
     shuffle_idx = np.load(shuffle_idx_filename, allow_pickle=True)
     print_rank_0('    loaded indexed file in {:3.3f} seconds'.format(
         time.time() - start_time))
