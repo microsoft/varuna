@@ -25,7 +25,7 @@ from megatron.model.transformer import ParallelTransformer
 from megatron.model.utils import openai_gelu
 from megatron.model.utils import get_linear_layer
 
-# from varuna import CutPoint
+from varuna import CutPoint
 
 def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
                        bias=None):
@@ -298,7 +298,8 @@ class TransformerLanguageModel(MegatronModule):
             self.pooler = Pooler(self.hidden_size, self.init_method)
             self._pooler_key = 'pooler'
 
-        # self.cutpoints = torch.nn.ModuleList([CutPoint() for i in range(2)])
+        #self.pooler_cutpoint = CutPoint()
+        #self.cutpoints = torch.nn.ModuleList([CutPoint() for i in range(4)])
 
     def forward(self, input_ids, position_ids, attention_mask,
                 tokentype_ids=None, layer_past=None, get_key_value=False,
@@ -307,14 +308,17 @@ class TransformerLanguageModel(MegatronModule):
         # Embeddings.
         embedding_output = self.embedding(input_ids, position_ids,
                                           tokentype_ids=tokentype_ids)
-        # embedding_output = self.cutpoints[0](embedding_output)
+        #embedding_output = self.cutpoints[0](embedding_output)
 
         # Transformer.
         transformer_output = self.transformer(embedding_output,
                                               attention_mask,
                                               layer_past=layer_past,
                                               get_key_value=get_key_value)
-        # transformer_output = self.cutpoints[1](transformer_output)
+                                              
+        #transformer_output = self.pooler_cutpoint(transformer_output)
+        #for i in range(2):
+        #   transformer_output = self.cutpoints[i](transformer_output)
 
         if self.add_pooler:
             pooled_output = self.pooler(transformer_output,

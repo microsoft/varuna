@@ -110,15 +110,15 @@ class Varuna(Module):
 
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
         self.model = PartitionedModel(model, self.rank, self.local_rank, device, self.stage_to_rank_map, self.fp16, shared_weights)
-        self.model.initialize( dummy_inputs, from_cache=True )
+        self.model.initialize( dummy_inputs, from_cache=False )
         if self.local_rank==0:
             # print("varuna init() after dry run init: ", self.local_rank, torch.cuda.memory_summary(self.device))
             print('varuna init() after dry run:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
         self.partitioned_model = self.model
         self.shared_weight_stages = self.model.shared_weight_stages if self.shared_weights is not None else None
 
-        # print("SHARED WEIGHTS ARE")
-        # print(self.shared_weight_stages)
+        print("SHARED WEIGHTS ARE")
+        print(self.shared_weight_stages)
 
         # assert(batch_size % data_depth == 0, "Batch size not divisible by data parallel depth!")
         self.batch_size = batch_size // data_depth
@@ -189,7 +189,7 @@ class Varuna(Module):
         for stage in range(self.partitions):
             ranks = self.stage_to_rank_map[stage]
             if len(ranks) > 1:
-                process_groups[stage] = dist.new_group(ranks=ranks, backend='nccl')
+                process_groups[stage] = dist.new_group(ranks=ranks,backend='nccl')
             else:
                 process_groups[stage] = None
 
@@ -218,7 +218,7 @@ class Varuna(Module):
             ranks = stream_to_rank_map[stream]
             # ranks = [stage_to_rank_map[s][stream] for s in range(self.partitions) ]
             if len(ranks) > 1:
-                pipeline_groups[stream] = dist.new_group(ranks=ranks)
+                pipeline_groups[stream] = dist.new_group(ranks=ranks)#, backend='nccl')
             else:
                 pipeline_groups[stream] = None
             
@@ -238,7 +238,7 @@ class Varuna(Module):
         # avoid dataloader compute in machines other than the first
         # ask the model writer to pass the input batch generating dataloader function to Varuna::__init__
         # and Varuna can take care of input dataloader explicitly
-        self.config["make_logfile"] = bool(self.config["make_logfile"] and self.step < 10)
+        self.config["make_logfile"] = bool(self.config["make_logfile"] and self.step < 3)
         pipeline = Pipeline(batches, self.model, self.config, self.schedule, self.optimizer)
         loss, overflow = pipeline.run()
         self.step += 1
@@ -302,14 +302,21 @@ class Varuna(Module):
     def checkpoint(self, cp_dir_name):
         return self.partitioned_model.checkpoint(cp_dir_name)
 
-    def checkpoint_optimizer(self, optimizer, parameter_to_name, param_name_to_pstage, cp_dir_name, tempdir=None):
+    def checkpoint_optimizer(self, optimizer, parameter_to_name, param_name_to_pstage, \
+                                cp_dir_name, tempdir=None, on_demand = False):
         cp_time = time.time()
         mv_futures = []
         if tempdir is not None:
             executor = concurrent.futures.ThreadPoolExecutor()
 
+        rank_within_stage = self.stage_to_rank_map[self.stage].index(self.rank)
+        if on_demand:
+            cp_dir_name = cp_dir_name + "_"  + str(rank_within_stage)
+            if tempdir is not None:
+                tempdir + "_"  + str(rank_within_stage)
+
         # one worker from each partition
-        if self.rank == self.stage_to_rank_map[self.stage][0]:
+        if on_demand or self.rank == self.stage_to_rank_map[self.stage][0]:
             cuts_per_stage = self.partitioned_model.cuts_per_stage
             # save param states for each cutpoint separately
             pstages = range(cuts_per_stage * self.stage, (self.stage+1)* cuts_per_stage)
@@ -431,7 +438,7 @@ class Pipeline:
         self.make_logfile = config["make_logfile"]
         if self.make_logfile:
             replica_num = self.stage_to_rank_map[self.stage].index(self.rank)
-            microBS = self.fwd_inp_shape[0] if self.bwd_grad_shape is None else self.bwd_grad_shape[0]
+            microBS = 4#self.fwd_inp_shape[0] if self.bwd_grad_shape is None else self.bwd_grad_shape[0]
             logfilename = "varuna_logs-mBS" + str(microBS) + "-stage" + str(self.stage) + "of" + str(self.partitions) + "_" + str(replica_num)
             self.logfile = open(logfilename,"a")
             self.logfile.write("start time {}\n".format(time.time()))
@@ -810,7 +817,7 @@ class Pipeline:
         master_grads = [p.grad for p in amp.master_params(self.optimizer) if p.grad is not None]
         # print("all_reduce_opt_grads() grad details: ", self.stage, len(master_grads), numpy.array([numpy.array(x.size()).prod() for x in master_grads]).sum())
         flat_grad_size = sum(p.numel() for p in master_grads)
-        flat_raw = torch.empty(flat_grad_size, device=self.device, dtype=torch.float32)
+        flat_raw = torch.empty(flat_grad_size, device=self.device, dtype=torch.float16)
         
         # 2. combine unflattening and predivision of unscaled 'raw' gradient
         allreduced_views = apex_C.unflatten(flat_raw, master_grads)
@@ -838,7 +845,7 @@ class Pipeline:
 
         # all-reduce to sync overflow
         osync_time_start = time.time()
-        torch.distributed.all_reduce(overflow_buf, group=self.pipeline_group)
+        #torch.distributed.all_reduce(overflow_buf, group=self.pipeline_group)
         osync_time = time.time() - osync_time_start
         if self.make_logfile:
             self.logfile.write("overflow sync {} {}\n".format(osync_time_start,osync_time))
@@ -878,9 +885,11 @@ def scatter(input, batch_size, chunk_size):
     return microbatches
 
 
-def load_varuna_optimizer(optimizer, my_stage, num_stages, total_num_pstages, parameter_names, common_store, fp16=False):
-    stages_per_worker = total_num_pstages // num_stages
-    pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
+def load_varuna_optimizer(optimizer, my_stage, num_stages, total_num_pstages, parameter_names, \
+                        common_store, fp16=False, pstages_to_read = None):
+    if pstages_to_read is None:
+        stages_per_worker = total_num_pstages // num_stages
+        pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
     # reload state
     opt_state = {}
     for i in pstages_to_read:
