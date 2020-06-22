@@ -28,7 +28,8 @@ from megatron import mpu
 from megatron import get_args
 from megatron import print_rank_0
 import concurrent.futures
-
+from datetime import datetime
+import time
 
 from varuna import load_varuna_checkpoint, load_varuna_optimizer
 
@@ -177,10 +178,11 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
                 pass
             param_name_to_pstage = model.checkpoint(model_cp_dir)
             param_name_to_pstage["lm_head_weight"] = args.num_layers + 1
-            mv_futures = model.checkpoint_optimizer(optimizer, parameter_names, param_name_to_pstage, opt_cp_dir, tempdir=None)
-            
+            mv_futures = model.checkpoint_optimizer(optimizer, parameter_names, param_name_to_pstage, opt_cp_dir, tempdir=tempdir)
+
         # remove old checkpoints
         if args.max_num_ckpts is not None and torch.distributed.get_rank() == 0:
+            rm_time = time.time()
             all_ckpted_iters = sorted([int(f.split("_")[-1]) for f in os.listdir(args.save) if f.startswith("opt_ckpt")])
             # assert all_ckpted_iters[-1] == iteration, "The latest checkpoint is corrupted?"
             if len(all_ckpted_iters) > args.max_num_ckpts:
@@ -195,13 +197,15 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
                         os.system("rm -rf {} &".format(os.path.join(args.save,'iter_{:07d}'.format(it))))
                     except Exception as e:
                         print("Error while removing checkpoint {}: {}".format(it,str(e)))
+            rm_time = time.time() - rm_time
+            print("rm time", rm_time)
         print('  successfully saved {}'.format(checkpoint_name))
 
     if mv_futures is not None and len(mv_futures) > 0:
         executor = concurrent.futures.ThreadPoolExecutor()
         executor.submit(future_on_futures, args.local_rank, iteration)
         executor.shutdown(wait = False)
-
+    
     # Wait so everyone is done (necessary)
     torch.distributed.barrier()
     # And update the latest iteration
