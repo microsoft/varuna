@@ -438,7 +438,7 @@ class Pipeline:
         self.make_logfile = config["make_logfile"]
         if self.make_logfile:
             replica_num = self.stage_to_rank_map[self.stage].index(self.rank)
-            microBS = 4#self.fwd_inp_shape[0] if self.bwd_grad_shape is None else self.bwd_grad_shape[0]
+            microBS = self.fwd_inp_shape[0] if self.bwd_grad_shape is None else self.bwd_grad_shape[0]
             logfilename = "varuna_logs-mBS" + str(microBS) + "-stage" + str(self.stage) + "of" + str(self.partitions) + "_" + str(replica_num)
             self.logfile = open(logfilename,"a")
             self.logfile.write("start time {}\n".format(time.time()))
@@ -845,7 +845,7 @@ class Pipeline:
 
         # all-reduce to sync overflow
         osync_time_start = time.time()
-        #torch.distributed.all_reduce(overflow_buf, group=self.pipeline_group)
+        torch.distributed.all_reduce(overflow_buf, group=self.pipeline_group)
         osync_time = time.time() - osync_time_start
         if self.make_logfile:
             self.logfile.write("overflow sync {} {}\n".format(osync_time_start,osync_time))

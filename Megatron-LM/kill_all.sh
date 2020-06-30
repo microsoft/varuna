@@ -1,4 +1,4 @@
-machines=($(cat /home/varuna/t-saathl/Varuna/Megatron-LM/available_machines.out))
+machines=($(cat /home/varuna/t-saathl/tieweights/Varuna/Megatron-LM/available_machines.out))
 
 nservers=${#machines[@]}
 
