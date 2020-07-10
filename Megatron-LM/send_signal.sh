@@ -1,4 +1,4 @@
-machines=($(cat /home/varuna/t-saathl/mega1_5b/Megatron-LM/available_machines.out))
+machines=($(cat /home/varuna/t-saathl/Varuna/Megatron-LM/available_machines.out))
 
 echo "triggering stop signal"
 i=0

@@ -374,10 +374,13 @@ if __name__ == "__main__":
 
         print("done and trying to send here", flush=True)
      
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            message = "checkpoint done {}".format(last_iter)
-            sock.connect((manager_ip, manager_port))
-            sock.sendall(bytes(message, 'ascii'))
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                message = "checkpoint done {}".format(last_iter)
+                sock.connect((manager_ip, manager_port))
+                sock.sendall(bytes(message, 'ascii'))
+        except:
+            print('Could not send checkpoint done signal')
 
         print("and sent!")
 
