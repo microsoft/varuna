@@ -117,8 +117,8 @@ class Varuna(Module):
         self.partitioned_model = self.model
         self.shared_weight_stages = self.model.shared_weight_stages if self.shared_weights is not None else None
 
-        # print("SHARED WEIGHTS ARE")
-        # print(self.shared_weight_stages)
+        print("SHARED WEIGHTS ARE")
+        print(self.shared_weight_stages)
 
         # assert(batch_size % data_depth == 0, "Batch size not divisible by data parallel depth!")
         self.batch_size = batch_size // data_depth

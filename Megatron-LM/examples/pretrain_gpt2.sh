@@ -1,5 +1,5 @@
 #! /bin/bash
-
+export PATH="/home/varuna/anaconda3/bin:$PATH"
 
 RANK=0
 WORLD_SIZE=2
@@ -13,8 +13,8 @@ echo $NNODES $NODE_RANK $MASTER_ADDR $ckpt
 date
 ifconfig eth0 | grep inet
 
-DATA_PATH=/home/varuna/bert-large-blob/openwebtext_full/openwebtext_text_document
-CHECKPOINT_PATH=/home/varuna/bert-large-blob/varuna_20b_8k_1.25e-3
+DATA_PATH=/home/varuna/gpt2-blob/openwebtext_full/openwebtext_text_document
+CHECKPOINT_PATH=/home/varuna/gpt2-blob/varuna_20b_8k_1.25e-3
 
 NCCL_SOCKET_IFNAME=eth0 NCCL_SOCKET_NTHREADS=4 NCCL_NSOCKS_PERTHREAD=4 python3 run_varuna.py --nstages 49 --batch_size 8192 --chunk_size 2 --total_num_stages 98 --ngpus_per_server 4 --nservers $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR  pretrain_gpt2.py \
        --num-layers 96 \
