@@ -11,14 +11,17 @@ import pickle
 from collections import OrderedDict 
 import collections
 
+from apex import amp
+
 class Profiling:
 
-    def __init__(self, model, device):
+    def __init__(self, model, device, fp16 = False):
         self.model = model
         self.ret_val = None
+        self.fp16 = fp16
         self.device = device
 
-    def initialize(self, dummy_inputs, stage_num=1, from_cache=False):
+    def initialize(self, dummy_inputs, stage_num=1, from_cache=True):
         start = time.time()
         self.dry_run(dummy_inputs, from_cache)
         print("dry run time", time.time() - start)
@@ -158,14 +161,14 @@ class Profiling:
 
         # should be 0?
         initial_mem = torch.cuda.memory_allocated(self.device)
-        # assert initial_mem == 0, "Something in memory already!!"
         print("initial mem", initial_mem)
-        self.model.to(self.device)
-        model_mem = torch.cuda.memory_allocated(self.device) - initial_mem
-        print("Model memory", model_mem)
+
+        #self.model.to(self.device)
+        # model_mem = torch.cuda.memory_allocated(self.device) - initial_mem
+        # print("Model memory", model_mem)
 
         of = open(filename,"w")
-        of.write("Batch size, fwd_time, bwd_time, max_mem_usage, input_mem, model_mem, fwd_act_size, opt_state_mem\n")
+        of.write("Batch size, fwd_time, bwd_time, max_mem_usage, input_mem, fwd_act_size, opt_state_mem\n")
 
         for batch_size in microbatch_sizes:
             self.model.train()
@@ -177,7 +180,9 @@ class Profiling:
                 inputs = get_batch_fn(batch_size)
                 input_mem = torch.cuda.memory_allocated() - input_mem
                 if self.fwd_inp_shape is not None:
-                    self.fwd_inp = torch.ones(self.fwd_inp_shape, dtype = torch.float32).to(self.device)
+                    fwd_inp_shape = list(self.fwd_inp_shape)
+                    fwd_inp_shape[0] = batch_size
+                    self.fwd_inp = torch.ones(fwd_inp_shape, dtype = torch.float16 if self.fp16 else torch.float32).to(self.device)
 
                 start = time.time()
                 
@@ -191,6 +196,7 @@ class Profiling:
                         raise e
                     fwd_out = self.ret_val
                 self.ret_val = None
+                torch.cuda.synchronize()
                 fwd_time = time.time() - start
 
                 bwd_time = time.time()
@@ -198,9 +204,15 @@ class Profiling:
                     fwd_out = fwd_out[0]
                 grads = torch.ones(list(fwd_out.size()), device = self.device)
                 if self.bwd_grad_shape is not None:
-                    self.bwd_grad = torch.ones(self.bwd_grad_shape, dtype = torch.float32).to(self.device)
+                    self.bwd_grad = torch.ones(self.bwd_grad_shape, dtype = torch.float16 if self.fp16 else torch.float32).to(self.device)
                 
-                fwd_out.backward(grads)
+                if self.fp16:
+                    with amp.scale_loss(fwd_out, optimizer, last_partition=True) as scaled_out:
+                        scaled_out.backward(grads)
+                else:
+                    fwd_out.backward(grads)
+
+                torch.cuda.synchronize()
                 bwd_time = time.time() - bwd_time
 
                 optimizer.step()
@@ -211,26 +223,22 @@ class Profiling:
                 optimizer.zero_grad()
 
                 mem_usage = torch.cuda.max_memory_allocated(self.device)
-                profile[batch_size] = {
-                    "fwd_time": fwd_time,
-                    "bwd_time": bwd_time,
-                    "max_mem_usage": mem_usage,
-                    "input_mem": input_mem,
-                    "model_mem": model_mem,
-                    "pre_mem": pre_mem
-                }
+                
                 print("Batch size", batch_size, ": ")
                 print("fwd_time", fwd_time)
                 print("bwd_time", bwd_time)
                 print("mem_usage", mem_usage)
                 print("-------------------------")
                 print()
+
                 del inputs
                 self.fwd_inp = None; self.bwd_grad = None
+                
                 opt_state_mem = torch.cuda.memory_allocated(self.device)
                 optimizer.state = collections.defaultdict(dict) # Reset state
                 opt_state_mem = opt_state_mem - torch.cuda.memory_allocated(self.device)
-                of.write("{}, {}, {}, {}, {}, {}, {}, {}\n".format(batch_size, fwd_time, bwd_time, mem_usage, input_mem, model_mem , fwd_act_size, opt_state_mem))
+                
+                of.write("{}, {}, {}, {}, {}, {}, {}\n".format(batch_size, fwd_time, bwd_time, mem_usage, input_mem, fwd_act_size, opt_state_mem))
                 print("Opt_state", opt_state_mem)
 
             except RuntimeError as e:

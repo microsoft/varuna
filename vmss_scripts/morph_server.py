@@ -9,7 +9,7 @@ import os
 import subprocess
 import sys
 
-checkpointed = 0
+checkpointed = -1
 is_preempting = False
 is_restarting = False
 is_morphing = False
@@ -21,6 +21,8 @@ last_preempt_handled = None
 
 if len(sys.argv) > 1:
     curr_world_size = int(sys.argv[1])
+if len(sys.argv) > 2:
+    checkpointed = int(sys.argv[2])
 
 class Handler(socketserver.BaseRequestHandler):
 
@@ -87,10 +89,11 @@ class Handler(socketserver.BaseRequestHandler):
             time.sleep(60*15)
 
     def setup(self):
+        pass
         #print("setup(): starting check progress")
-        check_progress_thread = Thread(target=Handler.check_progress, args=())
-        check_progress_thread.daemon=True
-        #check_progress_thread.start()
+        # check_progress_thread = Thread(target=Handler.check_progress, args=())
+        # check_progress_thread.daemon=True
+        # check_progress_thread.start()
     
     def handle(self):
         global checkpointed, is_preempting, is_restarting, is_morphing, last_ckpt_signal, curr_world_size, last_iter, last_preempt_handled
@@ -117,11 +120,15 @@ class Handler(socketserver.BaseRequestHandler):
                 if not is_morphing and not is_preempting and not is_restarting:
                     fields = data.split(" ")
                     notbefore = fields[-1]
-                    notbefore = datetime.strptime(notbefore,"%a,_%d_%b_%Y_%H:%M:%S_%Z")
-                    if last_preempt_handled is None or last_preempt_handled < notbefore:
+                    if len(notbefore) == 0:
+                        notbefore = recv_time
+                    else:
+                        notbefore = datetime.strptime(notbefore,"%a,_%d_%b_%Y_%H:%M:%S_%Z")
+                    if last_preempt_handled is None or last_preempt_handled < notbefore \
+                        or (last_preempt_handled - notbefore).total_seconds() < 120:
                         last_preempt_handled = notbefore
                         is_preempting = True  
-                        sleep_time = (notbefore - datetime.now()).seconds - 30
+                        sleep_time = (notbefore - datetime.now()).total_seconds() - 30
                         if sleep_time > 0:
                             time.sleep(sleep_time)
                         print('Trigger preempt!', flush=True)
@@ -141,6 +148,8 @@ class Handler(socketserver.BaseRequestHandler):
             print("Lock acquired by ckpt:", recv_time, is_restarting, is_morphing, is_preempting, flush=True)
             try:
                 last_iter = int(str(data).split(" ")[-1])
+                if last_iter > checkpointed:
+                    checkpointed = last_iter
                 if is_preempting:
                     print('Preempt successful {}'.format(last_iter), flush=True)
                     Handler.notify()
@@ -148,18 +157,18 @@ class Handler(socketserver.BaseRequestHandler):
                     Handler.kill_all()
                     curr_world_size = 0
                     Handler.update_available()
-                    Handler.start_remote(last_iter)
+                    Handler.start_remote(checkpointed)
                     is_preempting = False
                 elif is_morphing:
                     print("Morph successful {}".format(last_iter), flush=True)
                     Handler.kill_all()
                     curr_world_size = 0
-                    Handler.start_remote(last_iter)
+                    Handler.start_remote(checkpointed)
                     is_morphing = False
                     is_restarting = False
                 elif not is_restarting:
                     if last_ckpt_signal is None or \
-                    (recv_time - last_ckpt_signal).total_seconds() > 120:
+                    (recv_time - last_ckpt_signal).total_seconds() > 100:
                         print("Handling restart", last_ckpt_signal)
                         last_iter = int(str(data).split(" ")[-1])
                         Handler.notify()
@@ -167,7 +176,7 @@ class Handler(socketserver.BaseRequestHandler):
                         Handler.kill_all()
                         curr_world_size = 0
                         Handler.update_available()
-                        Handler.start_remote(last_iter)
+                        Handler.start_remote(checkpointed)
                         is_restarting = False
             except Exception as e:
                 is_restarting = False
@@ -191,7 +200,7 @@ class Handler(socketserver.BaseRequestHandler):
                     if curr_world_size == 0:
                         print("Nothing running currently, will start")
                         Handler.kill_all()
-                        Handler.start_remote(last_iter)
+                        Handler.start_remote(checkpointed)
                         is_morphing = False
                         is_restarting = False
                 else:

@@ -246,7 +246,7 @@ class Varuna(Module):
 
         if self.rank == 0 and self.step%10==0:
             manager_ip = "10.0.3.4"
-            manager_port = 4200
+            manager_port = 5000
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                     message = "progress {}".format(self.step)
@@ -845,6 +845,7 @@ class Pipeline:
         torch.distributed.all_reduce(flat_raw, group=self.process_group)
         allred_time = time.time() - allred_time_start
         if self.make_logfile:
+            self.logfile.write("all-reduce size {}\n".format(flat_grad_size))
             self.logfile.write("SYNC! all_reduce {} {} {}\n".format(flat_grad_size,allred_time_start,allred_time))
         
         # 4. combine unscaling and unflattening of allreduced gradient
@@ -857,6 +858,7 @@ class Pipeline:
         scaler = _amp_state.loss_scalers[0]
 
         # all-reduce to sync overflow
+        if self.partitions > 1:
         osync_time_start = time.time()
         torch.distributed.all_reduce(overflow_buf, group=self.pipeline_group)
         osync_time = time.time() - osync_time_start
