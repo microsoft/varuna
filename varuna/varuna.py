@@ -387,6 +387,15 @@ class Varuna(Module):
             task = step.split(',')
             schedule.append((int(task[0]), int(task[1])))
         
+        # all forwards followed by all backwards. vanilla gpipe
+        '''
+        schedule = [(0, i) for i in range(chunks)]  # all forwards
+        bwd = [[(1, i), (2, i)] for i in range(chunks)] # all backwards, preceeded by recompute
+        for b in bwd:
+            schedule.extend(b)
+        print(torch.distributed.get_rank(), ':schedule = ', schedule)
+        '''
+        
         return schedule
                 
 
@@ -445,7 +454,7 @@ class Pipeline:
         
         if self.partitions > 1 and self.shared_weights is not None:
             embed_comm_start = time.time()
-            share_weights(self)
+            share_weights(self)     # errors when number of layers = number of partitions
             if self.make_logfile:
                 torch.cuda.synchronize(self.device)
                 embed_comm_time = time.time() - embed_comm_start
@@ -755,11 +764,11 @@ class Pipeline:
             
             # if self.make_logfile:
             #     self.logfile.write("{} {} {} {}\n".format(TASK[task[0]],task[1], str(task_time_start), str(task_time)))
-        '''
+        # '''
 
 
         # dynamic schedule - run forward if gradients for backward are not ready yet
-
+        # '''
         schedule = [s for s in enumerate(self.schedule)]
         i=0
         count_fwd = 0
@@ -784,7 +793,7 @@ class Pipeline:
             self.worker(task[0], grad_mode, self.batches[task[1]])
 
             i+=1
-        
+        # '''
         overflow = False
         if self.fp16 and self.data_parallel:
             sync_time = time.time()
