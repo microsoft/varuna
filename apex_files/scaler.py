@@ -53,7 +53,6 @@ class LossScaler(object):
         self._scale_seq_len = scale_window
         self._unskipped = 0
         self._has_overflow = False
-        self._has_overflow_global = False       # myedits
         self._overflow_buf = torch.cuda.IntTensor([0])
         if multi_tensor_applier.available:
             import amp_C
@@ -199,17 +198,6 @@ class LossScaler(object):
         # If the fused kernel is available, we only need one D2H memcopy and sync.
         if LossScaler.has_fused_kernel and self.dynamic and not self._has_overflow:
             self._has_overflow = self._overflow_buf.item()
-        
-        # '''
-        # myedits: for synchronized loss_scaling;  Can be optimized?. Implement boolean all-reduce (reduce_op.ANY)
-        tensor_overflow = torch.tensor(self._has_overflow, dtype=torch.int8, device='cuda')
-        torch.distributed.all_reduce(tensor_overflow)
-        if tensor_overflow.item()==0:
-            self._has_overflow = False
-        else:
-            self._has_overflow = True
-        # myedits end
-        # '''
 
         if self._has_overflow and self.dynamic:
             should_skip = True
@@ -228,77 +216,3 @@ class LossScaler(object):
             self._unskipped = 0
 
         return should_skip
-
-    
-    '''
-    # myedits
-    def update_scale_sync(self):
-        # If the fused kernel is available, we only need one D2H memcopy and sync.
-        should_skip = False
-        if LossScaler.has_fused_kernel and self.dynamic and not self._has_overflow:
-            self._has_overflow = self._overflow_buf.item()
-        
-        loss_scale_this = self._loss_scale
-        loss_scale_tensor = torch.tensor([self._loss_scale, self._unskipped], dtype=torch.int32)
-        torch.distributed.all_reduce(loss_scale_tensor, op=torch.distributed.ReduceOp.MIN)
-        self._loss_scale = loss_scale_tensor[0].item()
-        self._unskipped = loss_scale_tensor[1].item()
-
-
-        if self._loss_scale != loss_scale_this:
-            should_skip = True
-        return should_skip
-    
-    # myedits end
-    # '''
-
-    # '''
-    # myedits
-    # myedits: Custom function. scale should be updated only at the end of a mini-batch
-    def update_scale_custom(self, last_microbatch):
-        if LossScaler.has_fused_kernel and self.dynamic and not self._has_overflow:
-            self._has_overflow = self._overflow_buf.item()
-
-        if self._has_overflow and self.dynamic: # every micro-batch
-            if not self._has_overflow_global:
-                print('scaler.py: gradient overflow. should_skip')
-            self._has_overflow_global  = True
-            should_skip = True
-        else:
-            should_skip = False
-
-        if last_microbatch:
-            # myedits: for synchronized loss_scaling;  Can be optimized?. Implement boolean all-reduce (reduce_op.ANY)
-            tensor_overflow = torch.tensor(self._has_overflow_global, dtype=torch.int8, device='cuda')  # int8 caps number of machines to 256
-            torch.distributed.all_reduce(tensor_overflow)
-            if tensor_overflow.item()==0:
-                self._has_overflow_global = False
-            else:
-                self._has_overflow_global = True
-            # myedits end
-
-            # once. at the end of a mini-batch (last micro-batch)
-            if self._has_overflow_global:
-                print('scaler.py: halving loss scale')
-                if(self._min_loss_scale):
-                    self._loss_scale = max(self._min_loss_scale, self._loss_scale/2.)
-                else:
-                    self._loss_scale = self._loss_scale/2.
-                self._unskipped = 0
-            else:
-                self._unskipped += 1
-
-        
-            if self._unskipped == self._scale_seq_len and self.dynamic:
-                print('scaler.py: doubling loss scale after {} unskipped steps'.format(self._scale_seq_len))
-                self._loss_scale = min(self._max_loss_scale, self._loss_scale*2.)
-                self._unskipped = 0 
-
-            if self._has_overflow_global and not should_skip:
-                should_skip = True
-
-            self._has_overflow_global = False
-
-        return should_skip
-    # myedits end
-    # '''

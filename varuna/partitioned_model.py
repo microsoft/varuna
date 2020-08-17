@@ -56,7 +56,9 @@ class CutPoint(Module):
             def forward(ctx, i):
                 # recieve activations
                 if is_in_next_stage and self.recv_fn is not None:
+                    # recv_time = time.time()
                     i = self.recv_fn()
+                    # recv_time = time.time() - recv_time
                 # send activations
                 elif is_in_prev_stage and self.send_fn is not None:
                     self.send_fn(i)
@@ -66,7 +68,10 @@ class CutPoint(Module):
             def backward(ctx, grad_output):
                 # receive gradients.
                 if is_in_prev_stage and self.recv_fn is not None:
+                    # recv_time = time.time()
                     grad_output = self.recv_fn(grads = True)
+                    # recv_time = time.time() - recv_time
+                    # self.logfile.write("rcv grads " + str(recv_time) + "\n")
                 # send gradients
                 elif is_in_next_stage and self.send_fn is not None:
                     self.send_fn(grad_output, grads = True)
@@ -103,6 +108,7 @@ class PartitionedModel(Module):
         else:
             raise ValueError("Rank " + self.rank + " not found in stage to rank map!")
 
+        # self.logfile = open("wait_logs" + str(self.rank),"w")
 
     def initialize(self, dummy_inputs, from_cache=False):
         # print("Initializing partitioned model!")
@@ -335,7 +341,7 @@ class PartitionedModel(Module):
                 continue
             if isinstance(module, CutPoint):
                 if len(state_dict.keys()) > 0:
-                    torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
+                    # torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
                     for p in temp_param_names:
                         param_name_to_pstage[p] = stage_index
                     temp_param_names = []
@@ -357,10 +363,10 @@ class PartitionedModel(Module):
         # last cutpoint
         if len(state_dict.keys()) > 0 and (cp_count < self.cuts_per_stage):
             state_dict["lm_head_weight"] = self.module.lm_head_weight
-            torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
+            # torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
             for p in temp_param_names:
                 param_name_to_pstage[p] = stage_index
-            # param_name_to_pstage["cls.predictions.bias"] = 23
+            # param_name_to_pstage["lm_head_weight"] = stage_index
             
         print("checkpointed!!")
         return param_name_to_pstage
@@ -371,12 +377,11 @@ class PartitionedModel(Module):
         self.module.eval()
         for p in self.module.parameters():
             p.grad = None
-        count = 0
+
         for n in self.ordered_modules:
             m = self.ordered_modules[n]
             if isinstance(m,CutPoint):
                 m.set_pruning(True)
-                count += 1
 
         # forward
         self.set_recv_fn(lambda grads=False: torch.zeros(self.forward_input_shapes[0], dtype=torch.float32))     
@@ -412,12 +417,11 @@ class PartitionedModel(Module):
         if prev_training:
             self.module.train()
 
-        count = 0
         for m in self.ordered_modules:
             m = self.ordered_modules[m]
             if isinstance(m,CutPoint):
                 m.set_pruning(False)
-                count += 1
+
         self.model_pruned = True
 
         
@@ -447,6 +451,7 @@ class PartitionedModel(Module):
             if self.ret_val is None:
                 raise e
             ret_val = self.ret_val
+        # self.logfile.flush()
         self.ret_val = None
         return ret_val 
 
@@ -460,11 +465,15 @@ class PassThroughModule(Module):
         return None
 
 
-def load_varuna_checkpoint(my_stage, num_stages, total_num_pstages, common_store):
+def load_varuna_checkpoint(my_stage, num_stages, total_num_pstages, common_store,prefix="cp-pstage"):
     state_dict = {}
     stages_per_worker = total_num_pstages // num_stages
     pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
     for i in pstages_to_read:
-        state_dict_ = torch.load(os.path.join(common_store, "cp-pstage-{}".format(i)),map_location="cpu")
+        cp_file = os.path.join(common_store, "{}-{}".format(prefix,i))
+        if not os.path.exists(cp_file):
+            print("WARNING: DID NOT FIND CKPT FILE",cp_file,"!!!!")
+            continue
+        state_dict_ = torch.load(cp_file,map_location="cpu")
         state_dict.update(state_dict_)
     return state_dict

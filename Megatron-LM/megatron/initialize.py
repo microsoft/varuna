@@ -78,8 +78,7 @@ def _initialize_distributed():
 
     else:
 
-        if args.rank == 0:
-            print('> initializing torch distributed ...', flush=True)
+        print('> initializing torch distributed ...', flush=True)
         # Manually set the device ids.
         if device_count > 0:
             device = args.rank % device_count
@@ -95,6 +94,7 @@ def _initialize_distributed():
         master_port = os.getenv('MASTER_PORT', '6000')
         init_method += master_ip + ':' + master_port
         connect_timeout = datetime.timedelta(minutes=10)
+        # print(init_method, args.world_size, flush=True)
         torch.distributed.init_process_group(
             backend=args.distributed_backend,
             world_size=args.world_size, timeout=connect_timeout, rank=args.rank,

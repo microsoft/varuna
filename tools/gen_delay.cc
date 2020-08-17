@@ -9,7 +9,7 @@ using namespace std;
 typedef std::deque<int> Queue;
 class GenSchedule {
 public:
-  GenSchedule(int depth, int num_mini, int rank): pipeline_depth_(depth), num_mini_(num_mini), rank_(rank) {
+  GenSchedule(int depth, int num_mini): pipeline_depth_(depth), num_mini_(num_mini) {
     InitQueues();
   }
   void Generate();
@@ -17,10 +17,9 @@ public:
 private:
   void InitQueues();
   Queue* PickQueue(int stage, char* identifier);
-  std::vector<Queue*> fwd_queues_, bi_queues_, bw_queues_, rc_queues_;
+  std::vector<Queue*> fwd_queues_, bi_queues_, bw_queues_, rc_queues_, fb_queues_;
   int pipeline_depth_;
   int num_mini_;
-  int rank_;
 };
 
 void GenSchedule::InitQueues() {
@@ -29,6 +28,7 @@ void GenSchedule::InitQueues() {
     bi_queues_.push_back(new Queue);
     bw_queues_.push_back(new Queue);
     rc_queues_.push_back(new Queue);
+    fb_queues_.push_back(new Queue);
   }
   // Fill the first stage's fwd queue.
   for (int i = 1; i <= num_mini_; ++i) {
@@ -39,40 +39,40 @@ void GenSchedule::InitQueues() {
 Queue* GenSchedule::PickQueue(int stage, char* identifier) {
   // Defines precedence order of servicing queues
   if (!bw_queues_[stage]->empty()) {
-    // *identifier = 'B';
-    *identifier = '3';
+    *identifier = 'B';
     return bw_queues_[stage];
   }
   if (!bi_queues_[stage]->empty()) {
-    // *identifier = 'b';
-    *identifier = '2'; 
+    *identifier = 'b'; 
     return bi_queues_[stage];
   }
   if (!rc_queues_[stage]->empty()) {
-    // *identifier = 'r'; 
-    *identifier = '1';
+    *identifier = 'r'; 
     return rc_queues_[stage];
   }
   if (!fwd_queues_[stage]->empty()) {
-    // *identifier = 'f'; 
-    *identifier = '0';
-    return fwd_queues_[stage];
+    if (stage == 0) {
+      *identifier = 'f'; 
+      return fwd_queues_[stage];
+    } 
+    else if (fb_queues_[stage]->size() < fwd_queues_[stage]->size()) { // we have one in buffer
+      if (!fwd_queues_[stage]->empty()) // buffering next in parallel with forward
+        fb_queues_[stage]->pop_front();
+      *identifier = 'f'; 
+      return fwd_queues_[stage];
+    } else {
+       fb_queues_[stage]->pop_front(); //delay for buffering
+    }
   }
   return NULL;
 }
 
-typedef struct {
-  int index;
-  char task;
-} schedule_task;
-
 void GenSchedule::Generate() {
-  std::vector<schedule_task> sched[pipeline_depth_];
   std::vector<int> num_bubbles;
   num_bubbles.assign(pipeline_depth_, 0);
 
   int time = 0;
-  for (time = 0; time < 20000; ++time) {
+  for (time = 0; time < 200000; ++time) {
     std::vector<int> mini_batches;
     std::vector<char> queue_ids;
     bool all_queues_empty = true;
@@ -88,20 +88,15 @@ void GenSchedule::Generate() {
       if (mini < 0) {
         ++num_bubbles[i];
         queue_ids.push_back('Z');        
-        // printf(" -  "); 
-        continue;
+        printf(" -  "); continue;
       }
 
       all_queues_empty = false;
       queue_ids.push_back(identifier);
       queue->pop_front();
-      // printf("%2d%c ", mini, identifier);
-      if (identifier!='3') {
-        schedule_task a = {mini, identifier};
-        sched[i].push_back(a);
-      }
+      printf("%2d%c ", mini, identifier);
     }
-    // printf("\n");
+    printf("\n");
     
     if (all_queues_empty) break;
 
@@ -113,30 +108,27 @@ void GenSchedule::Generate() {
       bool first_stage = (i == 0);
       bool last_stage = (i == pipeline_depth_ - 1);
       switch(queue_ids[i]) {
-        // case 'f':
-        case '0':
+        case 'f':
           if (!last_stage) {
             fwd_queues_[i+1]->push_back(mini);
+            fb_queues_[i+1]->push_back(mini);
           } else {
             bi_queues_[i]->push_back(mini);
           }
           break;
 
-        // case 'b':
-        case '2':
+        case 'b':
           bw_queues_[i]->push_back(mini);
-          if (!first_stage) {
-            rc_queues_[i-1]->push_back(mini);
-          }
           break;
 
-        // case 'r':
-        case '1':
+        case 'r':
           bi_queues_[i]->push_back(mini);
           break;
 
-        // case 'B':
-        case '3':
+        case 'B':
+          if (!first_stage) {
+            rc_queues_[i-1]->push_back(mini);
+          }
           break;
 
         case 'Z':
@@ -145,29 +137,18 @@ void GenSchedule::Generate() {
       }
     }
   }
-  
-  for (int i=0; i<pipeline_depth_; ++i) {
-    // printf("[");
-    if (i==rank_) {
-      for (int j=0; j<sched[i].size(); ++j) {
-        printf("%c,%d;", sched[i][j].task, sched[i][j].index-1);
-      }
-    }
-    // printf("\n");
-  }
-  // printf("\nFraction of bubbles = %d/%d  %.2f percent\n",
-  //        num_bubbles[0]-1, time-1, (float)(num_bubbles[0]-1)*100/(time-1));
+  printf("\nFraction of bubbles = %d/%d  %.2f percent\n",
+         num_bubbles[0]-1, time-1, (float)(num_bubbles[0]-1)*100/(time-1));
 }
 
 int main(int argc, char** argv) {
   if (argc < 3) {
-    printf("Usage: gen-schedule <pipeline-depth> <num_micro_batches> <device_rank>");
+    printf("Usage: gen-schedule <pipeline-depth> <num_micro_batches>");
     return -1;
   }
   int pipeline_depth = atoi(argv[1]);
   int num_mini = atoi(argv[2]);
-  int rank = atoi(argv[3]);
-  GenSchedule s(pipeline_depth, num_mini, rank);
+  GenSchedule s(pipeline_depth, num_mini);
   s.Generate();
   return 0;
 }

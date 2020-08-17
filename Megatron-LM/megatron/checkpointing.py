@@ -27,6 +27,8 @@ from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from megatron import mpu
 from megatron import get_args
 from megatron import print_rank_0
+import concurrent.futures
+
 
 from varuna import load_varuna_checkpoint, load_varuna_optimizer
 
@@ -97,8 +99,10 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
     else:
         data_parallel_rank = torch.distributed.get_rank()
     
+    mv_futures = None
     if data_parallel_rank == 0:
 
+        tempdir = "/mnt/nitika/varuna_ckpts/"
         checkpoint_name = get_checkpoint_name(args.save, iteration)
         model_cp_dir = os.path.join(args.save, "model_ckpt_{}".format(iteration))
         opt_cp_dir = os.path.join(args.save, "opt_ckpt_{}".format(iteration))
@@ -108,6 +112,9 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
                 os.makedirs(model_cp_dir)
             if not os.path.exists(opt_cp_dir):
                 os.makedirs(opt_cp_dir)
+        if args.local_rank:
+            if not os.path.exists(tempdir):
+                os.makedirs(tempdir)
 
         # Arguments, iteration, and model.
         state_dict = {}
@@ -149,12 +156,12 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
             while not (os.path.exists(model_cp_dir) and os.path.exists(opt_cp_dir)):
                 pass
             param_name_to_pstage = model.checkpoint(model_cp_dir)
-            param_name_to_pstage["lm_head_weight"] = args.num_layers - 1
-            model.checkpoint_optimizer(optimizer, parameter_names, param_name_to_pstage, opt_cp_dir)
+            param_name_to_pstage["lm_head_weight"] = args.num_layers + 1
+            mv_futures = model.checkpoint_optimizer(optimizer, parameter_names, param_name_to_pstage, opt_cp_dir, tempdir=None)
             
         # remove old checkpoints
         if args.max_num_ckpts is not None and torch.distributed.get_rank() == 0:
-            all_ckpted_iters = sorted([int(f.split("_")[-1]) for f in os.listdir(args.save) if f.startswith("model_ckpt")])
+            all_ckpted_iters = sorted([int(f.split("_")[-1]) for f in os.listdir(args.save) if f.startswith("opt_ckpt")])
             # assert all_ckpted_iters[-1] == iteration, "The latest checkpoint is corrupted?"
             if len(all_ckpted_iters) > args.max_num_ckpts:
                 to_remove = all_ckpted_iters[:-args.max_num_ckpts]
@@ -163,12 +170,22 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
                     if it <= args.min_ckpt_iter_to_remove:
                         continue
                     try:
-                        shutil.rmtree(os.path.join(args.save,"model_ckpt_{}".format(it)))
-                        shutil.rmtree(os.path.join(args.save, "opt_ckpt_{}".format(it)))
-                        shutil.rmtree(os.path.join(args.save,'iter_{:07d}'.format(it)))
+                        os.system("rm -rf {} &".format(os.path.join(args.save,"model_ckpt_{}".format(it))))
+                        os.system("rm -rf {} &".format(os.path.join(args.save, "opt_ckpt_{}".format(it))))
+                        os.system("rm -rf {} &".format(os.path.join(args.save,'iter_{:07d}'.format(it))))
                     except Exception as e:
                         print("Error while removing checkpoint {}: {}".format(it,str(e)))
         print('  successfully saved {}'.format(checkpoint_name))
+
+    if mv_futures is not None and len(mv_futures) > 0:
+        done, notdone = concurrent.futures.wait(mv_futures)
+        if len(notdone) > 0:
+            print("{} ckpts not moved\n".format(notdone))
+        for future in done:
+            try:
+                data = future.result()
+            except Exception as exc:
+                print('future generated an exception: %s' % ( exc))
 
     # Wait so everyone is done (necessary)
     torch.distributed.barrier()
@@ -180,8 +197,9 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
     # Wait so everyone is done (not necessary)
     torch.distributed.barrier()
 
-    with open("/home/varuna/local_ckpt_tracker.txt","w") as f:
-        f.write(str(iteration))
+    if args.local_rank == 0:
+        with open("/home/varuna/local_ckpt_tracker.txt","w") as f:
+            f.write(str(iteration))
 
 def parse_last_ckpt_iteration():
 
@@ -189,34 +207,34 @@ def parse_last_ckpt_iteration():
     if args.load_iteration != -1:
         return args.load_iteration, False
 
-        # Read the tracker file and set the iteration.
-        tracker_filename = get_checkpoint_tracker_filename(args.load)
+    # Read the tracker file and set the iteration.
+    tracker_filename = get_checkpoint_tracker_filename(args.load)
 
-        # If no tracker file, return iretation zero.
-        if not os.path.isfile(tracker_filename):
-            print_rank_0('WARNING: could not find the metadata file {} '.format(
-                tracker_filename))
-            print_rank_0('    will not load any checkpoints and will start from '
-                        'random')
-            return 0, False
+    # If no tracker file, return iretation zero.
+    if not os.path.isfile(tracker_filename):
+        print_rank_0('WARNING: could not find the metadata file {} '.format(
+            tracker_filename))
+        print_rank_0('    will not load any checkpoints and will start from '
+                    'random')
+        return 0, False
 
-        # Otherwise, read the tracker file and either set the iteration or
-        # mark it as a release checkpoint.
-        iteration = 0
-        release = False
-        with open(tracker_filename, 'r') as f:
-            metastring = f.read().strip()
-            try:
-                iteration = int(metastring)
-            except ValueError:
-                release = metastring == 'release'
-                if not release:
-                    print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
-                        tracker_filename))
-                    sys.exit()
+    # Otherwise, read the tracker file and either set the iteration or
+    # mark it as a release checkpoint.
+    iteration = 0
+    release = False
+    with open(tracker_filename, 'r') as f:
+        metastring = f.read().strip()
+        try:
+            iteration = int(metastring)
+        except ValueError:
+            release = metastring == 'release'
+            if not release:
+                print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
+                    tracker_filename))
+                sys.exit()
 
-        assert iteration > 0 or release, 'error parsing metadata file {}'.format(
-            tracker_filename)
+    assert iteration > 0 or release, 'error parsing metadata file {}'.format(
+        tracker_filename)
 
     return iteration, release
 
@@ -282,7 +300,8 @@ def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
     if args.varuna:
         model_cp_dir = os.path.join(args.load, "model_ckpt_{}".format(iteration))
         print("loading varuna ckpt", iteration)
-        model_state_dict = load_varuna_checkpoint(args.stage, args.partitions, args.num_layers, model_cp_dir)
+        opt_cp_dir = os.path.join(args.load, "opt_ckpt_{}".format(iteration))
+        model_state_dict = load_varuna_checkpoint(args.stage, args.partitions, args.num_layers + 2, opt_cp_dir, prefix="opt-fp32-params")
         model.load_state_dict(model_state_dict, strict = False)
     else:
         model.load_state_dict(state_dict['model'])
@@ -298,7 +317,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
                             if k != 'params':
                                 optimizer.param_groups[i][k] = v
                     opt_cp_dir = os.path.join(args.load, "opt_ckpt_{}".format(iteration))
-                    load_varuna_optimizer(optimizer, args.stage, args.partitions, args.num_layers, parameter_names, opt_cp_dir, args.fp16)
+                    load_varuna_optimizer(optimizer, args.stage, args.partitions, args.num_layers + 2, parameter_names, opt_cp_dir, args.fp16)
                     device = args.local_rank
                     for state in optimizer.state.values():
                         for k, v in state.items():
@@ -332,6 +351,12 @@ def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
                          'attempting to load the optimizer state, '
                          'exiting ...'.format(checkpoint_name))
             sys.exit()
+
+    
+    if args.local_rank == 0:
+        with open("/home/varuna/local_ckpt_tracker.txt","w") as f:
+            print("writing", iteration)
+            f.write(str(iteration))
 
     torch.distributed.barrier()
     print('  successfully loaded {}'.format(checkpoint_name))

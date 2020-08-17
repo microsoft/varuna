@@ -19,6 +19,7 @@ from datetime import datetime
 import math
 import sys
 import os
+import time
 
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
@@ -165,6 +166,8 @@ def get_model(model_provider_func, dry_run_input=None):
     if args.varuna:
         shared_weights = [("language_model.embedding.word_embeddings.weight","lm_head_weight")]
         model = Varuna(model, args.stage_to_rank_map, dry_run_input, args.batch_size * args.data_depth, args.chunk_size, args.fp16, local_rank=args.local_rank, device=args.local_rank, shared_weights=shared_weights)            
+    if args.local_rank == 0:
+        print('get_model() post varuna init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())            
     
     # Print number of parameters.
     if mpu.model_parallel_is_initialized() and  mpu.get_data_parallel_rank() == 0:
@@ -235,6 +238,8 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
 
     model = get_model(model_provider_func, dry_run_input)
     optimizer = get_optimizer(model)
+    if args.local_rank==0:
+        print('setup_model() post optimizer init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
     lr_scheduler = get_learning_rate_scheduler(optimizer)
 
     basemodel = model
@@ -248,17 +253,18 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
         else:
             basemodel, optimizer = amp.initialize(basemodel, optimizer, opt_level="O2", loss_scale=args.loss_scale, min_loss_scale=args.min_scale)
     
+    if args.local_rank==0:
+        print('setup_model() post amp init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
         if args.varuna:
-            if args.data_depth > 1:
-                model.model.module.module = basemodel
-            else:
-                model.model.module = basemodel
+            model.model.module = basemodel
 
     if args.varuna:
         model.set_optimizer(optimizer)
 
     # fp32 param names for checkpointing
     optimizer._amp_lazy_init()
+    if args.local_rank==0:
+        print('setup_model() post amp opt init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
     parameter_names_ = dict()
     for n,p in basemodel.named_parameters():
         parameter_names_[p] = n
@@ -272,8 +278,11 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
             parameter_names[p_master] = parameter_names_.pop(p_model)
             count += 1
     print(count, "params found in rank", args.rank)
-
-    
+    # if args.local_rank==0:
+        # print("setup_model() post opt init: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
+        # print('setup_model() post opt int:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
+    # print(args.rank, parameter_names)
+    # '''
 
     # Wrap model for distributed training."""
     if args.DDP_impl == 'torch':
@@ -299,6 +308,7 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
                 break
         with torch.no_grad():
             basemodel.lm_head_weight.data.copy_(param.data) 
+
 
     return model, optimizer, lr_scheduler, parameter_names
 
@@ -375,7 +385,7 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
 
     # Forward model for one step.
     # timers('forward').start()
-    loss, loss_reduced = varuna_step(data_iterator, model)
+    loss, loss_reduced, overflow = varuna_step(data_iterator, model)
     # timers('forward').stop()
 
     if args.clip_grad > 0:
@@ -386,7 +396,17 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
 
     # Update parameters.
     timers('optimizer').start()
-    overflow = optimizer.step()
+    # if args.local_rank==0:
+        # print("setup_model() pre opt step: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
+        # print('setup_model() pre opt step:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
+    if not overflow:
+        optimizer.step()
+    else:
+        for param in optimizer._amp_stash.all_fp32_from_fp16_params:
+            param.grad = None
+    # if args.local_rank==0:
+        # print("setup_model() post opt step: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
+        # print('setup_model() post opt step:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())        
     timers('optimizer').stop()
 
     for param in model.parameters():
@@ -403,7 +423,7 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
 
 
 def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
-                 loss_scale, step_time, report_memory_flag, loss_file=None):
+                 loss_scale, step_time, total_train_time, report_memory_flag, loss_file=None):
     global accumulated_loss
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -446,7 +466,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     accumulated_loss += lm_loss
     if (loss_file is not None) and iteration % args.gradient_accumulation_steps == 0:
         accumulated_loss = accumulated_loss / args.gradient_accumulation_steps
-        loss_file.write("{}, {}, {}, {}\n".format(step_time, loss_scale, learning_rate, accumulated_loss))
+        loss_file.write("{}, {}, {}, {}, {}\n".format(step_time, total_train_time, loss_scale, learning_rate, accumulated_loss))
         if complete_steps % 50:
             loss_file.flush()
         accumulated_loss = 0
@@ -460,6 +480,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                                                        args.train_iters)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time * 1000.0 / args.log_interval)
+        log_string += 'total train time(s): {:.1f}'.format(total_train_time)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
         for key in total_loss_dict:
             avg = total_loss_dict[key].item() / args.log_interval
@@ -496,12 +517,16 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     iteration = args.iteration * args.gradient_accumulation_steps
     skipped_iters = 0
     complete_steps = args.iteration
+    if args.varuna:
+        model.step = args.iteration
 
     loss_file = None
     eval_loss_file = None
     if (args.varuna and args.stage == args.partitions - 1) or (not args.varuna and torch.distributed.get_rank() == 0):
         loss_filename = "{}-{}.txt".format(args.loss_file, torch.distributed.get_rank() )
         eval_loss_filename = "eval-" + loss_filename
+        loss_filename = os.path.join(args.save, "stats", loss_filename)
+        eval_loss_filename = os.path.join(args.save, "stats", eval_loss_filename)
         if iteration == 0:
             if os.path.isfile(loss_filename):
                 raise RuntimeError("loss file {} already exists!".format(loss_filename))
@@ -514,9 +539,12 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             loss_file.write("resumed to config {}x{} at step {}\n".format(args.partitions, args.data_depth, args.iteration))
             eval_loss_file = open(eval_loss_filename, "a")
             eval_loss_file.write("resumed\n")
-
+        loss_file.write(str(datetime.now())+ "\n")
+    
     timers('interval time').start()
     report_memory_flag = True
+
+    train_start_time = time.time()
 
     step_func = train_step_varuna if args.varuna else train_step
 
@@ -535,12 +563,13 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             complete_steps += 1
 
         # Logging.
+        total_train_time = time.time() - train_start_time
         loss_scale = None
         if args.fp16:
             loss_scale = _amp_state.loss_scalers[0].loss_scale()
         report_memory_flag = training_log(loss_dict, total_loss_dict,
                                           optimizer.param_groups[0]['lr'],
-                                          iteration, loss_scale, step_time,
+                                          iteration, loss_scale, step_time, total_train_time,
                                           report_memory_flag, loss_file)
 
         # Autoresume
@@ -552,7 +581,10 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         # Checkpointing
         if args.save and args.save_interval and complete_steps > 0 and \
            complete_steps % args.save_interval == 0:
+            ckpt_time = time.time()           
             save_checkpoint(complete_steps, model, optimizer, lr_scheduler, parameter_names)
+            ckpt_time = time.time() - ckpt_time
+            print(args.rank, "ckpt time", ckpt_time)
             
         # Evaluation
         if args.eval_interval and complete_steps > 0 and complete_steps % args.eval_interval == 0 and \
@@ -560,7 +592,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             prefix = 'iteration {}'.format(complete_steps)
             evaluate_and_print_results(prefix, forward_step_func if not args.varuna else eval_step_varuna,
                                        valid_data_iterator, model,
-                                       complete_steps, False, eval_loss_file)
+                                       complete_steps, False, loss_file=eval_loss_file)
 
         if args.exit_interval and complete_steps > 0 and complete_steps % args.exit_interval == 0:
             torch.distributed.barrier()
@@ -600,7 +632,7 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
                         loss_dict[key]
     
     # Move model back to the train mode.
-    if not args.debug_eval():
+    if not args.debug_eval:
         model.train()
 
     if not args.varuna or args.stage == args.partitions - 1:
@@ -637,6 +669,7 @@ def evaluate_and_print_results(prefix, forward_step_func,
             writer.add_scalar('{} ppl'.format(key), ppl, iteration)
         if loss_file is not None:
             loss_file.write("{}: {}, ".format(key, total_loss_dict[key].item()))
+            loss_file.flush()
 
     if loss_file is not None:
         loss_file.write("\n")
@@ -751,7 +784,7 @@ def get_eval_numbers(train_valid_test_dataset_provider, model_provider,
     print("WS",args.world_size, torch.distributed.get_world_size())
 
     shared_weights = [("language_model.embedding.word_embeddings.weight","lm_head_weight")]
-    model, _opt, _lrs, _pn = setup_model_and_optimizer(model_provider)
+    model, _opt, _lrs, _pn = setup_model_and_optimizer(model_provider, None)
     model = Varuna(model, args.stage_to_rank_map, {}, args.batch_size * args.data_depth, _opt, args.chunk_size, args.fp16, local_rank=args.local_rank, device=args.local_rank, shared_weights=shared_weights)            
 
     ckpt_iters = sorted([int(f.split("_")[-1]) for f in os.listdir(args.load) if "model_ckpt_" in f])

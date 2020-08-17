@@ -4,6 +4,7 @@ import sys
 import subprocess
 import signal
 import math
+import random
 import socket
 # import atexit
 
@@ -13,7 +14,7 @@ local_rank_to_device = [0,1,2,3]
 MAX_GPU_MEM = 16280000000
 processes = []
 
-manager_ip = "172.16.5.4"
+manager_ip = "10.0.3.4"
 manager_port = 4200
 
 def calculate_config(args):
@@ -24,61 +25,125 @@ def calculate_config(args):
     print(gpus_per_stage, "per stage")
     dist_world_size = gpus_per_stage * args.nstages
     assert dist_world_size <= gpus_available, "Too many gpus_per_stage - {}!".format(gpus_per_stage)
-    unused_gpus = (gpus_available - dist_world_size)
 
-    # one whole server is unused
-    if unused_gpus > args.ngpus_per_server:
-        raise ValueError("Wrong number of servers - too many unused GPUs")
+    # some servers unused
+    if args.custom_placement:
+        servers_for_embeddings = math.ceil(gpus_per_stage / float(args.ngpus_per_server))
+        other_servers = math.ceil((dist_world_size - gpus_per_stage) / float(args.ngpus_per_server))
+        num_servers = other_servers + servers_for_embeddings
+        if num_servers > args.nservers:
+            raise RuntimeError("Not enough servers for cutom placement")
+        args.nservers = num_servers
+    else:
+        args.nservers = math.ceil(dist_world_size / float(args.ngpus_per_server))
+
+    print(args.nservers, "servers!")
+    if args.node_rank >= args.nservers:
+        print(args.node_rank, args.nservers, "I am of no use!")
+        exit()
+    gpus_available = args.nservers * args.ngpus_per_server
 
     stage_to_rank_map = {}
     rank_to_stage_map = {}
 
-    for i in range(args.nstages):
-        stage_to_rank_map[i]= range(i,dist_world_size,args.nstages)
-#    for i in range(0,dist_world_size,gpus_per_stage):
-#        stage_to_rank_map[int(i//gpus_per_stage)] = range(i,i+gpus_per_stage)
+    if args.custom_placement:
+        # seperate VMs for embeddings
+        stage_to_rank_map[0] = range(0, gpus_per_stage)
+        for i in range(1, args.nstages):
+            stage_to_rank_map[i] = \
+                range( gpus_per_stage + i-1, dist_world_size, args.nstages-1)
+    else:
+        # clustered
+        for i in range(args.nstages):
+            stage_to_rank_map[i] = range(i, dist_world_size, args.nstages) 
+            for r in stage_to_rank_map[i]:
+                rank_to_stage_map[r] = i
+
+        # scattered
+        # for i in range(0,dist_world_size,gpus_per_stage):
+        #    stage_to_rank_map[int(i//gpus_per_stage)] = range(i,i+gpus_per_stage)
+
+
+    # # batch size should be divisible by num of data parallel workers
+    per_gpu_batch_size = args.batch_size // gpus_per_stage
+    total_batch_size = per_gpu_batch_size * gpus_per_stage     
+
+    if args.custom_placement:
+        last_unused_gpus = 0
+        if ((dist_world_size - gpus_per_stage) % args.ngpus_per_server) != 0:
+            last_unused_gpus = args.ngpus_per_server - ((dist_world_size - gpus_per_stage) % args.ngpus_per_server)
+
+        last_embedding_node_rank = math.ceil(gpus_per_stage / args.ngpus_per_server) - 1
+        # unused_gpus = (args.nservers - last_embedding_node_rank - 1) * args.ngpus_per_server
+        if args.node_rank == last_embedding_node_rank:
+            first_rank_in_server = args.node_rank * args.ngpus_per_server
+            ranks_in_server = range(first_rank_in_server, gpus_per_stage)
+        elif args.node_rank < last_embedding_node_rank:
+            first_rank_in_server = args.node_rank * args.ngpus_per_server
+            ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
+        elif args.node_rank < (args.nservers - 1):
+            first_rank_in_server = (args.node_rank * args.ngpus_per_server) - (args.ngpus_per_server - gpus_per_stage % args.ngpus_per_server)
+            ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
+        else:
+            first_rank_in_server = (args.node_rank * args.ngpus_per_server) - (args.ngpus_per_server - gpus_per_stage % args.ngpus_per_server)
+            ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server - last_unused_gpus)
+    
+    else:
+        last_unused_gpus = 0
+        if (dist_world_size % args.ngpus_per_server) != 0:
+            last_unused_gpus = args.ngpus_per_server - (dist_world_size % args.ngpus_per_server)
+        
+        first_rank_in_server = args.node_rank * args.ngpus_per_server
+        ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
+        if args.node_rank == args.nservers - 1:
+            ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server - last_unused_gpus)
+    
+
+    # shuffle ranks for some razzle dazzle
+    alias_map_str = None
+    if args.rank_aliasing:
+        all_ranks = list(range(dist_world_size))
+        random.Random(4).shuffle(all_ranks)
+
+        all_reduce_groups = [all_ranks[i:i+gpus_per_stage] for i in range(0,dist_world_size, gpus_per_stage)]
+        all_reduce_groups = [sorted(g) for g in all_reduce_groups]
+
+        alias_map = []
+        node_rank0 = -1
+        for r in range(dist_world_size):
+            replica_num = r // args.nstages
+            s = rank_to_stage_map[r]
+            agr = (replica_num + s) % gpus_per_stage
+            alias = all_reduce_groups[s][agr]
+            assert alias not in alias_map, "Whhaaaa"+str(r)
+            if alias == 0:
+                node_rank0 = r // args.ngpus_per_server
+            alias_map.append(alias)
+
+
+        print("all ranks", len(alias_map))
+        all_ranks_str = [str(r) for r in alias_map]
+        alias_map_str = ",".join(all_ranks_str)
+        for s in stage_to_rank_map:
+            orig_ranks = stage_to_rank_map[s]
+            alias_ranks = [alias_map[r] for r in orig_ranks]
+            stage_to_rank_map[s] = alias_ranks
+
     stage_to_rank_map_str = ""
     for stage in stage_to_rank_map:
         ranks = ",".join([str(r) for r in stage_to_rank_map[stage]])
         stage_to_rank_map_str += (ranks + ";")
 
-    # # batch size should be divisible by num of data parallel workers
-    per_gpu_batch_size = args.batch_size // gpus_per_stage
-    total_batch_size = per_gpu_batch_size * gpus_per_stage
-    # train_batch_size = args.batch_size
-    
-    # per_gpu_micro_batch_size = math.ceil(per_gpu_batch_size / (1.0 * args.chunks))
-    # gradient_accumulation_steps = 1
-    # max_gradient_accumulation_steps = per_gpu_micro_batch_size // max_micro_batch_size_per_gpu
-
-    # # shouldn't ceil(max_grad_acc_steps) just be the actual one we use??
-    # while per_gpu_micro_batch_size > max_micro_batch_size_per_gpu and gradient_accumulation_steps <= max_gradient_accumulation_steps :
-    #     gradient_accumulation_steps += 1
-    #     per_gpu_micro_batch_size_ = per_gpu_micro_batch_size // gradient_accumulation_steps 
-    #     if per_gpu_micro_batch_size_ <= max_micro_batch_size_per_gpu:
-    #         per_gpu_micro_batch_size = per_gpu_micro_batch_size_
-    #         break
-
-    # # for pipelining, we don't really need gradient accumalation steps - just increase the number of chunks
-    # # we want to keep the micro BS same
-    # args.chunks = args.chunks * gradient_accumulation_steps
-
-    first_rank_in_server = args.node_rank * args.ngpus_per_server
-    if args.node_rank == args.nservers - 1:
-        ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server - unused_gpus)
-    else:
-        ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
-
     print("Config:")
+    print("ranks:", ranks_in_server)
     print("train batch size:",args.batch_size)
     print("partitions:", args.nstages)
     print("chunk_size:", args.chunk_size)
     print("data depth:", gpus_per_stage)
     print("stage to rank map:", stage_to_rank_map_str)
 
-    return dist_world_size, stage_to_rank_map_str, ranks_in_server, total_batch_size, gpus_per_stage
+    return dist_world_size, stage_to_rank_map, ranks_in_server, total_batch_size, gpus_per_stage, alias_map_str
     
-
 
 def parse_args():
     """
@@ -103,9 +168,6 @@ def parse_args():
 
     parser.add_argument("--batch_size", required=True, type=int,
                         help="Total effective batch size required")
-
-    # parser.add_argument("--profile", required=True, type=str,
-    #                     help="CSV file containing memory profile of the model")
     
     parser.add_argument("--chunk_size", type=int, required=True,
                         help="Micro-batch size per mini-batch")
@@ -126,6 +188,11 @@ def parse_args():
                         help="Master node (rank 0)'s free port that needs to "
                              "be used for communciation during distributed "
                              "training")
+    parser.add_argument("--custom_placement", default=False, action="store_true",
+                        help="place embeddings separately if possible")
+
+    parser.add_argument("--rank_aliasing", default=False, action="store_true",
+                        help="shuffle ranks to avoid NCCL errors")
 
     parser.add_argument("training_script", type=str,
                         help="The full path to the single GPU training "
@@ -147,41 +214,6 @@ if __name__ == "__main__":
 
     args = parse_args()
 
-    # max_micro_batch_size_per_gpu = -1
-    # cutpoints_per_stage = args.total_num_stages // args.nstages
-    # with open(args.profile, 'r') as f:
-    #     # skip line with column names
-    #     f.readline()
-    #     for line in f:
-    #         if line == "":
-    #             continue
-    #         batch_size, _f, _b, max_mem_usage, _i , _m, _acts_size, _ = line.split(",")
-    #         # profile is for single stage, so scale acc
-    #         max_mem_usage = int(max_mem_usage) * cutpoints_per_stage
-    #         batch_size = int(batch_size)
-    #         if max_mem_usage > MAX_GPU_MEM:
-    #             break
-    #         else:
-    #             max_micro_batch_size_per_gpu = batch_size
-
-    # print("max_micro_batch_size_per_gpu:",max_micro_batch_size_per_gpu)
-
-    # if max_micro_batch_size_per_gpu <= 0:
-    #     raise ValueError("No micro-batch can fit for the model! Calculated max micro BS per gpu is " + str(max_micro_batch_size_per_gpu))
-
-    # for max GPU util
-    if args.chunk_size == -1:
-        args.chunk_size = max_micro_batch_size_per_gpu
-
-    with open('ngpus', 'w') as f:
-        f.write(str(args.ngpus_per_server))
-    with open('nservers', 'w') as f:
-        f.write(str(args.nservers))
-    with open('nstages', 'w') as f:
-        f.write(str(args.nstages))
-    with open('gpus_per_stage', 'w') as f:
-        f.write(str(args.gpus_per_stage))
-
     def handler(signum,_):
         global loop_pending
         print('Signal handler called with signal', signum, flush=True)
@@ -202,8 +234,12 @@ if __name__ == "__main__":
         args.nservers = nservers
         args.gpus_per_stage = gpus_per_stage
         args.nstages = nstages
-        for p in processes:
-            p.send_signal(signal.SIGUSR1)
+        try:
+            for p in processes:
+                p.send_signal(signal.SIGUSR1)
+        except Exception as e:
+            print("run_varuna: error while sending signal:- ", e)
+            
         print("\n\n CONFIG CHANGED TO ",args.nservers, "x",args.ngpus_per_server,"!!\n\n\n", flush=True)
 
     signal.signal(signal.SIGUSR1, handler)
@@ -228,7 +264,36 @@ if __name__ == "__main__":
         processes = []
         loop_pending = False
 
-        dist_world_size, stage_to_rank_map_str, ranks_in_server, total_batch_size, gpus_per_stage = calculate_config(args)
+        dist_world_size, stage_to_rank_map, ranks_in_server, \
+            total_batch_size, gpus_per_stage, alias_map = calculate_config(args)
+
+        if alias_map is not None:
+            alias_ranks = [int(i) for i in alias_map.split(",")]
+        else:
+            alias_ranks = list(range(dist_world_size))
+
+        print("ALIAS RANKS:", alias_ranks)
+
+        
+        if args.node_rank == 0:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    message = "starting job of size {}".format(dist_world_size)
+                    sock.connect((manager_ip, manager_port))
+                    sock.sendall(bytes(message, 'ascii'))
+            except:
+                print("Could not send start message")
+        
+
+        with open('ngpus', 'w') as f:
+            f.write(str(args.ngpus_per_server))
+        with open('nservers', 'w') as f:
+            f.write(str(args.nservers))
+        with open('nstages', 'w') as f:
+            f.write(str(args.nstages))
+        with open('gpus_per_stage', 'w') as f:
+            f.write(str(args.gpus_per_stage))
+
         current_env["WORLD_SIZE"] = str(dist_world_size)
         print("World size is",dist_world_size)
         
@@ -236,9 +301,33 @@ if __name__ == "__main__":
         if dist_world_size % args.nstages != 0:
             raise ValueError("Each stage must get equal number of GPU processes")
 
+        if args.rank_aliasing:
+            group_ranks = []
+            for rr in ranks_in_server:
+                r = alias_ranks[rr]
+                for s in stage_to_rank_map:
+                    if r in stage_to_rank_map[s]:
+                        gr = sorted(stage_to_rank_map[s]).index(r)
+                        group_ranks.append(gr)
+                        break
+            collision = 0
+            for i in range(4):
+                for j in range(i+1,4):
+                    if group_ranks[i] == group_ranks[j]:
+                        collision += 1
+            print(group_ranks)
+            print("Collisions",collision)
+
+        stage_to_rank_map_str = ""
+        for stage in stage_to_rank_map:
+            ranks = ",".join([str(r) for r in stage_to_rank_map[stage]])
+            stage_to_rank_map_str += (ranks + ";")
+
         for rank in ranks_in_server:
             
             local_rank = rank % args.ngpus_per_server
+
+            rank = alias_ranks[rank]            
 
             # each process's rank
             current_env["RANK"] = str(rank)
@@ -246,7 +335,6 @@ if __name__ == "__main__":
 
             # spawn the processes
             cmd = [sys.executable, "-u"]
-            # cmd = ["bash"]
 
             cmd.append(args.training_script)
 
@@ -257,26 +345,13 @@ if __name__ == "__main__":
             cmd.append("--chunk_size={}".format(str(args.chunk_size)))
             cmd.append("--local_rank={}".format(str(local_rank)))
             cmd.append("--stage_to_rank_map={}".format(stage_to_rank_map_str))
-            # cmd.append("--device={}".format(str(local_rank_to_device[local_rank])))
             cmd.append("--batch-size={}".format(str(per_process_batch_size)))
-            # if loop_count > 0:
-            #     with open("resume_step","r") as f:
-            #         resume_step = int(f.read())
-            #     cmd.append("--resume_from_checkpoint")
-            #     cmd.append("--resume_step={}".format(resume_step))
 
             cmd.extend(args.training_script_args)
-            print(" ".join(cmd))
+            print(" ".join(cmd), flush=True)
 
-            # print(current_env["WORLD_SIZE"], current_env["RANK"], current_env["LOCAL_RANK"])
             process = subprocess.Popen(cmd, env=current_env)
             processes.append(process)
-
-        # cleanup on kill or error
-        # def cleanup:
-
-        with open("prev_job_done","w")as f:
-            f.write("notdone")
 
         # wait for all processes
         try:
@@ -291,8 +366,6 @@ if __name__ == "__main__":
         except Exception as e:
             print("run_varuna subprocesses quit with error:", e)
 
-        with open("prev_job_done","w") as f:
-            f.write("done")
 
         last_iter = -1
         if os.path.exists("/home/varuna/local_ckpt_tracker.txt"):
@@ -300,7 +373,7 @@ if __name__ == "__main__":
                 last_iter = int(f.read())
 
         print("done and trying to send here", flush=True)
-        
+     
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             message = "checkpoint done {}".format(last_iter)
             sock.connect((manager_ip, manager_port))
