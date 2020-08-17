@@ -53,15 +53,6 @@ from apex.amp import _amp_state
 
 import socket
 
-def client(message, ip="10.0.3.4", port=3500):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.connect((ip, port))
-        sock.sendall(bytes(message, 'ascii'))
-
-def print_rank_0_client(msg):
-    print_rank_0(msg)
-    # client(msg)
-
 accumulated_loss = 0
 MODEL = None
 OPTIMIZER = None
@@ -152,9 +143,9 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
     PARAMETER_NAMES = parameter_names
     
     # Print setup timing.
-    print_rank_0_client('done with setups ...')
+    print_rank_0('done with setups ...')
     timers.log(['model and optimizer', 'train/valid/test data iterators'])
-    print_rank_0_client('training ...')
+    print_rank_0('training ...')
     setup_time = time.time() - setup_time
 
     iteration = 0
@@ -184,9 +175,6 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
 def get_model(model_provider_func, dry_run_input=None):
     """Build the model."""
     args = get_args()
-
-    #if args.local_rank % 2 != 0:
-    #    time.sleep(900)
 
     # Build model on cpu.
     model = model_provider_func()
@@ -631,7 +619,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             torch.distributed.barrier()
             time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             rank = torch.distributed.get_rank()
-            print_rank_0_client('rank: {} | time: {} | exiting the program at '
+            print_rank_0('rank: {} | time: {} | exiting the program at '
                          'iteration {}'.format(rank, time_str, complete_steps))
             sys.exit()
 
@@ -654,7 +642,7 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
         while iteration < args.eval_iters:
             iteration += 1
             if verbose and iteration % args.log_interval == 0:
-                print_rank_0_client('Evaluating iter {}/{}'.format(iteration,
+                print_rank_0('Evaluating iter {}/{}'.format(iteration,
                                                             args.eval_iters))
             # Forward evaluation.
             _, loss_dict = forward_step_func(data_iterator, model)
@@ -721,7 +709,7 @@ def build_train_valid_test_data_iterators(
 
     (train_dataloader, valid_dataloader, test_dataloader) = (None, None, None)
 
-    print_rank_0_client('> building train, validation, and test datasets ...')
+    print_rank_0('> building train, validation, and test datasets ...')
     print("Trying to build")
     # Data loader only on rank 0 of each model parallel group.
     if (not mpu.model_parallel_is_initialized()) or mpu.get_model_parallel_rank() == 0:
@@ -741,10 +729,10 @@ def build_train_valid_test_data_iterators(
         train_val_test_num_samples = [train_iters * global_batch_size,
                                       eval_iters * global_batch_size,
                                       test_iters * global_batch_size]
-        print(' > datasets target sizes (minimum size):')
-        print('    train:      {}'.format(train_val_test_num_samples[0]))
-        print('    validation: {}'.format(train_val_test_num_samples[1]))
-        print('    test:       {}'.format(train_val_test_num_samples[2]))
+        print_rank_0(' > datasets target sizes (minimum size):')
+        print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
+        print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
+        print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
 
         # Build the datasets.
         train_ds, valid_ds, test_ds = build_train_valid_test_datasets_provider(
@@ -780,14 +768,14 @@ def build_train_valid_test_data_iterators(
     if train_dataloader is not None:
         train_dataloader.batch_sampler.start_iter = args.iteration % \
             len(train_dataloader)
-        print('setting training data start iteration to {}'.
+        print_rank_0('setting training data start iteration to {}'.
                      format(train_dataloader.batch_sampler.start_iter))
     if valid_dataloader is not None:
         start_iter_val = (args.iteration // args.eval_interval) * \
             args.eval_iters
         valid_dataloader.batch_sampler.start_iter = start_iter_val % \
             len(valid_dataloader)
-        print('setting validation data start iteration to {}'.
+        print_rank_0('setting validation data start iteration to {}'.
                      format(valid_dataloader.batch_sampler.start_iter))
 
     # Build iterators.
