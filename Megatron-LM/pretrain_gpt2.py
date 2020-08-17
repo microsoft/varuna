@@ -24,7 +24,7 @@ from megatron import mpu
 from megatron import print_rank_0
 from megatron.data.gpt2_dataset import build_train_valid_test_datasets
 from megatron.model import GPT2Model
-from megatron.training import pretrain, get_eval_numbers
+from megatron.training import pretrain, get_eval_numbers, on_demand_checkpoint
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import reduce_losses
 
@@ -166,6 +166,7 @@ if __name__ == "__main__":
 
     def handler(signum,_):
         print(torch.distributed.get_rank(), 'signal handler called with signal', signum)
+        on_demand_checkpoint()
         exit()
 
     signal.signal(signal.SIGUSR1, handler) 

@@ -60,7 +60,7 @@ def parse_args(extra_args_provider=None, defaults={},
     # Check required arguments.
     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
                      'max_position_embeddings']
-    if args.varuna:
+    if args.varuna and not args.profiler:
         required_args += ['stage_to_rank_map', 'partitions', 'chunk_size']
     for req_arg in required_args: 
         _check_arg_is_not_none(args, req_arg)
@@ -73,7 +73,7 @@ def parse_args(extra_args_provider=None, defaults={},
         print('using world size: {} and model-parallel size: {} '.format(
             args.world_size, args.model_parallel_size))
 
-    if args.varuna:
+    if args.varuna and not args.profiler:
         # parse stage_to_rank_map
         assert len(args.stage_to_rank_map) > 0, "Need a valid stage to rank map for Varuna!"
         stage_to_rank_map = args.stage_to_rank_map
@@ -88,7 +88,7 @@ def parse_args(extra_args_provider=None, defaults={},
         args.data_depth = len(ranks)
         args.stage_to_rank_map = stage_to_rank_map
         assert args.stage != -1, "Invalid stage to rank map!"
-
+    
     # Fp16 loss scaling.
     args.dynamic_loss_scale = False
     if args.loss_scale is None:
@@ -166,6 +166,13 @@ def _add_varuna_args(parser):
                         help = "number of pipeline stages/partitions")
     group.add_argument("--chunk_size", type=int,default=None,
                         help = "number of microbatches for pipeline")
+    group.add_argument("--profiler", action="store_true", default=False,
+                        help = "whether we are profiling before training")
+    group.add_argument("--stage", type=int, default=-1, 
+                        help = "stage for varuna/profiling")
+    group.add_argument("--profiling-iters", type=int, default=10)
+    group.add_argument("--static-profile-csv", typ=str, default=None)
+    group.add_argument("--dynamic-profile-csv", type=str, default=None)
     return parser
 
 def _add_regularization_args(parser):

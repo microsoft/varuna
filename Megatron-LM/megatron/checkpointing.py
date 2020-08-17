@@ -95,17 +95,6 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
     args = get_args()
     global mv_futures
 
-    # if not on_demand and mv_futures is not None and len(mv_futures) > 0:
-    #     print("waiting on futures...")
-    #     done, notdone = concurrent.futures.wait(mv_futures)
-    #     if len(notdone) > 0:
-    #         print("{} ckpts not moved\n".format(len(notdone)))
-    #     for future in done:
-    #         try:
-    #             data = future.result()
-    #         except Exception as exc:
-    #             print('future generated an exception: %s' % ( exc))
-
     # Only rank zero of the data parallel writes to the disk.
     if not args.varuna and isinstance(model, torchDDP):
         model = model.module
@@ -119,7 +108,11 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
     
     if on_demand or data_parallel_rank == 0:
 
-        tempdir = "/mnt/nitika/varuna_ckpts/"
+        print(torch.distributed.get_rank(), "reached entry")
+        tempdir = "/mnt/nitika/varuna_ckpts"
+        if on_demand and args.partitions < 4:
+            tempdir += "_" + data_parallel_rank
+
         checkpoint_name = get_checkpoint_name(args.save, iteration, on_demand, data_parallel_rank)
 
         model_cp_dir = os.path.join(args.save, "model_ckpt_{}".format(iteration))
@@ -136,6 +129,8 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
         if args.local_rank == 0:
             if not os.path.exists(tempdir):
                 os.makedirs(tempdir)
+        
+        print(torch.distributed.get_rank(), "created dirs")
 
         # Arguments, iteration, and model.
         state_dict = {}
@@ -166,7 +161,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
         if args.fp16:
             state_dict['amp'] = amp.state_dict()
 
-        if on_demand or args.rank == 0:
+        if (on_demand and args.stage == 0) or args.rank == 0:
             # Save.
             print('global rank {} is saving checkpoint at iteration {:7d} to {}'.
                 format(torch.distributed.get_rank(), iteration, checkpoint_name))

@@ -111,32 +111,20 @@ class Varuna(Module):
 
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
         self.model = PartitionedModel(model, self.rank, self.local_rank, device, self.stage_to_rank_map, self.fp16, shared_weights)
-        self.model.initialize( dummy_inputs, from_cache=False )
-        if self.local_rank==0:
-            # print("varuna init() after dry run init: ", self.local_rank, torch.cuda.memory_summary(self.device))
-            print('varuna init() after dry run:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
+        self.model.initialize( dummy_inputs, from_cache=True )
         self.partitioned_model = self.model
         self.shared_weight_stages = self.model.shared_weight_stages if self.shared_weights is not None else None
 
         print("SHARED WEIGHTS ARE")
         print(self.shared_weight_stages)
 
-        # assert(batch_size % data_depth == 0, "Batch size not divisible by data parallel depth!")
         self.batch_size = batch_size // data_depth
         self.micro_batch_size = chunk_size
         self.last_chunk_size = self.batch_size % chunk_size 
         self.init_communication(rank_within_stage)
 
-        self.model.to(self.device)
-        # torch.cuda.synchronize()
-        if self.local_rank==0:
-            # print("varuna_init() post model.to: ", self.local_rank, torch.cuda.memory_summary(self.device))
-            print('varuna init() post model.to:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
+        self.model.to(self.device)        
         self.init_distributed()
-        # if self.local_rank==0:
-        #     # print("varuna_init() post ddp init: ", self.local_rank, torch.cuda.memory_summary(self.device))
-        #     print('varuna init() post ddp init:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
-
 
         self.config = {
             "stage": self.stage,
@@ -240,10 +228,23 @@ class Varuna(Module):
         # ask the model writer to pass the input batch generating dataloader function to Varuna::__init__
         # and Varuna can take care of input dataloader explicitly
         self.config["make_logfile"] = bool(self.config["make_logfile"] and self.step < 10)
+        batch_time = time.time()
         pipeline = Pipeline(batches, self.model, self.config, self.schedule, self.optimizer)
         loss, overflow = pipeline.run()
+        batch_time = time.time() - batch_time
         self.step += 1
 
+        # if self.profilling:
+        # #     self.current_profile_steps += 1
+        #     self.profile_avg_batch_time += batch_time
+        #     if self.steps - self.initial_step == 10:
+        #         self.profile_avg_batch_time /= 10
+        #         self.profile_csv.write("{}, {} \n".format(self.partitions, self.profile_avg_batch_time))
+        #         self.profilling = False
+        #         self.current_profile_steps = 0
+        #         self.profile_avg_batch_time = 0
+        #         self.profilling = self.repartition()
+            
         if self.rank == 0 and self.step%10==0:
             manager_ip = "10.0.3.4"
             manager_port = 5000
@@ -325,8 +326,8 @@ class Varuna(Module):
         rank_within_stage = self.stage_to_rank_map[self.stage].index(self.rank)
         if on_demand:
             cp_dir_name = cp_dir_name + "_"  + str(rank_within_stage)
-            if tempdir is not None:
-                tempdir + "_"  + str(rank_within_stage)
+            # if tempdir is not None:
+            #     tempdir = tempdir + "_"  + str(rank_within_stage)
 
         # one worker from each partition
         if on_demand or self.rank == self.stage_to_rank_map[self.stage][0]:
@@ -451,7 +452,7 @@ class Pipeline:
         self.make_logfile = config["make_logfile"]
         if self.make_logfile:
             replica_num = self.stage_to_rank_map[self.stage].index(self.rank)
-            microBS = self.fwd_inp_shape[0] if self.bwd_grad_shape is None else self.bwd_grad_shape[0]
+            microBS = len(self.batches[0])
             logfilename = "varuna_logs-mBS" + str(microBS) + "-stage" + str(self.stage) + "of" + str(self.partitions) + "_" + str(replica_num)
             self.logfile = open(logfilename,"a")
             self.logfile.write("start time {}\n".format(time.time()))
@@ -513,12 +514,6 @@ class Pipeline:
             self.grads_send_thread = Thread(target=self.grads_sender, args=())
             self.grads_send_thread.daemon=True
             self.grads_send_thread.start() 
-    
-    # def handle_wait(self, handles, count):
-    #     while count>0:
-    #         handle = handles.get()
-    #         handle.wait()
-    #         count -= 1
     
     def acts_receiver(self):
         chunks = len(self.batches)
@@ -751,10 +746,8 @@ class Pipeline:
         self.spawn_receive_workers()
 
         batchstart = time.time()
-        '''
+        '''        
         for index, task in enumerate(self.schedule):
-            # if self.local_rank==0  and (task[1]%200==0 or task[1]<10):
-            #     print(TASK[task[0]], 'iteration memory at micro-step', task[1], ':', torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
             grad_mode = False
             if task[0] == 0:
                 if self.schedule[index+1][0] == 2:      
@@ -768,7 +761,7 @@ class Pipeline:
             
             # if self.make_logfile:
             #     self.logfile.write("{} {} {} {}\n".format(TASK[task[0]],task[1], str(task_time_start), str(task_time)))
-        '''
+        '''        
 
 
         # dynamic schedule - run forward if gradients for backward are not ready yet
@@ -859,11 +852,11 @@ class Pipeline:
 
         # all-reduce to sync overflow
         if self.partitions > 1:
-        osync_time_start = time.time()
-        torch.distributed.all_reduce(overflow_buf, group=self.pipeline_group)
-        osync_time = time.time() - osync_time_start
-        if self.make_logfile:
-            self.logfile.write("overflow sync {} {}\n".format(osync_time_start,osync_time))
+            osync_time_start = time.time()
+            torch.distributed.all_reduce(overflow_buf, group=self.pipeline_group)
+            osync_time = time.time() - osync_time_start
+            if self.make_logfile:
+                self.logfile.write("overflow sync {} {}\n".format(osync_time_start,osync_time))
         if overflow_buf.item()==0:
             overflow_buf = torch.cuda.IntTensor([0])
         else:
