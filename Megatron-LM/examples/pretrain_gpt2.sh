@@ -1,5 +1,5 @@
 #! /bin/bash
-
+export PATH="/home/varuna/anaconda3/bin:$PATH"
 
 RANK=0
 WORLD_SIZE=2
@@ -14,7 +14,7 @@ date
 ifconfig eth0 | grep inet
 
 DATA_PATH=/home/varuna/gpt2-blob/openwebtext_full/openwebtext_text_document
-CHECKPOINT_PATH=/home/varuna/gpt2-blob/dummy_ckpt
+CHECKPOINT_PATH=/home/varuna/gpt2-blob/varuna_20b_8k_1.25e-3
 
 NCCL_DEBUG=INFO NCCL_SOCKET_IFNAME=eth0 NCCL_SOCKET_NTHREADS=4 NCCL_NSOCKS_PERTHREAD=4 \
 python3 run_varuna.py --nstages 10 --batch_size 1024 --chunk_size 4 --total_num_stages 50 \
