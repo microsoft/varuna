@@ -25,6 +25,7 @@ from megatron.model.transformer import ParallelTransformer
 from megatron.model.utils import openai_gelu
 from megatron.model.utils import get_linear_layer
 
+from varuna import CutPoint
 
 def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
                        bias=None):
@@ -165,9 +166,6 @@ class Embedding(MegatronModule):
         self.init_method(self.tokentype_embeddings.weight)
 
     def forward(self, input_ids, position_ids, tokentype_ids=None):
-
-        # with open("amp-varuna-input-{}".format(torch.distributed.get_rank()),"a") as f:
-        #     f.write(str(input_ids) + "\n")
         # Embeddings.
         words_embeddings = self.word_embeddings(input_ids)
         position_embeddings = self.position_embeddings(position_ids)
@@ -177,10 +175,6 @@ class Embedding(MegatronModule):
             embeddings = embeddings + self.tokentype_embeddings(tokentype_ids)
         else:
             assert self.tokentype_embeddings is None
-
-        # with open("amp-varuna-embed-{}".format(torch.distributed.get_rank()),"a") as f:
-        #     f.write(str(self.word_embeddings.weight) + "\n")
-        #     f.write(str(words_embeddings) + "\n")
 
         # Dropout.
         embeddings = self.embedding_dropout(embeddings)
@@ -304,6 +298,8 @@ class TransformerLanguageModel(MegatronModule):
             self.pooler = Pooler(self.hidden_size, self.init_method)
             self._pooler_key = 'pooler'
 
+        self.cutpoints = torch.nn.ModuleList([CutPoint() for i in range(2)])
+
     def forward(self, input_ids, position_ids, attention_mask,
                 tokentype_ids=None, layer_past=None, get_key_value=False,
                 pooling_sequence_index=0):
@@ -311,12 +307,14 @@ class TransformerLanguageModel(MegatronModule):
         # Embeddings.
         embedding_output = self.embedding(input_ids, position_ids,
                                           tokentype_ids=tokentype_ids)
+        embedding_output = self.cutpoints[0](embedding_output)
 
         # Transformer.
         transformer_output = self.transformer(embedding_output,
                                               attention_mask,
                                               layer_past=layer_past,
                                               get_key_value=get_key_value)
+        transformer_output = self.cutpoints[1](transformer_output)
 
         if self.add_pooler:
             pooled_output = self.pooler(transformer_output,
