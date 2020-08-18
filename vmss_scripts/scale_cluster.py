@@ -57,7 +57,7 @@ def get_available_machines():
         if "unreachable" in m:
             split = i
             break
-    assert split > 0, "unable to get reachable machines!"
+    assert split >= 0, "unable to get reachable machines!"
     up = machines[:split]
     down = machines[split+1:]
     return up, down

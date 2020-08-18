@@ -17,6 +17,7 @@ from .partitioned_model import PartitionedModel
 import gc
 import numpy
 # from hashlib import sha1
+import socket
 
 import os
 import sys
@@ -110,7 +111,7 @@ class Varuna(Module):
 
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
         self.model = PartitionedModel(model, self.rank, self.local_rank, device, self.stage_to_rank_map, self.fp16, shared_weights)
-        self.model.initialize( dummy_inputs, from_cache=True )
+        self.model.initialize( dummy_inputs, from_cache=False )
         if self.local_rank==0:
             # print("varuna init() after dry run init: ", self.local_rank, torch.cuda.memory_summary(self.device))
             print('varuna init() after dry run:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
@@ -189,7 +190,7 @@ class Varuna(Module):
         for stage in range(self.partitions):
             ranks = self.stage_to_rank_map[stage]
             if len(ranks) > 1:
-                process_groups[stage] = dist.new_group(ranks=ranks, backend='nccl')
+                process_groups[stage] = dist.new_group(ranks=ranks,backend='nccl')
             else:
                 process_groups[stage] = None
 
@@ -218,7 +219,7 @@ class Varuna(Module):
             ranks = stream_to_rank_map[stream]
             # ranks = [stage_to_rank_map[s][stream] for s in range(self.partitions) ]
             if len(ranks) > 1:
-                pipeline_groups[stream] = dist.new_group(ranks=ranks)
+                pipeline_groups[stream] = dist.new_group(ranks=ranks)#, backend='nccl')
             else:
                 pipeline_groups[stream] = None
             
@@ -242,6 +243,18 @@ class Varuna(Module):
         pipeline = Pipeline(batches, self.model, self.config, self.schedule, self.optimizer)
         loss, overflow = pipeline.run()
         self.step += 1
+
+        if self.rank == 0 and self.step%10==0:
+            manager_ip = "10.0.3.4"
+            manager_port = 5000
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    message = "progress {}".format(self.step)
+                    sock.connect((manager_ip, manager_port))
+                    sock.sendall(bytes(message, 'ascii'))
+            except:
+                print("Could not send progress update message")
+        
         return loss, overflow
 
     def evaluate(self, inputs):
@@ -302,14 +315,21 @@ class Varuna(Module):
     def checkpoint(self, cp_dir_name):
         return self.partitioned_model.checkpoint(cp_dir_name)
 
-    def checkpoint_optimizer(self, optimizer, parameter_to_name, param_name_to_pstage, cp_dir_name, tempdir=None):
+    def checkpoint_optimizer(self, optimizer, parameter_to_name, param_name_to_pstage, \
+                                cp_dir_name, tempdir=None, on_demand = False):
         cp_time = time.time()
         mv_futures = []
         if tempdir is not None:
             executor = concurrent.futures.ThreadPoolExecutor()
 
+        rank_within_stage = self.stage_to_rank_map[self.stage].index(self.rank)
+        if on_demand:
+            cp_dir_name = cp_dir_name + "_"  + str(rank_within_stage)
+            if tempdir is not None:
+                tempdir + "_"  + str(rank_within_stage)
+
         # one worker from each partition
-        if self.rank == self.stage_to_rank_map[self.stage][0]:
+        if on_demand or self.rank == self.stage_to_rank_map[self.stage][0]:
             cuts_per_stage = self.partitioned_model.cuts_per_stage
             # save param states for each cutpoint separately
             pstages = range(cuts_per_stage * self.stage, (self.stage+1)* cuts_per_stage)
@@ -363,7 +383,6 @@ class Varuna(Module):
 
         cp_time = time.time() - cp_time
         print("Opt ckpt time", cp_time)
-        executor.shutdown(wait = False)
         return mv_futures
 
     
@@ -732,7 +751,7 @@ class Pipeline:
         self.spawn_receive_workers()
 
         batchstart = time.time()
-        
+        '''
         for index, task in enumerate(self.schedule):
             # if self.local_rank==0  and (task[1]%200==0 or task[1]<10):
             #     print(TASK[task[0]], 'iteration memory at micro-step', task[1], ':', torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
@@ -749,9 +768,11 @@ class Pipeline:
             
             # if self.make_logfile:
             #     self.logfile.write("{} {} {} {}\n".format(TASK[task[0]],task[1], str(task_time_start), str(task_time)))
-        '''        
+        '''
+
 
         # dynamic schedule - run forward if gradients for backward are not ready yet
+
         schedule = [s for s in enumerate(self.schedule)]
         i=0
         count_fwd = 0
@@ -776,7 +797,6 @@ class Pipeline:
             self.worker(task[0], grad_mode, self.batches[task[1]])
 
             i+=1
-        '''
         
         overflow = False
         if self.fp16 and self.data_parallel:
@@ -810,7 +830,7 @@ class Pipeline:
         master_grads = [p.grad for p in amp.master_params(self.optimizer) if p.grad is not None]
         # print("all_reduce_opt_grads() grad details: ", self.stage, len(master_grads), numpy.array([numpy.array(x.size()).prod() for x in master_grads]).sum())
         flat_grad_size = sum(p.numel() for p in master_grads)
-        flat_raw = torch.empty(flat_grad_size, device=self.device, dtype=torch.float32)
+        flat_raw = torch.empty(flat_grad_size, device=self.device, dtype=torch.float16)
         
         # 2. combine unflattening and predivision of unscaled 'raw' gradient
         allreduced_views = apex_C.unflatten(flat_raw, master_grads)
@@ -825,6 +845,7 @@ class Pipeline:
         torch.distributed.all_reduce(flat_raw, group=self.process_group)
         allred_time = time.time() - allred_time_start
         if self.make_logfile:
+            self.logfile.write("all-reduce size {}\n".format(flat_grad_size))
             self.logfile.write("SYNC! all_reduce {} {} {}\n".format(flat_grad_size,allred_time_start,allred_time))
         
         # 4. combine unscaling and unflattening of allreduced gradient
@@ -837,6 +858,7 @@ class Pipeline:
         scaler = _amp_state.loss_scalers[0]
 
         # all-reduce to sync overflow
+        if self.partitions > 1:
         osync_time_start = time.time()
         torch.distributed.all_reduce(overflow_buf, group=self.pipeline_group)
         osync_time = time.time() - osync_time_start
@@ -878,9 +900,11 @@ def scatter(input, batch_size, chunk_size):
     return microbatches
 
 
-def load_varuna_optimizer(optimizer, my_stage, num_stages, total_num_pstages, parameter_names, common_store, fp16=False):
-    stages_per_worker = total_num_pstages // num_stages
-    pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
+def load_varuna_optimizer(optimizer, my_stage, num_stages, total_num_pstages, parameter_names, \
+                        common_store, fp16=False, pstages_to_read = None):
+    if pstages_to_read is None:
+        stages_per_worker = total_num_pstages // num_stages
+        pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
     # reload state
     opt_state = {}
     for i in pstages_to_read:

@@ -9,7 +9,7 @@ if [ $only_one -eq 0 ]
 then
     machines+=($(az vmss nic list --vmss-name megatron_1 --subscription $subscription --resource-group $group --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
     machines+=($(az vmss nic list --vmss-name megatron_2 --subscription $subscription --resource-group $group --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
-    machines+=($(az vmss nic list --vmss-name megatron_3 --subscription $subscription --resource-group $group --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
+    #machines+=($(az vmss nic list --vmss-name megatron_3 --subscription $subscription --resource-group $group --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
 fi
 
 reachable_machines=( )
