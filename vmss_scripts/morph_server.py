@@ -120,15 +120,11 @@ class Handler(socketserver.BaseRequestHandler):
                 if not is_morphing and not is_preempting and not is_restarting:
                     fields = data.split(" ")
                     notbefore = fields[-1]
-                    if len(notbefore) == 0:
-                        notbefore = recv_time
-                    else:
-                        notbefore = datetime.strptime(notbefore,"%a,_%d_%b_%Y_%H:%M:%S_%Z")
-                    if last_preempt_handled is None or last_preempt_handled < notbefore \
-                        or (last_preempt_handled - notbefore).total_seconds() < 120:
+                    notbefore = datetime.strptime(notbefore,"%a,_%d_%b_%Y_%H:%M:%S_%Z")
+                    if last_preempt_handled is None or last_preempt_handled < notbefore:
                         last_preempt_handled = notbefore
                         is_preempting = True  
-                        sleep_time = (notbefore - datetime.now()).total_seconds() - 30
+                        sleep_time = (notbefore - datetime.now()).seconds - 30
                         if sleep_time > 0:
                             time.sleep(sleep_time)
                         print('Trigger preempt!', flush=True)
