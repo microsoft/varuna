@@ -324,63 +324,82 @@ class Varuna(Module):
             executor = concurrent.futures.ThreadPoolExecutor()
 
         rank_within_stage = self.stage_to_rank_map[self.stage].index(self.rank)
-        if on_demand:
-            cp_dir_name = cp_dir_name + "_"  + str(rank_within_stage)
-            # if tempdir is not None:
-            #     tempdir = tempdir + "_"  + str(rank_within_stage)
+        depth = len(self.stage_to_rank_map[self.stage])
 
-        # one worker from each partition
-        if on_demand or self.rank == self.stage_to_rank_map[self.stage][0]:
-            cuts_per_stage = self.partitioned_model.cuts_per_stage
-            # save param states for each cutpoint separately
-            pstages = range(cuts_per_stage * self.stage, (self.stage+1)* cuts_per_stage)
+        # shard checkpoint over DP workers
+        cuts_per_stage = self.partitioned_model.cuts_per_stage
+        # save param states for each cutpoint separately
+        pstages = range(cuts_per_stage * self.stage, (self.stage+1)* cuts_per_stage)
+        pstage_state_dicts = dict()
+        for i in pstages:
+            pstage_state_dicts[i] = dict()
+
+        ind = 0
+        for key in optimizer.state:
+            # for sharding
+            if ind % depth != rank_within_stage:
+                ind += 1
+                continue
+            # store state by param names instead of actual parameters
+            param_name = parameter_to_name[key]
+            assert param_name in param_name_to_pstage, "param {} not found in rank {}".format(param_name,dist.get_rank())
+            pstage = param_name_to_pstage[param_name]
+            pstage_state_dicts[pstage][param_name] = optimizer.state[key]
+            ind += 1
+            
+        if tempdir is not None:
+            for i in pstages:
+                temp_name =  os.path.join(tempdir,"opt-state-" + str(i))
+                cp_name = os.path.join(cp_dir_name,"opt-state-" + str(i))
+                if depth > 1:
+                    temp_name += "_" + str(rank_within_stage)
+                    cp_name += "_" + str(rank_within_stage)
+                torch.save(pstage_state_dicts[i], temp_name)
+                mv_futures.append(executor.submit(shutil.move, temp_name, cp_name))
+        else:
+            for i in pstages:
+                cp_name = os.path.join(cp_dir_name,"opt-state-" + str(i))
+                if depth > 1:
+                    cp_name += "_" + str(rank_within_stage)
+                torch.save(pstage_state_dicts[i], cp_name)
+
+        # also store optimizer master params for mixed precision training
+        if self.fp16:
+
             pstage_state_dicts = dict()
             for i in pstages:
                 pstage_state_dicts[i] = dict()
 
-            # store state by param names instead of actual parameters
-            for key in optimizer.state:
-                param_name = parameter_to_name[key]
-                assert param_name in param_name_to_pstage, "param {} not found in rank {}".format(param_name,dist.get_rank())
+            ind = 0
+            for p in amp.master_params(optimizer):
+                if ind % depth != rank_within_stage:
+                    ind += 1
+                    continue
+                param_name = parameter_to_name[p]
+                # not a part of the worker's stage
+                if param_name not in param_name_to_pstage:
+                    continue
                 pstage = param_name_to_pstage[param_name]
-                pstage_state_dicts[pstage][param_name] = optimizer.state[key]
+                if pstage not in pstages:
+                    continue
+                pstage_state_dicts[pstage][param_name] = p
+                ind += 1
             
             if tempdir is not None:
                 for i in pstages:
-                    temp_name =  os.path.join(tempdir,"opt-state-" + str(i))
-                    cp_name = os.path.join(cp_dir_name,"opt-state-" + str(i))
+                    temp_name =  os.path.join(tempdir,"opt-fp32-params-" + str(i))
+                    cp_name = os.path.join(cp_dir_name,"opt-fp32-params-" + str(i))
+                    if depth > 1:
+                        temp_name += "_" + str(rank_within_stage)
+                        cp_name += "_" + str(rank_within_stage)
                     torch.save(pstage_state_dicts[i], temp_name)
                     mv_futures.append(executor.submit(shutil.move, temp_name, cp_name))
             else:
                 for i in pstages:
-                    torch.save(pstage_state_dicts[i], os.path.join(cp_dir_name,"opt-state-" + str(i)))
-
-            # also store optimizer master params for mixed precision training
-            if self.fp16:
-
-                pstage_state_dicts = dict()
-                for i in pstages:
-                    pstage_state_dicts[i] = dict()
-
-                for p in amp.master_params(optimizer):
-                    param_name = parameter_to_name[p]
-                    # not a part of the worker's stage
-                    if param_name not in param_name_to_pstage:
-                        continue
-                    pstage = param_name_to_pstage[param_name]
-                    if pstage not in pstages:
-                        continue
-                    pstage_state_dicts[pstage][param_name] = p
-            
-                if tempdir is not None:
-                    for i in pstages:
-                        temp_name =  os.path.join(tempdir,"opt-fp32-params-" + str(i))
-                        cp_name = os.path.join(cp_dir_name,"opt-fp32-params-" + str(i))
-                        torch.save(pstage_state_dicts[i], temp_name)
-                        mv_futures.append(executor.submit(shutil.move, temp_name, cp_name))
-                else:
-                    for i in pstages:
-                        torch.save(pstage_state_dicts[i], os.path.join(cp_dir_name,"opt-fp32-params-" + str(i)))
+                    cp_name = os.path.join(cp_dir_name,"opt-fp32-params-" + str(i))
+                    if depth > 1:
+                        cp_name += "_" + str(rank_within_stage)
+                    torch.save(pstage_state_dicts[i], cp_name)
 
         cp_time = time.time() - cp_time
         print("Opt ckpt time", cp_time)

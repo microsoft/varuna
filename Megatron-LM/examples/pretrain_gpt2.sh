@@ -1,9 +1,6 @@
 #! /bin/bash
 export PATH="/home/varuna/anaconda3/bin:$PATH"
 
-RANK=0
-WORLD_SIZE=2
-
 NNODES=$1
 NODE_RANK=$2
 MASTER_ADDR=$3
@@ -14,9 +11,10 @@ date
 ifconfig eth0 | grep inet
 
 DATA_PATH=/home/varuna/gpt2-blob/openwebtext_full/openwebtext_text_document
-CHECKPOINT_PATH=/home/varuna/gpt2-blob/varuna_20b_8k_1.25e-3
+CHECKPOINT_PATH=/home/varuna/gpt2-blob/dummy_ckpt
 
-NCCL_SOCKET_IFNAME=eth0 NCCL_SOCKET_NTHREADS=4 NCCL_NSOCKS_PERTHREAD=4 python3 run_varuna.py --nstages 49 --batch_size 8192 --chunk_size 2 --total_num_stages 98 --ngpus_per_server 4 --nservers $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR  pretrain_gpt2.py \
+NCCL_SOCKET_IFNAME=eth0 NCCL_SOCKET_NTHREADS=4 NCCL_NSOCKS_PERTHREAD=4 \
+python3 run_varuna.py --nstages 49 --batch_size 512 --chunk_size 2 --total_num_stages 98 --ngpus_per_server 4 --nservers $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR  pretrain_gpt2.py \
        --num-layers 96 \
        --hidden-size 4200 \
        --num-attention-heads 42 \
@@ -39,13 +37,12 @@ NCCL_SOCKET_IFNAME=eth0 NCCL_SOCKET_NTHREADS=4 NCCL_NSOCKS_PERTHREAD=4 python3 r
        --clip-grad 1.0 \
        --warmup .05 \
        --log-interval 1 \
-       --save-interval 15 \
+       --save-interval 5 \
        --max-num-ckpts 3 \
-       --min-ckpt-iter-to-remove 1410 \
        --load-iteration $ckpt \
        --eval-interval 100 \
        --eval-iters 10 \
-       --loss-file varuna_20b_8k \
+       --loss-file dummy \
        --fp16 --varuna
 # num params = 20,753,384,400
 set +x

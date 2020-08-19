@@ -299,6 +299,7 @@ class TransformerLanguageModel(MegatronModule):
             self._pooler_key = 'pooler'
 
         self.cutpoints = torch.nn.ModuleList([CutPoint() for i in range(2)])
+        # self.pooler_cutpoint = CutPoint()
 
     def forward(self, input_ids, position_ids, attention_mask,
                 tokentype_ids=None, layer_past=None, get_key_value=False,
@@ -315,6 +316,8 @@ class TransformerLanguageModel(MegatronModule):
                                               layer_past=layer_past,
                                               get_key_value=get_key_value)
         transformer_output = self.cutpoints[1](transformer_output)
+
+        # transformer_output = self.pooler_cutpoint(transformer_output)
 
         if self.add_pooler:
             pooled_output = self.pooler(transformer_output,
