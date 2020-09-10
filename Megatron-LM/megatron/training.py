@@ -325,6 +325,8 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
         with torch.no_grad():
             basemodel.lm_head_weight.data.copy_(param.data) 
 
+    model.parameter_names = parameter_names
+
 
     return model, optimizer, lr_scheduler, parameter_names
 
@@ -401,7 +403,7 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
 
     # Forward model for one step.
     # timers('forward').start()
-    loss, loss_reduced, overflow = varuna_step(data_iterator, model)
+    loss, loss_reduced, overflow, global_norm = varuna_step(data_iterator, model)
     # timers('forward').stop()
 
     if args.clip_grad > 0:
@@ -416,7 +418,7 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
         # print("setup_model() pre opt step: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
         # print('setup_model() pre opt step:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
     if not overflow:
-        optimizer.step()
+        optimizer.step(global_grad_norm=global_norm)
     else:
         for param in optimizer._amp_stash.all_fp32_from_fp16_params:
             param.grad = None
@@ -539,6 +541,9 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     if args.varuna:
         model.step = args.iteration
 
+    model.out_dir = args.save
+    if args.rank == 0 and not os.path.exists(os.path.join(args.save,"stats")):
+        os.makedirs(os.path.join(args.save,"stats"))
     loss_file = None
     eval_loss_file = None
     if (args.varuna and args.stage == args.partitions - 1) or (not args.varuna and torch.distributed.get_rank() == 0):

@@ -167,63 +167,87 @@ class Profiling:
         # model_mem = torch.cuda.memory_allocated(self.device) - initial_mem
         # print("Model memory", model_mem)
 
-        of = open(filename,"w")
+        of = open(filename,"a")
         of.write("Batch size, fwd_time, bwd_time, max_mem_usage, input_mem, fwd_act_size, opt_state_mem\n")
 
         for batch_size in microbatch_sizes:
             self.model.train()
-            try: 
-                torch.cuda.reset_max_memory_allocated(self.device)
-                pre_mem = torch.cuda.memory_allocated()
-                # get_batch_fn should load inputs into device and return dict
-                input_mem = torch.cuda.memory_allocated()
-                inputs = get_batch_fn(batch_size)
-                input_mem = torch.cuda.memory_allocated() - input_mem
-                if self.fwd_inp_shape is not None:
-                    fwd_inp_shape = list(self.fwd_inp_shape)
-                    fwd_inp_shape[0] = batch_size
-                    self.fwd_inp = torch.ones(fwd_inp_shape, dtype = torch.float16 if self.fp16 else torch.float32).to(self.device)
+            avg_fwd_time = 0
+            avg_bwd_time = 0
+            avg_mem_usage = 0
+            try:
+                for i in range(5): 
+                    torch.cuda.reset_max_memory_allocated(self.device)
+                    pre_mem = torch.cuda.memory_allocated()
+                    # get_batch_fn should load inputs into device and return dict
+                    input_mem = torch.cuda.memory_allocated()
+                    inputs = get_batch_fn(batch_size)
+                    input_mem = torch.cuda.memory_allocated() - input_mem
+                    if self.fwd_inp_shape is not None:
+                        fwd_inp_shape = list(self.fwd_inp_shape)
+                        fwd_inp_shape[0] = batch_size
+                        self.fwd_inp = torch.ones(fwd_inp_shape, dtype = torch.float16 if self.fp16 else torch.float32).to(self.device)
 
-                start = time.time()
+                    start = time.time()
                 
-                try:
-                    calc_val = self.model(**inputs)
-                    fwd_out = self.ret_val if self.ret_val is not None else calc_val
-                    del calc_val
-                except Exception as e:
-                    if self.ret_val is None:
-                        print("Calc error!!!")
-                        raise e
-                    fwd_out = self.ret_val
-                self.ret_val = None
-                torch.cuda.synchronize()
-                fwd_time = time.time() - start
+                    try:
+                        calc_val = self.model(**inputs)
+                        fwd_out = self.ret_val if self.ret_val is not None else calc_val
+                        del calc_val
+                    except Exception as e:
+                        if self.ret_val is None:
+                            print("Calc error!!!")
+                            raise e
+                        fwd_out = self.ret_val
+                    self.ret_val = None
+                    torch.cuda.synchronize()
+                    fwd_time = time.time() - start
 
-                bwd_time = time.time()
-                if isinstance(fwd_out, tuple):
-                    fwd_out = fwd_out[0]
-                grads = torch.ones(list(fwd_out.size()), device = self.device)
-                if self.bwd_grad_shape is not None:
-                    self.bwd_grad = torch.ones(self.bwd_grad_shape, dtype = torch.float16 if self.fp16 else torch.float32).to(self.device)
+                    bwd_time = time.time()
+                    if isinstance(fwd_out, tuple):
+                        fwd_out = fwd_out[0]
+                    grads = torch.ones(list(fwd_out.size()), device = self.device)
+                    if self.bwd_grad_shape is not None:
+                        self.bwd_grad = torch.ones(self.bwd_grad_shape, dtype = torch.float16 if self.fp16 else torch.float32).to(self.device)
                 
-                if self.fp16:
-                    with amp.scale_loss(fwd_out, optimizer, last_partition=True) as scaled_out:
-                        scaled_out.backward(grads)
-                else:
-                    fwd_out.backward(grads)
+                    print("grads before",optimizer.param_groups[0]["params"][0].grad)
+                    if self.fp16:
+                        with amp.scale_loss(fwd_out, optimizer, last_partition=True) as scaled_out:
+                            scaled_out.backward(grads)
+                    else:
+                        fwd_out.backward(grads)
 
-                torch.cuda.synchronize()
-                bwd_time = time.time() - bwd_time
+                    torch.cuda.synchronize()
+                    bwd_time = time.time() - bwd_time
 
-                optimizer.step()
+                    optimizer.step()
+                    for param in optimizer._amp_stash.all_fp32_from_fp16_params:
+                        param.grad = None
+                    for param in self.model.parameters():
+                        param.grad = None
+                    
+                    fwd_act_size = fwd_out.element_size() * fwd_out.nelement()
+                    del grads, fwd_out
+                    self.model.zero_grad()
+                    optimizer.zero_grad()
+
+                    mem_usage = torch.cuda.max_memory_allocated(self.device)
                 
-                fwd_act_size = fwd_out.element_size() * fwd_out.nelement()
-                del grads, fwd_out
-                self.model.zero_grad()
-                optimizer.zero_grad()
+                    avg_fwd_time += fwd_time
+                    avg_bwd_time += bwd_time
+                    avg_mem_usage += mem_usage
 
-                mem_usage = torch.cuda.max_memory_allocated(self.device)
+                    del inputs
+                    self.fwd_inp = None; self.bwd_grad = None
                 
+                    opt_state_mem = torch.cuda.memory_allocated(self.device)
+                    optimizer.state = collections.defaultdict(dict) # Reset state
+                    opt_state_mem = opt_state_mem - torch.cuda.memory_allocated(self.device)
+                
+                fwd_time = avg_fwd_time / 5
+                bwd_time = avg_bwd_time / 5
+                mem_usage = avg_mem_usage / 5
+
                 print("Batch size", batch_size, ": ")
                 print("fwd_time", fwd_time)
                 print("bwd_time", bwd_time)
@@ -231,13 +255,6 @@ class Profiling:
                 print("-------------------------")
                 print()
 
-                del inputs
-                self.fwd_inp = None; self.bwd_grad = None
-                
-                opt_state_mem = torch.cuda.memory_allocated(self.device)
-                optimizer.state = collections.defaultdict(dict) # Reset state
-                opt_state_mem = opt_state_mem - torch.cuda.memory_allocated(self.device)
-                
                 of.write("{}, {}, {}, {}, {}, {}, {}\n".format(batch_size, fwd_time, bwd_time, mem_usage, input_mem, fwd_act_size, opt_state_mem))
                 print("Opt_state", opt_state_mem)
 

@@ -171,7 +171,7 @@ def _add_varuna_args(parser):
     group.add_argument("--stage", type=int, default=-1, 
                         help = "stage for varuna/profiling")
     group.add_argument("--profiling-iters", type=int, default=10)
-    group.add_argument("--static-profile-csv", typ=str, default=None)
+    group.add_argument("--static-profile-csv", type=str, default=None)
     group.add_argument("--dynamic-profile-csv", type=str, default=None)
     return parser
 
