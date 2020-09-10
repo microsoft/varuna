@@ -93,13 +93,13 @@ public:
       }
     }
   }
-
-  Queue* PickNextNetworkQueue(int64 now);
-  Queue* PickNextComputeQueue(int64 now);
   bool ProcessEvent(Simulator* sim, Event event, int64 now);
   void ServiceQueues(Simulator* sim, int64 now);
 
 private:
+  Queue* PickNextNetworkQueue(int64 now);
+  Queue* PickNextComputeQueue(int64 now);
+
   Queue *fwd_, *bwd_, *rc_, *sendact_, *sendgrad_;
   bool gpu_busy_;
   bool network_busy_;
@@ -130,10 +130,8 @@ public:
   void Simulate();
   void DumpState();
   bool AddEvent(int64 scheduled_time, Event e);
-  bool PopNextEvent(Event* e);
 
   int64 current_time() { return clock_now_micros_;}  
-
   int fwd_compute_time() { return fwd_time_; }
   int bwd_compute_time() { return bwd_time_;}
 
@@ -142,6 +140,8 @@ public:
   int sendgrad_time() { return sendgrad_time_;}
 
 private:
+  bool PopNextEvent(Event* e);
+
   Stage** stages_;
   EventList event_list_;
   int pipeline_depth_;
