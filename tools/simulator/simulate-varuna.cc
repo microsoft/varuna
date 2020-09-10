@@ -6,6 +6,16 @@ static inline Queue* QueueReady(Queue* q, int64 now) {
   return NULL;
 }
 
+Event::State IdToState(char id) {
+  switch(id) {
+    case 'f': return Event::FWD_START;
+    case 'r': return Event::RC_START;
+    case 'b': return Event::BWD_START;
+    case 'a': return Event::SENDACT_START;
+    case 'g': return Event::SENDGRAD_START;
+  }
+}
+
 // ===========  class Stage ===================
 
 Queue* Stage::PickNextNetworkQueue(int64 now) {
@@ -27,16 +37,6 @@ Queue* Stage::PickNextComputeQueue(int64 now) {
   // Service fwd queue only if no recomputed activations are in flight.
   if ((recomputed_mb_ < 0) && (q = QueueReady(fwd_, now))) return q;
   return NULL;
-}
-
-Event::State IdToState(char id) {
-  switch(id) {
-    case 'f': return Event::FWD_START;
-    case 'r': return Event::RC_START;
-    case 'b': return Event::BWD_START;
-    case 'a': return Event::SENDACT_START;
-    case 'g': return Event::SENDGRAD_START;
-  }
 }
 
 void Stage::ServiceQueues(Simulator* sim, int64 now) {
