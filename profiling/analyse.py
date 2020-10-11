@@ -66,6 +66,9 @@ for i in range(dp):
     lossfile.readline()
     lossfile.readline()
     for line in lossfile:
+        if "Loss scale" in line:
+            lossfile.readline(); lossfile.readline()
+            continue
         mb_time += float(line.split(",")[0])
         count += 1
 

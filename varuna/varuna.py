@@ -469,7 +469,7 @@ class Pipeline:
             replica_num = self.stage_to_rank_map[self.stage].index(self.rank)
             microBS = config["chunk_size"]
             logfilename = "varuna_logs-"+str(self.data_depth)+"dp-" + str(microBS) + "mBS-stage" + str(self.stage) + "of" + str(self.partitions) + "_" + str(replica_num)
-            # logfilename = os.path.join("/home/varuna/gpt2-blob/perf_analysis_8.3b","stats",logfilename)
+            # logfilename = os.path.join("/home/varuna/gpt2-blob/perf_analysis_2.5b","stats",logfilename)
             self.logfile = open(logfilename,"a")
             self.logfile.write("start time {}\n".format(time.time()))
 
@@ -539,11 +539,11 @@ class Pipeline:
                 if recv_handles.qsize()>4:
                     handle, tensor = recv_handles.get()
                     handle.wait()
-                    self.acts_queue.put(tensor.to(self.device))
+                    self.acts_queue.put(tensor)
         while not recv_handles.empty():
             handle, tensor = recv_handles.get()
             handle.wait()
-            self.acts_queue.put(tensor.to(self.device))
+            self.acts_queue.put(tensor)
         del acts_tensor
     
     def grads_receiver(self):
@@ -563,11 +563,11 @@ class Pipeline:
                 if recv_handles.qsize()>4:
                     handle, tensor = recv_handles.get()
                     handle.wait()
-                    self.grads_queue.put(tensor.to(self.device))
+                    self.grads_queue.put(tensor)
         while not recv_handles.empty():
             handle, tensor = recv_handles.get()
             handle.wait()
-            self.grads_queue.put(tensor.to(self.device))
+            self.grads_queue.put(tensor)
         del grads_tensor
 
     def acts_sender(self):
@@ -585,7 +585,7 @@ class Pipeline:
         
         while count > 0:
             output_acts = self.acts_send_queue.get()
-            handle = dist.isend(output_acts.cpu(), dst=self.send_rank)
+            handle = dist.isend(output_acts, dst=self.send_rank)
             send_handles.put(handle)
             if send_handles.qsize()>4:
                 handle = send_handles.get()
@@ -611,7 +611,7 @@ class Pipeline:
 
         while count > 0:
             input_grads = self.grads_send_queue.get()
-            handle = dist.isend(input_grads.cpu(), dst=self.receive_rank)
+            handle = dist.isend(input_grads, dst=self.receive_rank)
             send_handles.put(handle)
             if send_handles.qsize()>4:
                 handle = send_handles.get()
@@ -626,10 +626,10 @@ class Pipeline:
     def set_model_send_fn(self, recompute = False):
         def send(tensor, grads = False):
             if grads:
-                self.grads_send_queue.put(tensor)
+                self.grads_send_queue.put(tensor.cpu())
             else:
                 if not recompute:
-                    self.acts_send_queue.put(tensor)
+                    self.acts_send_queue.put(tensor.cpu())
         
         self.partitioned_model.set_send_fn(send)
 
@@ -643,8 +643,7 @@ class Pipeline:
 
         else:
             recv_time_start = time.time()
-            acts = self.acts_queue.get() if self.stage > 0 else None
-            acts = acts.to(self.device) if self.stage > 0 else None
+            acts = self.acts_queue.get().to(self.device) if self.stage > 0 else None
             if self.make_logfile:
                 torch.cuda.synchronize()
                 recv_time = time.time() - recv_time_start
@@ -653,7 +652,7 @@ class Pipeline:
         def recv(grads = False):
             if grads:
                 recv_time_start = time.time()
-                g = self.grads_queue.get()
+                g = self.grads_queue.get().to(self.device)
                 if self.make_logfile:  
                     torch.cuda.synchronize()
                     recv_time = time.time() - recv_time_start 
