@@ -15,10 +15,10 @@ date
 ifconfig eth0 | grep inet
 
 DATA_PATH=/home/varuna/gpt2-blob/openwebtext_full/openwebtext_text_document
-CHECKPOINT_PATH=/home/varuna/gpt2-blob/mega_345m_4_5e-3
+CHECKPOINT_PATH=/home/varuna/gpt2-blob/dryrun
 
 NCCL_DEBUG=INFO NCCL_SOCKET_IFNAME=eth0 NCCL_SOCKET_NTHREADS=4 NCCL_NSOCKS_PERTHREAD=4 \
-python3 run_varuna.py --nstages 2 --batch_size 8192 --chunk_size 4 --total_num_stages 50 \
+python3 run_varuna.py --nstages 4 --batch_size 1024 --chunk_size 4 --total_num_stages 50 \
        --ngpus_per_server 4 --nservers $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR pretrain_gpt2.py \
        --num-layers 24 \
        --hidden-size 1024 \
