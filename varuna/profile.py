@@ -26,6 +26,7 @@ class Profiling:
         self.dry_run(dummy_inputs, from_cache)
         print("dry run time", time.time() - start)
         self.trim_model(k=stage_num)
+        self.check_unused_parameters(dummy_inputs)
 
     def dry_run(self, dummy_inputs, from_cache):
         # executes the forward pass of the module on dummy inputs. 
@@ -144,6 +145,61 @@ class Profiling:
                 modules[path[-1]] = None
                 modules[path[-1]] = PassThroughModule()
                 self.ordered_modules[m] = None
+    
+    def check_unused_parameters(self, dummy_inputs):
+        # set eval mode and clear grads
+        prev_training = self.model.training
+        self.model.eval()
+        for p in self.model.parameters():
+            p.grad = None
+
+        for n in self.ordered_modules:
+            m = self.ordered_modules[n]
+            if isinstance(m,CutPoint):
+                m.set_pruning(True)
+
+        # device = dummy_inputs[list(dummy_inputs.keys())[0]].device
+        # forward
+        if self.pre_cp is not None:
+            self.pre_cp.recv_fn = lambda grads=False: \
+                torch.zeros(self.fwd_inp_shape, dtype=torch.float32)    
+        try:
+            calc_val = self.model(**dummy_inputs)
+            ret_val = self.ret_val if self.ret_val is not None else calc_val
+        except Exception as e:
+            if self.ret_val is None:
+                raise e
+            ret_val = self.ret_val
+        
+        # backward
+        if self.pre_cp is not None:
+            self.pre_cp.recv_fn = None
+        ret_val.backward(torch.ones(list(ret_val.size()), dtype=torch.float32))
+        
+
+        self.ret_val = None
+        to_remove = []
+        for n,p in self.model.named_parameters():
+            if p.grad is None:
+                to_remove.append(n)
+                path = n.split(".")
+                parent = self.model
+                for i in range(len(path) - 1):
+                    parent = getattr(parent, path[i])
+                setattr(parent,path[-1], None)
+        
+        # reset grads and train mode
+        for p in self.model.parameters():
+            p.grad = None
+        if prev_training:
+            self.model.train()
+
+        for m in self.ordered_modules:
+            m = self.ordered_modules[m]
+            if isinstance(m,CutPoint):
+                m.set_pruning(False)
+
+        self.model_pruned = True
     
     def set_ret_val(self, val):
         self.ret_val = val
