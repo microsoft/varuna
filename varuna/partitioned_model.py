@@ -21,12 +21,16 @@ class CutPoint(Module):
         self.stage = -1
         self.fp16 = False
         self.pruning = False
+        self.barrier_event = None
     
     def set_pruning(self, boolean):
         self.pruning = boolean
 
     def forward(self, *inputs, **kwargs):
         # not set by ModelParallel, pass through as is
+        if self.barrier_event is not None:
+            self.barrier_event.record()
+        
         if self.cp_func is None:
             return inputs[0]
 
@@ -445,10 +449,49 @@ class PartitionedModel(Module):
         if self.post_cp is not None:
             self.post_cp.recv_fn = recv_fn
 
+    def set_recording_events(self):
+        self.recording_events = []
+        if self.stage == 0:
+            self.recording_events.append(torch.cuda.Event(enable_timing=True))
+        in_stage = (self.stage == 0)
+        for name in self.ordered_modules:
+            module = self.ordered_modules[name]
+            if isinstance(module, CutPoint):
+                if module.cp_index == self.stage:
+                    in_stage = True
+                if in_stage:
+                    event = torch.cuda.Event(enable_timing=True)
+                    module.barrier_event = event
+                    self.recording_events.append(event)
+                if module.cp_index == self.stage + 1:
+                    in_stage = False
+        if self.stage == self.num_stages - 1:
+            self.recording_events.append(torch.cuda.Event(enable_timing=True))
+
+    def clear_recording_events(self):
+        for name in self.ordered_modules:
+            module = self.ordered_modules[name]
+            if isinstance(module, CutPoint):
+                module.barrier_event = None
+
+    def elapsed_times(self):
+        num_barriers = len(self.recording_events)
+        times = []
+        for i in range(num_barriers-1):
+            times.append(
+                self.recording_events[i].elapsed_time(self.recording_events[i+1])
+                )
+        return times
+
     def forward(self, *inputs, **kwargs):
-        # if not self.model_pruned:
-            # raise Error
-    
+        
+        recording = 'record' in kwargs and kwargs['record']
+        kwargs.pop('record')
+        if recording:
+            self.set_recording_events()
+            if self.stage == 0:
+                self.recording_events[0].record()
+
         try:
             calc_val = self.module(*inputs, **kwargs)
             ret_val = self.ret_val if self.ret_val is not None else calc_val
@@ -458,6 +501,12 @@ class PartitionedModel(Module):
             ret_val = self.ret_val
         # self.logfile.flush()
         self.ret_val = None
+
+        if recording:
+            if self.stage == self.num_stages - 1:
+                self.recording_events[-1].record()
+            self.clear_recording_events()
+
         return ret_val 
 
 

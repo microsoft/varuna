@@ -12,6 +12,8 @@ from collections import OrderedDict
 import collections
 
 from apex import amp
+import numpy as np
+import random
 
 class Profiling:
 
@@ -21,11 +23,11 @@ class Profiling:
         self.fp16 = fp16
         self.device = device
 
-    def initialize(self, dummy_inputs, stage_num=1, from_cache=True):
-        start = time.time()
+    def initialize(self, dummy_inputs, start=0, end=1, from_cache=True):
+        start_time = time.time()
         self.dry_run(dummy_inputs, from_cache)
-        print("dry run time", time.time() - start)
-        self.trim_model(k=stage_num)
+        print("dry run time", time.time() - start_time)
+        self.trim_model(start, end)
         self.check_unused_parameters(dummy_inputs)
 
     def dry_run(self, dummy_inputs, from_cache):
@@ -82,12 +84,12 @@ class Profiling:
             self.num_cutpoints = len(self.input_shapes)
     
 # """ Trims out the kth stage (starting from 1) from model. """
-    def trim_model(self, k=1):
+    def trim_model(self, start=0, end=1):
 
         def attach_meta(cutpoint, index):
             cutpoint.cp_index = index
             cutpoint.set_ret_val_func = self.set_ret_val
-            cutpoint.stage = k-1
+            cutpoint.stage = start
             cutpoint.device = self.device
             cutpoint.send_fn = lambda x,grads=False: None
             cutpoint.set_cp_func()
@@ -110,20 +112,20 @@ class Profiling:
 
             is_used[name] = False
             # when the next cutpoint to come is the kth, modules are used
-            if index == k:
+            if index > start and index <= end:
                 used_modules.append(name)
                 is_used[name] = True
             
             # only need to set up two cutpoints at most
             if isinstance(module, CutPoint):    
-                if index == k:
-                    attach_meta(module, index)
+                if index == end:
+                    attach_meta(module, start+1)
                     self.bwd_grad_shape = self.input_shapes[name][0]
-                if index == k-1:
+                if index == start:
                     self.fwd_inp_shape = self.input_shapes[name][0]
                     used_modules.append(name)
                     is_used[name] = True
-                    attach_meta(module, index)
+                    attach_meta(module, start)
                     self.pre_cp = module
                 index += 1
             
@@ -209,8 +211,72 @@ class Profiling:
             return self.bwd_grad
         return self.fwd_inp
 
+    def warmup(self, get_batch_fn, microbatch_sizes, optimizer):
+        optimizer._amp_lazy_init()
+        
+        if self.pre_cp is not None:
+            self.pre_cp.recv_fn = self.recv
+
+        count = 0
+        while count < 100:
+            batch_size = random.choice(microbatch_sizes)
+            warmup_time = time.time()
+            try:
+                inputs = get_batch_fn(batch_size)
+                #input_mem = torch.cuda.memory_allocated() - input_mem
+                if self.fwd_inp_shape is not None:
+                    fwd_inp_shape = list(self.fwd_inp_shape)
+                    fwd_inp_shape[0] = batch_size
+                    self.fwd_inp = torch.ones(fwd_inp_shape, dtype = torch.float16 if self.fp16 else torch.float32).to(self.device)
+                torch.set_grad_enabled(True)
+                try:
+                    calc_val = self.model(**inputs)
+                    fwd_out = self.ret_val if self.ret_val is not None else calc_val
+                    del calc_val
+                except Exception as e:
+                    if self.ret_val is None:
+                        print("Calc error!!!")
+                        raise e
+                    fwd_out = self.ret_val
+                
+                if isinstance(fwd_out, tuple):
+                    fwd_out = fwd_out[0]
+                grads = 0.00001 * torch.ones(list(fwd_out.size()), device = self.device)
+                if self.bwd_grad_shape is not None:
+                    self.bwd_grad = torch.ones(self.bwd_grad_shape, dtype = torch.float16 if self.fp16 else torch.float32).to(self.device)
+
+                # print("grads before",optimizer.param_groups[0]["params"][0].grad)
+                if self.fp16:
+                    with amp.scale_loss(fwd_out, optimizer, last_partition=True) as scaled_out:
+                        scaled_out.backward(grads)
+                else:
+                    fwd_out.backward(grads)
+
+            except RuntimeError as e:
+                if 'out of memory' in str(e):
+                    print("Out of memorryyyy", batch_size)
+                else:
+                    raise e
+            
+            for param in optimizer._amp_stash.all_fp32_from_fp16_params:
+                param.grad = None
+            for param in self.model.parameters():
+                param.grad = None
+
+            #fwd_act_size = fwd_out.element_size() * fwd_out.nelement()
+            #del grads, fwd_out
+            self.model.zero_grad()
+            optimizer.zero_grad()
+            self.ret_val = None
+            self.fwd_inp = None; self.bwd_grad = None
+
+            warmup_time = time.time() - warmup_time
+            print("warming up", warmup_time)
+            count += 1
+
     def profile(self, get_batch_fn,  microbatch_sizes, optimizer, filename="profile.csv"):
 
+        self.warmup(get_batch_fn, microbatch_sizes, optimizer)
         profile = {}
         if self.pre_cp is not None:
             self.pre_cp.recv_fn = self.recv
@@ -228,8 +294,8 @@ class Profiling:
 
         for batch_size in microbatch_sizes:
             self.model.train()
-            avg_fwd_time = 0
-            avg_bwd_time = 0
+            fwd_times = []
+            bwd_times = []
             avg_mem_usage = 0
             try:
                 for i in range(5): 
@@ -256,23 +322,24 @@ class Profiling:
                             raise e
                         fwd_out = self.ret_val
                     self.ret_val = None
+                    _tosend = fwd_out.cpu()
                     torch.cuda.synchronize()
                     fwd_time = time.time() - start
 
                     bwd_time = time.time()
                     if isinstance(fwd_out, tuple):
                         fwd_out = fwd_out[0]
-                    grads = torch.ones(list(fwd_out.size()), device = self.device)
+                    grads = 0.00001 * torch.ones(list(fwd_out.size()), device = self.device)
                     if self.bwd_grad_shape is not None:
                         self.bwd_grad = torch.ones(self.bwd_grad_shape, dtype = torch.float16 if self.fp16 else torch.float32).to(self.device)
                 
-                    print("grads before",optimizer.param_groups[0]["params"][0].grad)
+                    # print("grads before",optimizer.param_groups[0]["params"][0].grad)
                     if self.fp16:
                         with amp.scale_loss(fwd_out, optimizer, last_partition=True) as scaled_out:
                             scaled_out.backward(grads)
                     else:
                         fwd_out.backward(grads)
-
+                    _tosend = grads.cpu()
                     torch.cuda.synchronize()
                     bwd_time = time.time() - bwd_time
 
@@ -289,8 +356,8 @@ class Profiling:
 
                     mem_usage = torch.cuda.max_memory_allocated(self.device)
                 
-                    avg_fwd_time += fwd_time
-                    avg_bwd_time += bwd_time
+                    fwd_times.append(fwd_time)
+                    bwd_times.append(bwd_time)
                     avg_mem_usage += mem_usage
 
                     del inputs
@@ -300,19 +367,27 @@ class Profiling:
                     optimizer.state = collections.defaultdict(dict) # Reset state
                     opt_state_mem = opt_state_mem - torch.cuda.memory_allocated(self.device)
                 
-                fwd_time = avg_fwd_time / 5
-                bwd_time = avg_bwd_time / 5
+                print("fwd:", fwd_times, 'bwd:', bwd_times)
+                fwd_times = remove_outliers(fwd_times)
+                bwd_times = remove_outliers(bwd_times)
+                fwd_time = sum(fwd_times)/len(fwd_times)
+                bwd_time = sum(bwd_times)/len(bwd_times)
                 mem_usage = avg_mem_usage / 5
 
-                print("Batch size", batch_size, ": ")
-                print("fwd_time", fwd_time)
-                print("bwd_time", bwd_time)
-                print("mem_usage", mem_usage)
-                print("-------------------------")
-                print()
-
-                of.write("{}, {}, {}, {}, {}, {}, {}\n".format(batch_size, fwd_time, bwd_time, mem_usage, input_mem, fwd_act_size, opt_state_mem))
-                print("Opt_state", opt_state_mem)
+                # print("Batch size", batch_size, ": ")
+                # print("fwd_time", fwd_time)
+                # print("bwd_time", bwd_time)
+                # print("mem_usage", mem_usage)
+                # print("-------------------------")
+                # print()
+                
+                string = "{}, {}, {}, {}, {}, {}, {}".format(\
+                                    batch_size, fwd_time, bwd_time, 
+                                    mem_usage, input_mem, fwd_act_size, 
+                                    opt_state_mem)
+                print(string)
+                of.write(string + "\n")
+                # print("Opt_state", opt_state_mem)
 
             except RuntimeError as e:
                 if 'out of memory' in str(e):
@@ -331,3 +406,23 @@ class PassThroughModule(Module):
 
     def forward(self,*args,**kwargs):
         return None
+
+
+def remove_outliers(data):
+    #define a list to accumlate anomalies
+    anomalies = []
+    
+    n = len(data)
+    data = sorted(data)
+    if n % 2:
+        median = data[n//2]
+    else:
+        median = (data[n//2] + data[(n//2)-1])/2
+     
+    upper_limit = 3*median
+    # print(lower_limit)
+    filtered = []
+    for point in data:
+        if point <= upper_limit:
+            filtered.append(point)
+    return filtered

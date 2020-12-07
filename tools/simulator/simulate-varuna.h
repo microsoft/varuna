@@ -6,7 +6,7 @@
 #include <utility>
 #include <random>
 
-#include "generate-schedule.h"
+#include "generate_schedule.h"
 
 using namespace std;
 
@@ -97,6 +97,12 @@ public:
     rc_ = new Queue('r');
     sendact_ = new Queue('a');
     sendgrad_ = new Queue('g');
+    recvact_ = new Queue('A');
+    recvgrad_ = new Queue('G');
+    if(stage_num_ > 0) acts_left = num_mb;
+    if(stage_num_ < depth-1) grads_left = num_mb;
+    // acts_recvd.insert(acts_recvd.begin(), num_mb, false);
+    // grads_recvd.insert(grads_recvd.begin(), num_mb, false);
     if (stage_num_ == 0) {
       for (int i = 0; i < num_micro_; ++i) {
         fwd_->q.push_back(QueueEntry(i, 0));
@@ -104,25 +110,42 @@ public:
     }
     // printf("schedule size %d\n", schedule.size());
   }
-  bool ProcessEvent(Simulator* sim, Event event, int64 now);
+  int ProcessEvent(Simulator* sim, Event event, int64 now);
   void ServiceQueues(Simulator* sim, int64 now);
+  bool isDone(){
+    return curr_task_ind >= schedule.size();
+  }
+  void MoveQueues(){
+    if(recvact_->q.size()>0 || ( recvact_->q.size()>0 && acts_left<=2)){
+      fwd_->insert(recvact_->front());
+      recvact_->pop_front();
+    }
+    if(recvgrad_->q.size()>0 || ( recvgrad_->q.size()>0 && grads_left<=2)){
+      rc_ -> insert(recvgrad_->front());
+      recvgrad_->pop_front();
+    }
+  }
 
 private:
   Queue* PickNextNetworkQueue(int64 now);
   Queue* PickNextComputeQueue(int64 now);
 
-  Queue *fwd_, *bwd_, *rc_, *sendact_, *sendgrad_;
-  bool gpu_busy_;
-  int network_busy_;
+  Queue *fwd_, *bwd_, *rc_, *sendact_, *sendgrad_, *recvact_, *recvgrad_;
+  bool gpu_busy_ = false;
+  int network_busy_ = false;
   int stage_num_;
   int depth_;
   int num_micro_;
-  int recomputed_mb_;
+  int recomputed_mb_ = -1;
   int last_fwd_mb_ = -1;
   int last_rec_mb_ = -1;
-  bool wait_for_fwd_ = false;
+  // bool wait_for_fwd_ = false;
+  int waiting_for_stage = -1;
   std::vector<schedule_task> schedule;
   int curr_task_ind = 0;
+  // std::vector<bool> acts_recvd, grads_recvd;
+  int acts_left = 0;
+  int grads_left = 0;
 };
 
 typedef class Stage Stage;

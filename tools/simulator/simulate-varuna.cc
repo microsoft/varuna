@@ -2,7 +2,7 @@
 
 #define DEBUG
 
-int MAX_NETWORK = 2;
+int MAX_NETWORK = 4;
 
 static inline Queue* QueueReady(Queue* q, int64 now) {
   if (!q->q.empty() && q->front().time <= now) return q;
@@ -57,9 +57,6 @@ Queue* Stage::PickNextComputeQueue(int64 now) {
   if(curr_task_ind >= schedule.size()) return NULL;
 
   schedule_task t = schedule[curr_task_ind];
-  // if(stage_num_ == 22){
-  //   printf("pick %d %d %c\n", stage_num_, t.index, t.task);
-  // }
 
   // swap 
   if(t.task == '1' && !QueueReady(rc_,now) && (last_fwd_mb_<num_micro_-1)){
@@ -98,17 +95,20 @@ Queue* Stage::PickNextComputeQueue(int64 now) {
 
 void Stage::ServiceQueues(Simulator* sim, int64 now) {
   Queue* q;
+  waiting_for_stage = -1;
   if (!gpu_busy_){
     if(q = PickNextComputeQueue(now)) {
       QueueEntry qe = q->front();
       q->pop_front();
       sim->AddEvent(now, Event(stage_num_, qe.micro_batch, IdToState(q->id)));
-      wait_for_fwd_ = false;
     }
-    else if(last_fwd_mb_ < num_micro_ - 1){
-      wait_for_fwd_ = true;
+    else if(curr_task_ind < schedule.size()){
+      waiting_for_stage = schedule[curr_task_ind].task == '0' ?
+                              stage_num_ - 1 : stage_num_ + 1 ;
+      // printf("%d WAITING FOR %d\n", stage_num_, waiting_for_stage);
     }
   }
+  
   // if (!network_busy_ && (q = PickNextNetworkQueue(now))) {
   //   QueueEntry qe = q->front();
   //   q->pop_front();
@@ -126,7 +126,7 @@ void Stage::ServiceQueues(Simulator* sim, int64 now) {
   }
 }
 
-bool Stage::ProcessEvent(Simulator* sim, Event e, int64 now) {
+int Stage::ProcessEvent(Simulator* sim, Event e, int64 now) {
 #ifdef DEBUG
   printf("Event time: %lld  Stage: %d MB: %d state: %s\n",
          now, e.stage, e.mb_num, Event::StringState(e.state));
@@ -203,9 +203,13 @@ bool Stage::ProcessEvent(Simulator* sim, Event e, int64 now) {
       //               Event(stage_num_ - 1, e.mb_num, Event::RC_QUEUE));
       break;
     case Event::RECV_ACT:
+      // recvact_->insert(QueueEntry(e.mb_num, now));
+      // acts_left--;
       fwd_->insert(QueueEntry(e.mb_num, now));
       break;
     case Event::RECV_GRAD:
+      // recvgrad_->insert(QueueEntry(e.mb_num, now));
+      // grads_left--;
       rc_->insert(QueueEntry(
         rc_->q.empty() ? last_rec_mb_ + 1: rc_->q.back().micro_batch+1, now));
       break;
@@ -213,6 +217,7 @@ bool Stage::ProcessEvent(Simulator* sim, Event e, int64 now) {
       printf("Invalid event");
   }
   ServiceQueues(sim, now);
+  return waiting_for_stage;
 }
 
 // ======== class Simulator ===================
@@ -267,12 +272,20 @@ void Simulator::Simulate() {
   stages_[0]->ServiceQueues(this, clock_now_micros_);
 
   Event event;
+  int wait_stage = -1;
   while (PopNextEvent(&event)) {
     if (event.stage >= pipeline_depth_) {
       printf("Unexpected stage in event: %d vs. %d", event.stage, pipeline_depth_);
       return;
     }
-    stages_[event.stage]->ProcessEvent(this, event, clock_now_micros_);
+    wait_stage = stages_[event.stage]->ProcessEvent(this, event, clock_now_micros_);
+    // if(wait_stage >=0 && wait_stage < pipeline_depth_)
+    //   stages_[wait_stage]->ServiceQueues(this, clock_now_micros_);
+    // for(int i = 0; i < pipeline_depth_; i++)
+    //   stages_[i]->MoveQueues();
+  }
+  if (!stages_[0]->isDone()){
+    printf("THERE'S AN ERROR!\n");
   }
   #ifdef DEBUG
   for(int i = 0; i < pipeline_depth_; i++){

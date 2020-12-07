@@ -679,12 +679,16 @@ class Pipeline:
             self.set_model_send_fn(recompute = False)
             acts = self.set_model_recv_fn(recompute = False)
             task_time_start = time.time()
+            inputs_as_dict["record"] = self.make_logfile
             output = self.model(**inputs_as_dict)
             if self.make_logfile:
                 torch.cuda.synchronize(self.device)
+                cutpoint_times = self.model.elapsed_times()
                 task_time = time.time() - task_time_start
                 self.logfile.write("{} {} {} {}\n".format(TASK[0], 0, str(task_time_start), str(task_time)))
-
+                for cpt in cutpoint_times:
+                    self.logfile.write(str(cpt) + " ")
+                self.logfile.write("\n")
             if grad_mode == False:
                 if self.stage > 0:
                     acts = acts.cpu()

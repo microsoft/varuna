@@ -72,7 +72,8 @@ def get_batch(size, cpu=False):
 model = GPT2Model(num_tokentypes=0, parallel_output=True)
 
 profiler = Profiling(model, device, args.fp16)
-profiler.initialize(get_batch(1,cpu=True), stage_num=args.stage , from_cache=False)
+profiler.initialize(get_batch(1,cpu=True), start=1, end=3 , from_cache=False)
+profile_name = "gpt2_1_5b_profile_fp16-{}to{}.csv".format(1,3)
 
 params = 0
 for n,p in model.named_parameters():
@@ -85,7 +86,7 @@ model.to(device)
 model_mem = torch.cuda.memory_allocated(device) - initial_mem
 print("Model memory", model_mem)
 
-with open("gpt2_8_5b_profile_fp16-{}.csv".format(args.stage),"w") as f:
+with open(profile_name,"w") as f:
     f.write(("Model memory: " + str(model_mem) + "\n"))
 
 param_groups = get_params_for_weight_decay_optimization(model)
@@ -101,4 +102,4 @@ if args.fp16:
 
 # profiler.model = model
 model.train()
-profile = profiler.profile(get_batch,[1]+ list(range(1,max_micro_BS)), optimizer, "gpt2_8_5b_profile_fp16-{}.csv".format(args.stage))
+profile = profiler.profile(get_batch,[1]+ list(range(1,max_micro_BS)), optimizer, profile_name)
