@@ -950,6 +950,7 @@ class Pipeline:
                 if log_verbose:
                     print(f'{self.rank} {self.rank_within_stage} overflow all_reduce done')
                 overflow_buf = allred_tensor[0]
+                global_grad_norm_sq = allred_tensor[1]
                 global_grad_norm = allred_tensor[1] ** 0.5
 
                 if self.local_rank == 0:
@@ -962,6 +963,12 @@ class Pipeline:
                     self.logfile.write("overflow 0 {} {}\n".format(osync_time_start, osync_time))
             else:
                 global_grad_norm = local_grad_norm
+                global_grad_norm_sq = local_grad_norm**2
+            
+            clipped = clip_grad_norm(amp.master_params(self.optimizer), global_grad_norm_sq, 1.0)
+            if clipped:
+                global_grad_norm = global_grad_norm/global_grad_norm # * args.clip_grad (max_norm)
+
             if overflow_buf.item()==0:
                 overflow_buf = torch.cuda.IntTensor([0])
             else:
@@ -1025,3 +1032,36 @@ def load_varuna_optimizer(optimizer, my_stage, num_stages, total_num_pstages, pa
             name = parameter_names[p]
             if name in saved_master_params:
                 p.data.copy_(saved_master_params[name].data)
+
+
+def clip_grad_norm(parameters, grad_norm_sq, max_norm, norm_type=2):
+    """Clips gradient norm of an iterable of parameters.
+
+    This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
+    added functionality to handle model parallel parameters. Note that
+    the gradients are modified in place.
+
+    Arguments:
+        parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
+            single Tensor that will have gradients normalized
+        max_norm (float or int): max norm of the gradients
+        norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
+            infinity norm.
+
+    Returns:
+        Total norm of the parameters (viewed as a single vector).
+    """
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    parameters = list(filter(lambda p: p.grad is not None, parameters))
+    max_norm = float(max_norm)
+    norm_type = float(norm_type)
+    
+    total_norm = grad_norm_sq.item() ** (1. / norm_type)
+    # print(f'clip_grad_norm() total_norm = {total_norm}')
+    clip_coef = max_norm / (total_norm + 1e-6)
+    if clip_coef < 1:
+        for p in parameters:
+            p.grad.data.mul_(clip_coef)
+            
+    return clip_coef<1

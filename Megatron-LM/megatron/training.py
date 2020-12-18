@@ -403,11 +403,11 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
     loss, loss_reduced, overflow, global_grad_norm = varuna_step(data_iterator, model)
     # timers('forward').stop()
 
-    if args.clip_grad > 0:
-        if not args.fp16:
-            mpu.clip_grad_norm(model.parameters(), args.clip_grad)
-        else:
-            mpu.clip_grad_norm(amp.master_params(optimizer), args.clip_grad)
+    # if args.clip_grad > 0:
+    #     if not args.fp16:
+    #         mpu.clip_grad_norm(model.parameters(), args.clip_grad)
+    #     else:
+    #         mpu.clip_grad_norm(amp.master_params(optimizer), args.clip_grad)
 
     # Update parameters.
     timers('optimizer').start()
@@ -415,7 +415,7 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
         # print("setup_model() pre opt step: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
         # print('setup_model() pre opt step:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
     if not overflow:
-        optimizer.step(global_grad_norm)
+        optimizer.step(global_grad_norm=global_grad_norm)
     else:
         for param in optimizer._amp_stash.all_fp32_from_fp16_params:
             param.grad = None
