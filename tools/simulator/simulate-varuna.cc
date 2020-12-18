@@ -1,6 +1,6 @@
 #include "simulate-varuna.h"
 
-#define DEBUG
+// #define DEBUG
 
 int MAX_NETWORK = 4;
 
@@ -59,7 +59,7 @@ Queue* Stage::PickNextComputeQueue(int64 now) {
   schedule_task t = schedule[curr_task_ind];
 
   // swap 
-  if(t.task == '1' && !QueueReady(rc_,now) && (last_fwd_mb_<num_micro_-1)){
+  if(!gpipe && t.task == '1' && !QueueReady(rc_,now) && (last_fwd_mb_<num_micro_-1)){
     for(int i=curr_task_ind+1; i<schedule.size(); i++){
       if(schedule[i].task=='0'){
         schedule.insert(schedule.begin() + curr_task_ind, schedule[i]);
@@ -72,7 +72,8 @@ Queue* Stage::PickNextComputeQueue(int64 now) {
   t = schedule[curr_task_ind];
 
   if (t.task == '2' && (q = QueueReady(bwd_, now)) && 
-      q->front().micro_batch == t.index){
+      q->front().micro_batch == t.index && 
+      (stage_num_==depth_-1 || recomputed_mb_ == t.index)){
       curr_task_ind++;
       return q;
   }
@@ -143,8 +144,10 @@ int Stage::ProcessEvent(Simulator* sim, Event e, int64 now) {
       gpu_busy_ = false;
       if (stage_num_ != depth_ - 1) {
         sendact_->push_back(QueueEntry(e.mb_num, now));
-      } else {
+      } else if (!gpipe) {
         bwd_->insert(QueueEntry(e.mb_num, now)); 
+      } else if(e.mb_num == num_micro_-1){
+        rc_->push_back(QueueEntry(e.mb_num, now));
       }
       break;
     case Event::BWD_START:
@@ -164,9 +167,12 @@ int Stage::ProcessEvent(Simulator* sim, Event e, int64 now) {
       if (stage_num_ > 0) {
         sendgrad_->push_back(QueueEntry(e.mb_num, now));
       }
+      if (stage_num_ == depth_ - 1 && gpipe && e.mb_num > 0)
+        rc_->push_back(QueueEntry(e.mb_num-1, now));
       break;
     case Event::RC_QUEUE:
-      rc_->insert(QueueEntry(e.mb_num, now));
+      if(!gpipe) rc_->insert(QueueEntry(e.mb_num, now));
+      else rc_-> insert_rev(QueueEntry(e.mb_num, now));
       break;
 
     case Event::RC_START:
@@ -177,7 +183,12 @@ int Stage::ProcessEvent(Simulator* sim, Event e, int64 now) {
     case Event::RC_DONE:
       recomputed_mb_ = e.mb_num;          
       gpu_busy_ = false;
-      bwd_->insert(QueueEntry(e.mb_num, now));
+      if(!gpipe){
+        bwd_->insert(QueueEntry(e.mb_num, now));
+      }else{
+        if (stage_num_ == depth_-1) bwd_->insert_rev(QueueEntry(e.mb_num, now));
+        if (stage_num_ > 0) sim->AddEvent(now, Event(stage_num_ - 1, e.mb_num, Event::RC_QUEUE));
+      }
       break;
     case Event::SENDACT_START:
       network_busy_++;
@@ -210,8 +221,12 @@ int Stage::ProcessEvent(Simulator* sim, Event e, int64 now) {
     case Event::RECV_GRAD:
       // recvgrad_->insert(QueueEntry(e.mb_num, now));
       // grads_left--;
-      rc_->insert(QueueEntry(
-        rc_->q.empty() ? last_rec_mb_ + 1: rc_->q.back().micro_batch+1, now));
+      if(!gpipe){
+        rc_->insert(QueueEntry(
+          rc_->q.empty() ? last_rec_mb_ + 1: rc_->q.back().micro_batch+1, now));
+      } else{
+        bwd_->insert_rev(QueueEntry(e.mb_num, now));
+      }
       break;
     default:
       printf("Invalid event");
@@ -286,6 +301,7 @@ void Simulator::Simulate() {
   }
   if (!stages_[0]->isDone()){
     printf("THERE'S AN ERROR!\n");
+    return;
   }
   #ifdef DEBUG
   for(int i = 0; i < pipeline_depth_; i++){

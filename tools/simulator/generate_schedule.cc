@@ -18,7 +18,32 @@ void GenSchedule::InitQueues() {
   }
 }
 
-TaskQueue* GenSchedule::PickQueue(int stage, char* identifier) {
+TaskQueue* GenSchedule::PickQueue_gpipe(int stage, char* identifier) {
+  // Defines precedence order of servicing queues
+  if (!fwd_queues_[stage]->empty()) {
+    // *identifier = 'f'; 
+    *identifier = '0';
+    return fwd_queues_[stage];
+  }
+  if (!bi_queues_[stage]->empty()) {
+    // *identifier = 'b';
+    *identifier = '2'; 
+    return bi_queues_[stage];
+  }
+  if (!rc_queues_[stage]->empty()) {
+    // *identifier = 'r'; 
+    *identifier = '1';
+    return rc_queues_[stage];
+  }
+  if (!bw_queues_[stage]->empty()) {
+    // *identifier = 'B';
+    *identifier = '3';
+    return bw_queues_[stage];
+  }
+  return NULL;
+}
+
+TaskQueue* GenSchedule::PickQueue_varuna(int stage, char* identifier) {
   // Defines precedence order of servicing queues
   if (!bw_queues_[stage]->empty()) {
     // *identifier = 'B';
@@ -41,6 +66,11 @@ TaskQueue* GenSchedule::PickQueue(int stage, char* identifier) {
     return fwd_queues_[stage];
   }
   return NULL;
+}
+
+TaskQueue* GenSchedule::PickQueue(int stage, char* identifier) {
+  if(gpipe) return PickQueue_gpipe(stage, identifier);
+  return PickQueue_varuna(stage, identifier);
 }
 
 void GenSchedule::Generate(std::vector<schedule_task> sched[]) {
@@ -94,15 +124,19 @@ void GenSchedule::Generate(std::vector<schedule_task> sched[]) {
         case '0':
           if (!last_stage) {
             fwd_queues_[i+1]->push_back(mini);
-          } else {
+          } else if(!gpipe){
             bi_queues_[i]->push_back(mini);
+          }else if (mini == num_mini_){
+            rc_queues_[i]->push_back(mini);
           }
           break;
 
         // case 'b':
         case '2':
           bw_queues_[i]->push_back(mini);
-          if (!first_stage) {
+          if(gpipe && last_stage && mini > 1)
+            rc_queues_[i]->push_back(mini-1);
+          if (!gpipe && !first_stage) {
             rc_queues_[i-1]->push_back(mini);
           }
           break;
@@ -110,6 +144,9 @@ void GenSchedule::Generate(std::vector<schedule_task> sched[]) {
         // case 'r':
         case '1':
           bi_queues_[i]->push_back(mini);
+          if (gpipe && !first_stage) {
+            rc_queues_[i-1]->push_back(mini);
+          }
           break;
 
         // case 'B':
