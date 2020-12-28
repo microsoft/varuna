@@ -106,6 +106,9 @@ class Varuna(Module):
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
         self.model = PartitionedModel(model, self.rank, self.local_rank, device, self.stage_to_rank_map, self.fp16, shared_weights)
         self.model.initialize( dummy_inputs, from_cache=False )
+        if self.local_rank==0:
+            # print("varuna init() after dry run init: ", self.local_rank, torch.cuda.memory_summary(self.device))
+            print('varuna init() after dry run:', self.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
         self.partitioned_model = self.model
         self.shared_weight_stages = self.model.shared_weight_stages if self.shared_weights is not None else None
 
@@ -175,7 +178,7 @@ class Varuna(Module):
         for stage in range(self.partitions):
             ranks = self.stage_to_rank_map[stage]
             if len(ranks) > 1:
-                process_groups[stage] = dist.new_group(ranks=ranks, backend='nccl')
+                process_groups[stage] = dist.new_group(ranks=ranks,backend='nccl')
             else:
                 process_groups[stage] = None
 
@@ -232,20 +235,8 @@ class Varuna(Module):
         loss, overflow, global_grad_norm = pipeline.run()
         batch_time = time.time() - batch_time
         self.step += 1
-        # print(f'{torch.distributed.get_rank()}: step = {self.step}')
 
-        # if self.profilling:
-        # #     self.current_profile_steps += 1
-        #     self.profile_avg_batch_time += batch_time
-        #     if self.steps - self.initial_step == 10:
-        #         self.profile_avg_batch_time /= 10
-        #         self.profile_csv.write("{}, {} \n".format(self.partitions, self.profile_avg_batch_time))
-        #         self.profilling = False
-        #         self.current_profile_steps = 0
-        #         self.profile_avg_batch_time = 0
-        #         self.profilling = self.repartition()
-            
-        if False and self.rank == 0 and self.step%10==0:    # disable morphing for hypercluster
+        if self.rank == 0 and self.step%10==0:
             manager_ip = "10.0.3.4"
             manager_port = 5000
             try:

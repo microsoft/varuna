@@ -28,7 +28,8 @@ from megatron import mpu
 from megatron import get_args
 from megatron import print_rank_0
 import concurrent.futures
-
+from datetime import datetime
+import time
 
 from varuna import load_varuna_checkpoint, load_varuna_optimizer
 
@@ -93,17 +94,6 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
     """Save a model checkpoint."""
     args = get_args()
     global mv_futures
-
-    # if not on_demand and mv_futures is not None and len(mv_futures) > 0:
-    #     print("waiting on futures...")
-    #     done, notdone = concurrent.futures.wait(mv_futures)
-    #     if len(notdone) > 0:
-    #         print("{} ckpts not moved\n".format(len(notdone)))
-    #     for future in done:
-    #         try:
-    #             data = future.result()
-    #         except Exception as exc:
-    #             print('future generated an exception: %s' % ( exc))
 
     # Only rank zero of the data parallel writes to the disk.
     if not args.varuna and isinstance(model, torchDDP):
@@ -176,11 +166,12 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
             while not (os.path.exists(model_cp_dir) and os.path.exists(opt_cp_dir)):
                 pass
             param_name_to_pstage = model.checkpoint(model_cp_dir)
-            param_name_to_pstage["lm_head_weight"] = args.num_layers - 1
-            mv_futures = model.checkpoint_optimizer(optimizer, parameter_names, param_name_to_pstage, opt_cp_dir, tempdir=None)
-            
+            param_name_to_pstage["lm_head_weight"] = args.num_layers + 1
+            mv_futures = model.checkpoint_optimizer(optimizer, parameter_names, param_name_to_pstage, opt_cp_dir, tempdir=tempdir)
+
         # remove old checkpoints
         if args.max_num_ckpts is not None and torch.distributed.get_rank() == 0:
+            rm_time = time.time()
             all_ckpted_iters = sorted([int(f.split("_")[-1]) for f in os.listdir(args.save) if f.startswith("opt_ckpt")])
             # assert all_ckpted_iters[-1] == iteration, "The latest checkpoint is corrupted?"
             if len(all_ckpted_iters) > args.max_num_ckpts:
@@ -195,13 +186,15 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
                         os.system("rm -rf {} &".format(os.path.join(args.save,'iter_{:07d}'.format(it))))
                     except Exception as e:
                         print("Error while removing checkpoint {}: {}".format(it,str(e)))
+            rm_time = time.time() - rm_time
+            print("rm time", rm_time)
         print('  successfully saved {}'.format(checkpoint_name))
 
     if mv_futures is not None and len(mv_futures) > 0:
         executor = concurrent.futures.ThreadPoolExecutor()
         executor.submit(future_on_futures, args.local_rank, iteration)
         executor.shutdown(wait = False)
-
+    
     # Wait so everyone is done (necessary)
     torch.distributed.barrier()
     # And update the latest iteration
@@ -319,15 +312,8 @@ def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
         model_cp_dir = os.path.join(args.load, "model_ckpt_{}".format(iteration))
         print("loading varuna ckpt", iteration)
         opt_cp_dir = os.path.join(args.load, "opt_ckpt_{}".format(iteration))
-        pstages_to_read = None
-        # if args.stage == args.partitions - 1:
-        #     pstages_to_read = [45, 46, 47]
-        #     stages_per_worker = args.num_layers // args.partitions
-        #     pstages_to_read = list(range(stages_per_worker * args.stage, \
-        #                             stages_per_worker * (args.stage + 1))) \
-        #                                 + [48, 49]
-        model_state_dict = load_varuna_checkpoint(args.stage, args.partitions, args.num_layers,\
-                         opt_cp_dir, prefix="opt-fp32-params", pstages_to_read=pstages_to_read)
+        model_state_dict = load_varuna_checkpoint(args.stage, args.partitions, args.num_layers+2,\
+                         opt_cp_dir, prefix="opt-fp32-params", pstages_to_read=None)
         model.load_state_dict(model_state_dict, strict = False)
     else:
         model.load_state_dict(state_dict['model'])
@@ -343,17 +329,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
                             if k != 'params':
                                 optimizer.param_groups[i][k] = v
                     opt_cp_dir = os.path.join(args.load, "opt_ckpt_{}".format(iteration))
-                    # print("WARNING I'M READING IN A CHANGED WAY\n")
-                    pstages_to_read = None
-                    # if args.stage == args.partitions - 1:
-                    #     pstages_to_read = [45, 46, 47]
-                    #     stages_per_worker = args.num_layers // args.partitions
-                    #     pstages_to_read = list(range(stages_per_worker * args.stage, \
-                    #                             stages_per_worker * (args.stage + 1))) \
-                    #                              + [48, 49]
-                    # elif args.stage == 24:
-                    #     pstages_to_read = [47]
-                    load_varuna_optimizer(optimizer, args.stage, args.partitions, args.num_layers, parameter_names, opt_cp_dir, args.fp16, pstages_to_read = pstages_to_read)
+                    load_varuna_optimizer(optimizer, args.stage, args.partitions, args.num_layers+2, parameter_names, opt_cp_dir, args.fp16, pstages_to_read = None)
                     device = args.local_rank
                     for state in optimizer.state.values():
                         for k, v in state.items():

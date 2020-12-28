@@ -1,9 +1,16 @@
 cluster=${2:-"megatron"}
-subscription=${3:-"f3ebbda2-3d0f-468d-8e23-31a0796dcac1"}
-group=${4:-"Varuna"}
+only_one=${3:-0}
+subscription=${4:-"f3ebbda2-3d0f-468d-8e23-31a0796dcac1"}
+group=${5:-"Varuna"}
 print_unavailable=${1:-0}
 
 machines=($(az vmss nic list --vmss-name $cluster --subscription $subscription --resource-group $group --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
+if [ $only_one -eq 0 ]
+then
+    machines+=($(az vmss nic list --vmss-name megatron_1 --subscription $subscription --resource-group $group --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
+    machines+=($(az vmss nic list --vmss-name megatron_2 --subscription $subscription --resource-group $group --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
+    #machines+=($(az vmss nic list --vmss-name megatron_3 --subscription $subscription --resource-group $group --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
+fi
 
 reachable_machines=( )
 unreachable_machines=( )
