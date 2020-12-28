@@ -743,13 +743,9 @@ class Pipeline:
             self.loss = None
         
     def run(self):
-        # dist.barrier()
-        # time.sleep(10)
         if log_verbose:
             print(f'{self.rank} {self.rank_within_stage} starting pipeline')
-        # for n, p in self.model.named_parameters():
-        #     if (torch.distributed.get_rank()==0 and 'word_embeddings.weight' in n) or (torch.distributed.get_rank()==1 and 'lm_head_weight' in n):
-        #         print(torch.distributed.get_rank(), ":", n, "=", p)
+
         self.spawn_receive_workers()
 
         batchstart = time.time()

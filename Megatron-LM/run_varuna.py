@@ -15,7 +15,7 @@ MAX_GPU_MEM = 16280000000
 processes = []
 
 manager_ip = "10.0.3.4"
-manager_port = 4201
+manager_port = 4200
 
 def calculate_config(args):
     # world size in terms of number of processes
