@@ -711,7 +711,7 @@ def build_train_valid_test_data_iterators(
     (train_dataloader, valid_dataloader, test_dataloader) = (None, None, None)
 
     print_rank_0('> building train, validation, and test datasets ...')
-    print("Trying to build")
+    print_rank_0("Trying to build")
     # Data loader only on rank 0 of each model parallel group.
     if (not mpu.model_parallel_is_initialized()) or mpu.get_model_parallel_rank() == 0:
         # Rank, size, and global batch size.
@@ -730,10 +730,10 @@ def build_train_valid_test_data_iterators(
         train_val_test_num_samples = [train_iters * global_batch_size,
                                       eval_iters * global_batch_size,
                                       test_iters * global_batch_size]
-        print(' > datasets target sizes (minimum size):')
-        print('    train:      {}'.format(train_val_test_num_samples[0]))
-        print('    validation: {}'.format(train_val_test_num_samples[1]))
-        print('    test:       {}'.format(train_val_test_num_samples[2]))
+        print_rank_0(' > datasets target sizes (minimum size):')
+        print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
+        print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
+        print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
 
         # Build the datasets.
         train_ds, valid_ds, test_ds = build_train_valid_test_datasets_provider(
@@ -769,14 +769,14 @@ def build_train_valid_test_data_iterators(
     if train_dataloader is not None:
         train_dataloader.batch_sampler.start_iter = args.iteration % \
             len(train_dataloader)
-        print('setting training data start iteration to {}'.
+        print_rank_0('setting training data start iteration to {}'.
                      format(train_dataloader.batch_sampler.start_iter))
     if valid_dataloader is not None:
         start_iter_val = (args.iteration // args.eval_interval) * \
             args.eval_iters
         valid_dataloader.batch_sampler.start_iter = start_iter_val % \
             len(valid_dataloader)
-        print('setting validation data start iteration to {}'.
+        print_rank_0('setting validation data start iteration to {}'.
                      format(valid_dataloader.batch_sampler.start_iter))
 
     # Build iterators.
