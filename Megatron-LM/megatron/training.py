@@ -326,6 +326,7 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
             basemodel.lm_head_weight.data.copy_(param.data) 
 
 
+    model.parameter_names = parameter_names
     return model, optimizer, lr_scheduler, parameter_names
 
 
@@ -401,14 +402,14 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
 
     # Forward model for one step.
     # timers('forward').start()
-    loss, loss_reduced, overflow = varuna_step(data_iterator, model)
+    loss, loss_reduced, overflow, global_grad_norm = varuna_step(data_iterator, model)
     # timers('forward').stop()
 
-    if args.clip_grad > 0:
-        if not args.fp16:
-            mpu.clip_grad_norm(model.parameters(), args.clip_grad)
-        else:
-            mpu.clip_grad_norm(amp.master_params(optimizer), args.clip_grad)
+    # if args.clip_grad > 0:
+    #     if not args.fp16:
+    #         mpu.clip_grad_norm(model.parameters(), args.clip_grad)
+    #     else:
+    #         mpu.clip_grad_norm(amp.master_params(optimizer), args.clip_grad)
 
     # Update parameters.
     timers('optimizer').start()
@@ -416,7 +417,7 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
         # print("setup_model() pre opt step: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
         # print('setup_model() pre opt step:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
     if not overflow:
-        optimizer.step()
+        optimizer.step(global_grad_norm=global_grad_norm)
     else:
         for param in optimizer._amp_stash.all_fp32_from_fp16_params:
             param.grad = None
@@ -710,7 +711,7 @@ def build_train_valid_test_data_iterators(
     (train_dataloader, valid_dataloader, test_dataloader) = (None, None, None)
 
     print_rank_0('> building train, validation, and test datasets ...')
-    print("Trying to build")
+    print_rank_0("Trying to build")
     # Data loader only on rank 0 of each model parallel group.
     if (not mpu.model_parallel_is_initialized()) or mpu.get_model_parallel_rank() == 0:
         # Rank, size, and global batch size.

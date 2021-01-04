@@ -24,11 +24,21 @@ from megatron import mpu
 from megatron import print_rank_0
 from megatron.data.gpt2_dataset import build_train_valid_test_datasets
 from megatron.model import GPT2Model
-from megatron.training import pretrain, get_eval_numbers
+from megatron.training import pretrain, get_eval_numbers, on_demand_checkpoint
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import reduce_losses
 
 import signal
+import socket
+import traceback
+
+from datetime import datetime
+
+def client(message, ip="10.0.3.4", port=3500):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.connect((ip, port))
+        sock.sendall(bytes(message, 'ascii'))
+
 
 def model_provider():
     """Build the model."""
@@ -130,11 +140,11 @@ def varuna_step(data_iterator, model):
         "labels": labels
     })
 
-    loss, overflow = model(inputs)
+    loss, overflow, global_grad_norm = model(inputs)
 
     # Reduce loss for logging.
     # reduced_loss = reduce_losses([loss])
-    return loss, {'lm loss': torch.Tensor([loss])}, overflow
+    return loss, {'lm loss': torch.Tensor([loss])}, overflow, global_grad_norm
 
 def cond_forward_step(data_iterator, model):
     args = get_args()
@@ -148,7 +158,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     args = get_args()
 
     print_rank_0('> building train, validation, and test datasets '
-                 'for GPT2 ...')
+                 'for GPT2 ...', datetime.now())
     train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
         data_prefix=args.data_path,
         data_impl=args.data_impl,
@@ -166,12 +176,17 @@ if __name__ == "__main__":
 
     def handler(signum,_):
         print(torch.distributed.get_rank(), 'signal handler called with signal', signum)
+        # on_demand_checkpoint()
         exit()
 
     signal.signal(signal.SIGUSR1, handler) 
 
+    # try:
     pretrain(train_valid_test_datasets_provider, model_provider, cond_forward_step,
-             eval_step_varuna, args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
-
-    # get_eval_numbers(train_valid_test_datasets_provider, model_provider,eval_step_varuna)
+         eval_step_varuna, args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+    # except Exception as e:
+    #     tb = traceback.format_exc()
+    #     client("ERROR in run!")
+    #     client(tb)
+    # # get_eval_numbers(train_valid_test_datasets_provider, model_provider,eval_step_varuna)
 
