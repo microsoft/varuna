@@ -27,6 +27,7 @@ varuna
 *.py[cod]
 *$py.class
 profiles/
+profiling/analyse*
 
 # C extensions
 *.so
