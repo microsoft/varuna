@@ -367,9 +367,9 @@ class PartitionedModel(Module):
 
         # last cutpoint
         if len(state_dict.keys()) > 0 and (cp_count < self.cuts_per_stage):
-            # state_dict["lm_head_weight"] = self.module.lm_head_weight
-            state_dict["cls.predictions.bias"] = self.module.cls.predictions.bias
-            param_name_to_pstage["cls.predictions.bias"] = self.num_cutpoints
+            state_dict["lm_head_weight"] = self.module.lm_head_weight
+            # state_dict["cls.predictions.bias"] = self.module.cls.predictions.bias
+            # param_name_to_pstage["cls.predictions.bias"] = self.num_cutpoints
             if not self.fp16:
                 torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
             for p in temp_param_names:
@@ -391,7 +391,6 @@ class PartitionedModel(Module):
             if isinstance(m,CutPoint):
                 m.set_pruning(True)
 
-        # device = dummy_inputs[list(dummy_inputs.keys())[0]].device
         # forward
         self.set_recv_fn(lambda grads=False: torch.zeros(self.forward_input_shapes[0], dtype=torch.float32))     
         try:

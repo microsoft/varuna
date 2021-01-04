@@ -1,5 +1,9 @@
 #! /bin/bash
 #export PATH="/home/varuna/anaconda3/bin:$PATH"
+#which conda
+
+RANK=0
+WORLD_SIZE=2
 
 NNODES=$1
 NODE_RANK=$2
@@ -40,6 +44,7 @@ python3 run_varuna.py --nstages 9 --batch_size 8192 --chunk_size 4 --total_num_s
        --log-interval 1 \
        --save-interval 15 \
        --max-num-ckpts 10 \
+       --min-ckpt-iter-to-remove 3100 \
        --load-iteration $ckpt \
        --eval-interval 100 \
        --eval-iters 10 \

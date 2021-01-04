@@ -72,8 +72,8 @@ def get_batch(size, cpu=False):
 model = GPT2Model(num_tokentypes=0, parallel_output=True)
 
 profiler = Profiling(model, device, args.fp16)
-profiler.initialize(get_batch(1,cpu=True), start=1, end=3 , from_cache=False)
-profile_name = "gpt2_1_5b_profile_fp16-{}to{}.csv".format(1,3)
+profiler.initialize(get_batch(1,cpu=True), start=args.stage-1, end=args.stage , from_cache=False)
+profile_name = "gpt2_1_5b_profile_fp16-{}to{}.csv".format(args.stage-1, args.stage)
 
 params = 0
 for n,p in model.named_parameters():

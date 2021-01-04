@@ -325,8 +325,6 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
         with torch.no_grad():
             basemodel.lm_head_weight.data.copy_(param.data) 
 
-    model.parameter_names = parameter_names
-
 
     model.parameter_names = parameter_names
     return model, optimizer, lr_scheduler, parameter_names

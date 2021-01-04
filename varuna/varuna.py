@@ -232,17 +232,6 @@ class Varuna(Module):
         loss, overflow, global_grad_norm = pipeline.run()
         batch_time = time.time() - batch_time
         self.step += 1
-
-        # if self.profilling:
-        # #     self.current_profile_steps += 1
-        #     self.profile_avg_batch_time += batch_time
-        #     if self.steps - self.initial_step == 10:
-        #         self.profile_avg_batch_time /= 10
-        #         self.profile_csv.write("{}, {} \n".format(self.partitions, self.profile_avg_batch_time))
-        #         self.profilling = False
-        #         self.current_profile_steps = 0
-        #         self.profile_avg_batch_time = 0
-        #         self.profilling = self.repartition()
             
         if self.rank == 0 and self.step%10==0:
             manager_ip = "10.0.3.4"
@@ -660,7 +649,7 @@ class Pipeline:
                 recv_time_start = time.time()
                 g = self.grads_queue.get().to(self.device)
                 if self.make_logfile:  
-                    torch.cuda.synchronize()
+                    torch.cuda.synchronize(self.device)
                     recv_time = time.time() - recv_time_start 
                     self.logfile.write("{} {} {} {}\n".format("recvgrads", 0, recv_time_start, recv_time))
                 self.back_start_times.put(time.time())
@@ -685,16 +674,11 @@ class Pipeline:
             self.set_model_send_fn(recompute = False)
             acts = self.set_model_recv_fn(recompute = False)
             task_time_start = time.time()
-            inputs_as_dict["record"] = self.make_logfile
             output = self.model(**inputs_as_dict)
             if self.make_logfile:
                 torch.cuda.synchronize(self.device)
-                # cutpoint_times = self.model.elapsed_times()
                 task_time = time.time() - task_time_start
                 self.logfile.write("{} {} {} {}\n".format(TASK[0], 0, str(task_time_start), str(task_time)))
-                # for cpt in cutpoint_times:
-                #     self.logfile.write(str(cpt) + " ")
-                self.logfile.write("\n")
             if grad_mode == False:
                 if self.stage > 0:
                     acts = acts.cpu()
