@@ -71,13 +71,23 @@ def get_batch(size, cpu=False):
 
 model = GPT2Model(num_tokentypes=0, parallel_output=True)
 
+profiler = Profiling(model, device, args.fp16)
+profiler.initialize(get_batch(1,cpu=True), start=args.stage-1, end=args.stage , from_cache=False)
+profile_name = "gpt2_1_5b_profile_fp16-{}to{}.csv".format(args.stage-1, args.stage)
+
+params = 0
+for n,p in model.named_parameters():
+    print(n)
+    params += torch.numel(p)
+print("total num of params is ",params)
+
 initial_mem = torch.cuda.memory_allocated(device)
 model.to(device)
 model_mem = torch.cuda.memory_allocated(device) - initial_mem
 print("Model memory", model_mem)
 
-profiler = Profiling(model, device, args.fp16)
-profiler.initialize(get_batch(1), stage_num=args.stage , from_cache=False)
+with open(profile_name,"w") as f:
+    f.write(("Model memory: " + str(model_mem) + "\n"))
 
 param_groups = get_params_for_weight_decay_optimization(model)
 optimizer = LAMB(param_groups, lr=args.lr, weight_decay=args.weight_decay)
@@ -91,4 +101,5 @@ if args.fp16:
         model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale=args.loss_scale, min_loss_scale=args.min_scale)
 
 # profiler.model = model
-profile = profiler.profile(get_batch, range(1,max_micro_BS), optimizer, "gpt2_345m_profile_fp16-{}.csv".format(args.stage))
+model.train()
+profile = profiler.profile(get_batch,[1]+ list(range(1,max_micro_BS)), optimizer, profile_name)

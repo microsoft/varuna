@@ -88,7 +88,7 @@ def parse_args(extra_args_provider=None, defaults={},
         args.data_depth = len(ranks)
         args.stage_to_rank_map = stage_to_rank_map
         assert args.stage != -1, "Invalid stage to rank map!"
-
+    
     # Fp16 loss scaling.
     args.dynamic_loss_scale = False
     if args.loss_scale is None:
@@ -166,6 +166,8 @@ def _add_varuna_args(parser):
                         help = "number of pipeline stages/partitions")
     group.add_argument("--chunk_size", type=int,default=None,
                         help = "number of microbatches for pipeline")
+    group.add_argument("--stage", type=int, default=-1, 
+                        help = "stage for varuna/profiling")
     return parser
 
 def _add_regularization_args(parser):

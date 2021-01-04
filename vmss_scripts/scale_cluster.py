@@ -73,7 +73,7 @@ def scale_out(max_size=87):
 
 if __name__ == "__main__":
 
-    max_size = 25
+    max_size = int(sys.argv[2])
     dt = datetime.now()
     print(dt, cluster)
     print(dt, cluster, file=sys.stderr)

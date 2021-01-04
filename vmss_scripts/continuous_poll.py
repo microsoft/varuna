@@ -29,11 +29,11 @@ def poll_and_update():
         print("no morph", flush=True)
     else:
         machines_added = [m for m in new_machines if m not in current_machines]
-        run_cmd_all("sudo reboot", machines_added)
-        time.sleep(60)
-        cmd = "sudo blobfuse /home/varuna/gpt2-blob --tmp-path=/mnt/ramkdisk/blobfusetmp --config-file=/home/varuna/fuse_connection2.cfg -o allow_other"
-        run_cmd_all(cmd, machines_added)
-        run_cmd_all("sudo mkdir -p /mnt/nitika/varuna_ckpts; sudo chmod -R 777 /mnt/nitika", machines_added)
+        # run_cmd_all("sudo reboot", machines_added)
+        # time.sleep(60)
+        # cmd = "sudo blobfuse /home/varuna/gpt2-blob --tmp-path=/mnt/ramkdisk/blobfusetmp --config-file=/home/varuna/fuse_connection2.cfg -o allow_other"
+        # run_cmd_all(cmd, machines_added)
+        # run_cmd_all("sudo mkdir -p /mnt/nitika/varuna_ckpts; sudo chmod -R 777 /mnt/nitika", machines_added)
         client(server_ip, server_port, "morph")
         print(len(new_machines), flush=True)
 
