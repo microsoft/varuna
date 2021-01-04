@@ -26,6 +26,7 @@ varuna
 *__pycache__/
 *.py[cod]
 *$py.class
+profiles/
 
 # C extensions
 *.so
