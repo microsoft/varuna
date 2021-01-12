@@ -157,7 +157,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid, and test datasets."""
     args = get_args()
 
-    print_rank_0('> building train, validation, and test datasets '
+    print('> building train, validation, and test datasets '
                  'for GPT2 ...', datetime.now())
     train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
         data_prefix=args.data_path,
@@ -167,7 +167,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         seq_length=args.seq_length,
         seed=args.seed,
         skip_warmup=(not args.mmap_warmup))
-    print_rank_0("> finished creating GPT2 datasets ...")
+    print("> finished creating GPT2 datasets ...")
 
     return train_ds, valid_ds, test_ds
 

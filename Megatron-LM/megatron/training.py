@@ -58,7 +58,6 @@ MODEL = None
 OPTIMIZER = None
 LR_SCHEDULER = None
 ITERATION = None
-PARAMETER_NAMES = None
 
 def pretrain(train_valid_test_dataset_provider, model_provider,
              forward_step_func, eval_step_varuna, extra_args_provider=None, args_defaults={}):
@@ -86,7 +85,7 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
             to set already parse arguments.
     """
 
-    global MODEL, OPTIMIZER, LR_SCHEDULER, PARAMETER_NAMES
+    global MODEL, OPTIMIZER, LR_SCHEDULER
 
     setup_time = time.time()
     # Initalize and get arguments, timers, and Tensorboard writer.
@@ -134,13 +133,12 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
         
     # Model, optimizer, and learning rate.    
     timers('model and optimizer').start()
-    model, optimizer, lr_scheduler, parameter_names = setup_model_and_optimizer(model_provider, dry_run_input if args.varuna else None)
+    model, optimizer, lr_scheduler = setup_model_and_optimizer(model_provider, dry_run_input if args.varuna else None)
     timers('model and optimizer').stop()
 
     MODEL = model
     OPTIMIZER = optimizer
     LR_SCHEDULER = lr_scheduler
-    PARAMETER_NAMES = parameter_names
     
     # Print setup timing.
     print_rank_0('done with setups ...')
@@ -153,7 +151,8 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
         if args.do_train:
             iteration, _ = train(forward_step_func,
                                  model, optimizer, lr_scheduler,
-                                 train_data_iterator, valid_data_iterator, parameter_names, eval_step_varuna, setup_time)
+                                 train_data_iterator, valid_data_iterator,
+                                 eval_step_varuna, setup_time)
 
     if args.do_valid:
         prefix = 'the end of training for val data'
@@ -162,7 +161,7 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
                                    iteration, False)
 
     if args.save and iteration != 0:
-        save_checkpoint(iteration, model, optimizer, lr_scheduler,parameter_names)
+        save_checkpoint(iteration, model, optimizer, lr_scheduler)
 
     if args.do_test:
         # Run on test data.
@@ -181,7 +180,9 @@ def get_model(model_provider_func, dry_run_input=None):
 
     if args.varuna:
         shared_weights = [("language_model.embedding.word_embeddings.weight","lm_head_weight")]
-        model = Varuna(model, args.stage_to_rank_map, dry_run_input, args.batch_size * args.data_depth, args.chunk_size, args.fp16, local_rank=args.local_rank, device=args.local_rank, shared_weights=shared_weights)            
+        model = Varuna( model, args.stage_to_rank_map, dry_run_input, args.batch_size * args.data_depth, 
+                        args.chunk_size, args.fp16, local_rank=args.local_rank, 
+                        device=args.local_rank, shared_weights=shared_weights)            
     if args.local_rank == 0:
         print('get_model() post varuna init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())            
     
@@ -254,51 +255,10 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
 
     model = get_model(model_provider_func, dry_run_input)
     optimizer = get_optimizer(model)
+    model.set_optimizer(optimizer)
     if args.local_rank==0:
         print('setup_model() post optimizer init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
     lr_scheduler = get_learning_rate_scheduler(optimizer)
-
-    basemodel = model
-    while isinstance(basemodel, (Varuna,PartitionedModel, torchDDP)):
-        basemodel = basemodel.module if hasattr(basemodel, "module") else basemodel.model
-
-    if args.fp16:
-        if args.dynamic_loss_scale:
-            basemodel, optimizer = amp.initialize(basemodel, optimizer, opt_level="O2", loss_scale="dynamic",min_loss_scale=args.min_scale)
-            amp._amp_state.loss_scalers[0]._loss_scale = 2**20
-        else:
-            basemodel, optimizer = amp.initialize(basemodel, optimizer, opt_level="O2", loss_scale=args.loss_scale, min_loss_scale=args.min_scale)
-    
-    if args.local_rank==0:
-        print('setup_model() post amp init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
-        if args.varuna:
-            model.model.module = basemodel
-
-    if args.varuna:
-        model.set_optimizer(optimizer)
-
-    # fp32 param names for checkpointing
-    optimizer._amp_lazy_init()
-    if args.local_rank==0:
-        print('setup_model() post amp opt init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
-    parameter_names_ = dict()
-    for n,p in basemodel.named_parameters():
-        parameter_names_[p] = n
-    fp16_model_params = optimizer._amp_stash.all_fp16_params
-    fp32_master_params = optimizer._amp_stash.all_fp32_from_fp16_params
-    print("stash lens",len(fp16_model_params), len(fp32_master_params))
-    count = 0
-    parameter_names = dict()
-    for p_model, p_master in zip(fp16_model_params, fp32_master_params):
-        if p_model in parameter_names_:
-            parameter_names[p_master] = parameter_names_.pop(p_model)
-            count += 1
-    print(count, "params found in rank", args.rank)
-    # if args.local_rank==0:
-        # print("setup_model() post opt init: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
-        # print('setup_model() post opt int:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
-    # print(args.rank, parameter_names)
-    # '''
 
     # Wrap model for distributed training."""
     if args.DDP_impl == 'torch':
@@ -311,23 +271,22 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
         model = LocalDDP(model)
         
     if args.load is not None:
-        args.iteration = load_checkpoint(basemodel, optimizer, lr_scheduler, parameter_names)
+        args.iteration = load_checkpoint(model, optimizer, lr_scheduler)
     else:
         args.iteration = 0
 
     # this needs to be fixed asap
-    if args.varuna and args.stage == args.partitions - 1:
-        param = None
-        for p in parameter_names:
-            if parameter_names[p] == "lm_head_weight":
-                param = p
-                break
-        with torch.no_grad():
-            basemodel.lm_head_weight.data.copy_(param.data) 
+    # if args.varuna and args.stage == args.partitions - 1:
+    #     param = None
+    #     for p in parameter_names:
+    #         if parameter_names[p] == "lm_head_weight":
+    #             param = p
+    #             break
+    #     with torch.no_grad():
+    #         basemodel.lm_head_weight.data.copy_(param.data) 
 
 
-    model.parameter_names = parameter_names
-    return model, optimizer, lr_scheduler, parameter_names
+    return model, optimizer, lr_scheduler
 
 
 def backward_step(optimizer, model, loss, iteration):
@@ -516,7 +475,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
 
 
 def train(forward_step_func, model, optimizer, lr_scheduler,
-          train_data_iterator, valid_data_iterator, parameter_names, eval_step_varuna=None,setup_time=0):
+          train_data_iterator, valid_data_iterator, eval_step_varuna=None,setup_time=0):
     """Train the model function."""
     global ITERATION
 
@@ -607,7 +566,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         if args.save and args.save_interval and complete_steps > 0 and \
            complete_steps % args.save_interval == 0:
             ckpt_time = time.time()           
-            save_checkpoint(complete_steps, model, optimizer, lr_scheduler, parameter_names)
+            save_checkpoint(complete_steps, model, optimizer, lr_scheduler)
             ckpt_time = time.time() - ckpt_time
             print(args.rank, "ckpt time", ckpt_time)
             
@@ -804,12 +763,12 @@ def build_train_valid_test_data_iterators(
 
 
 def on_demand_checkpoint():
-    global MODEL, OPTIMIZER, LR_SCHEDULER, PARAMETER_NAMES, ITERATION
+    global MODEL, OPTIMIZER, LR_SCHEDULER, ITERATION
 
-    ckpt_vars = [MODEL, OPTIMIZER, LR_SCHEDULER, PARAMETER_NAMES, ITERATION]
+    ckpt_vars = [MODEL, OPTIMIZER, LR_SCHEDULER, ITERATION]
     assert not any([v is None for v in ckpt_vars]), "CKPT VARS NOT SET!"
     
-    save_checkpoint(ITERATION, MODEL, OPTIMIZER, LR_SCHEDULER, PARAMETER_NAMES, on_demand=True)
+    save_checkpoint(ITERATION, MODEL, OPTIMIZER, LR_SCHEDULER, on_demand=True)
 
 
 def get_eval_numbers(train_valid_test_dataset_provider, model_provider,

@@ -21,7 +21,11 @@ print_stats.py
 poll.*
 available_machines.out
 Megatron-LM/setup_remote.sh
-varuna
+varuna/200b_varuna.py
+varuna/varuna_broadcast.py
+varuna/repmem_varuna.py
+varuna/varuna_broadcast.py
+varuna/varuna_for_finetuning.py
 # Byte-compiled / optimized / DLL files
 *__pycache__/
 *.py[cod]

@@ -6,6 +6,8 @@ import os
 import time
 import pickle
 
+from .utils import save_rng_states, restore_rng_states
+
 from collections import OrderedDict 
 
 class CutPoint(Module):
@@ -60,9 +62,7 @@ class CutPoint(Module):
             def forward(ctx, i):
                 # recieve activations
                 if is_in_next_stage and self.recv_fn is not None:
-                    # recv_time = time.time()
                     i = self.recv_fn()
-                    # recv_time = time.time() - recv_time
                 # send activations
                 elif is_in_prev_stage and self.send_fn is not None:
                     self.send_fn(i)
@@ -72,10 +72,7 @@ class CutPoint(Module):
             def backward(ctx, grad_output):
                 # receive gradients.
                 if is_in_prev_stage and self.recv_fn is not None:
-                    # recv_time = time.time()
                     grad_output = self.recv_fn(grads = True)
-                    # recv_time = time.time() - recv_time
-                    # self.logfile.write("rcv grads " + str(recv_time) + "\n")
                 # send gradients
                 elif is_in_next_stage and self.send_fn is not None:
                     self.send_fn(grad_output, grads = True)
@@ -96,6 +93,10 @@ class PartitionedModel(Module):
         self.local_rank = local_rank
         self.fp16 = fp16
         self.shared_weights = shared_weights
+
+        
+        self.grads_send_queue = self.acts_send_queue = None
+        self.acts_queue = self.grads_queue = None
         
         torch.cuda.set_device(device)
         self.device = torch.device("cuda", device)
@@ -392,7 +393,9 @@ class PartitionedModel(Module):
                 m.set_pruning(True)
 
         # forward
-        self.set_recv_fn(lambda grads=False: torch.zeros(self.forward_input_shapes[0], dtype=torch.float32))     
+        recv_fn = (lambda grads=False: torch.zeros(self.forward_input_shapes[0], dtype=torch.float32))     
+        if self.pre_cp is not None:
+            self.pre_cp.recv_fn = recv_fn
         try:
             calc_val = self.module(**dummy_inputs)
             ret_val = self.ret_val if self.ret_val is not None else calc_val
@@ -402,7 +405,8 @@ class PartitionedModel(Module):
             ret_val = self.ret_val
         
         # backward
-        self.set_recv_fn(None)
+        if self.pre_cp is not None:
+            self.pre_cp.recv_fn = None
         if self.stage != self.num_stages - 1:
             ret_val.backward(torch.ones(list(ret_val.size()), dtype=torch.float32))
         else:
@@ -436,17 +440,49 @@ class PartitionedModel(Module):
     def set_ret_val(self, val):
         self.ret_val = val
 
-    def set_send_fn(self, send_fn):
-        if self.pre_cp is not None:
-            self.pre_cp.send_fn = send_fn
-        if self.post_cp is not None:
-            self.post_cp.send_fn = send_fn
+    def set_queues(self, acts_send, grad_send, acts_recv, grad_recv, recompute):
+        self.acts_send_queue = acts_send
+        self.grads_send_queue = grad_send
+        self.acts_queue = acts_recv
+        self.grads_queue = grad_recv
+        self.recompute_queue = recompute
 
-    def set_recv_fn(self, recv_fn):
+    def set_send_fn(self, recompute = False):
+        def send(tensor, grads = False):
+            if grads:
+                self.grads_send_queue.put(tensor.cpu())
+            else:
+                if not recompute:
+                    self.acts_send_queue.put(tensor.cpu())
+
         if self.pre_cp is not None:
-            self.pre_cp.recv_fn = recv_fn
+            self.pre_cp.send_fn = send
         if self.post_cp is not None:
-            self.post_cp.recv_fn = recv_fn
+            self.post_cp.send_fn = send
+
+    def set_recv_fn(self, recompute=False):
+        acts = None
+        if recompute:
+            ctx, acts = self.recompute_queue.get()
+            restore_rng_states(ctx, self.device)
+        else:
+            acts = self.acts_queue.get() if self.stage > 0 else None
+        if self.stage > 0:
+            acts = acts.to(self.device) 
+
+        def recv(grads = False):
+            if grads:
+                print("{} waiting for grads\n".format(self.stage), end="")
+                g = self.grads_queue.get().to(self.device)
+                print("{} recvd grads\n".format(self.stage), end="")
+                return g
+            else:
+                return acts
+        if self.pre_cp is not None:
+            self.pre_cp.recv_fn = recv
+        if self.post_cp is not None:
+            self.post_cp.recv_fn = recv
+        return acts
 
     def set_recording_events(self):
         self.recording_events = []
@@ -482,29 +518,45 @@ class PartitionedModel(Module):
                 )
         return times
 
-    def forward(self, *inputs, **kwargs):
+    def forward(self, inputs_as_dict, recompute=False, save_ctx=False, 
+                recording=False, handle_comm=False):
         
-        recording = 'record' in kwargs and kwargs['record']
-        kwargs.pop('record')
+        if save_ctx:
+            # if these acts are going to be recomputed
+            rng_states = save_rng_states(self.device)
+
         if recording:
             self.set_recording_events()
             if self.stage == 0:
                 self.recording_events[0].record()
 
+        if handle_comm:
+            self.set_send_fn(recompute)
+            print("{} waiting for acts\n".format(self.stage), end="")
+            recv_acts = self.set_recv_fn(recompute)
+            print("{} recvd acts\n".format(self.stage), end="")
         try:
-            calc_val = self.module(*inputs, **kwargs)
+            calc_val = self.module(**inputs_as_dict)
             ret_val = self.ret_val if self.ret_val is not None else calc_val
         except Exception as e:
             if self.ret_val is None:
                 raise e
             ret_val = self.ret_val
-        # self.logfile.flush()
         self.ret_val = None
 
         if recording:
             if self.stage == self.num_stages - 1:
                 self.recording_events[-1].record()
             self.clear_recording_events()
+        
+        if save_ctx:
+            if self.stage > 0:
+                recv_acts = recv_acts.cpu()
+            ctx = (rng_states, recv_acts)
+            self.recompute_queue.put(ctx)
+
+        if handle_comm:
+            self.set_recv_fn(None)
 
         return ret_val 
 
@@ -518,17 +570,3 @@ class PassThroughModule(Module):
         return None
 
 
-def load_varuna_checkpoint(my_stage, num_stages, total_num_pstages, common_store, \
-                        prefix="cp-pstage", pstages_to_read = None):
-    state_dict = {}
-    if pstages_to_read is None:
-        stages_per_worker = total_num_pstages // num_stages
-        pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
-    for i in pstages_to_read:
-        cp_file = os.path.join(common_store, "{}-{}".format(prefix,i))
-        if not os.path.exists(cp_file):
-            print("WARNING: DID NOT FIND CKPT FILE",cp_file,"!!!!")
-            continue
-        state_dict_ = torch.load(cp_file,map_location="cpu")
-        state_dict.update(state_dict_)
-    return state_dict

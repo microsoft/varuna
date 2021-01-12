@@ -7,7 +7,7 @@ from megatron.model import GPT2Model
 from megatron.model import get_params_for_weight_decay_optimization
 from megatron.global_vars import set_global_variables
 from megatron import get_args
-from varuna import Profiling
+from varuna import Profiler
 from apex.optimizers import FusedLAMB as LAMB
 
 import torch
@@ -19,12 +19,11 @@ set_global_variables(args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
 args = get_args()
 
 max_micro_BS = 50
-device = 0
 
 train_val_test_num_samples = [ 5 * max_micro_BS, 0, 0 ]
 
-init_method = 'tcp://127.0.0.1:6000'
-torch.distributed.init_process_group(world_size=1, backend='gloo', rank=0, init_method= init_method)
+model = GPT2Model(num_tokentypes=0, parallel_output=True)
+profiler = Profiler(model, args.fp16)
 
 # Build the datasets.
 train_ds, _test , _valid = build_train_valid_test_datasets(
@@ -37,7 +36,7 @@ train_ds, _test , _valid = build_train_valid_test_datasets(
                             skip_warmup=(not args.mmap_warmup))
 
 
-def get_batch(size, cpu=False):
+def get_batch(size, device=None):
     dataloader = torch.utils.data.DataLoader(train_ds, batch_size=size)
     dry_run_input = next(iter(dataloader))
 
@@ -63,36 +62,19 @@ def get_batch(size, cpu=False):
         "labels": labels
     })
 
-    if not cpu:
+    if device is not None:
         for k in dry_run_input:
             dry_run_input[k] = dry_run_input[k].to(device)
     
     return dry_run_input
 
-model = GPT2Model(num_tokentypes=0, parallel_output=True)
+profiler.initialize(get_batch(1) , from_cache=False)
 
-profiler = Profiling(model, device, args.fp16)
-profiler.initialize(get_batch(1,cpu=True), start=args.stage-1, end=args.stage , from_cache=False)
-profile_name = "gpt2_1_5b_profile_fp16-{}to{}.csv".format(args.stage-1, args.stage)
-
-params = 0
-for n,p in model.named_parameters():
-    print(n)
-    params += torch.numel(p)
-print("total num of params is ",params)
-
-initial_mem = torch.cuda.memory_allocated(device)
-model.to(device)
-model_mem = torch.cuda.memory_allocated(device) - initial_mem
-print("Model memory", model_mem)
-
-with open(profile_name,"w") as f:
-    f.write(("Model memory: " + str(model_mem) + "\n"))
+# with open(profile_name,"w") as f:
+#     f.write(("Model memory: " + str(model_mem) + "\n"))
 
 param_groups = get_params_for_weight_decay_optimization(model)
 optimizer = LAMB(param_groups, lr=args.lr, weight_decay=args.weight_decay)
-# lr_scheduler = get_learning_rate_scheduler(optimizer)
-
 if args.fp16:
     if args.dynamic_loss_scale:
         model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale="dynamic",min_loss_scale=args.min_scale)
@@ -100,6 +82,5 @@ if args.fp16:
     else:
         model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale=args.loss_scale, min_loss_scale=args.min_scale)
 
-# profiler.model = model
-model.train()
-profile = profiler.profile(get_batch,[1]+ list(range(1,max_micro_BS)), optimizer, profile_name)
+profile = profiler.profile(get_batch,[1]+ list(range(1,max_micro_BS)), optimizer)
+ 

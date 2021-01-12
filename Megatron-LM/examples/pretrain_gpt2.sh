@@ -14,14 +14,14 @@ date
 ifconfig eth0 | grep inet
 
 DATA_PATH=/home/varuna/gpt2-blob/turing/megatron
-CHECKPOINT_PATH=/home/varuna/gpt2-blob/mega_2_5b_4.8e-3_clipgrads
+CHECKPOINT_PATH=/home/varuna/gpt2-blob/dummy
 
 NCCL_DEBUG=INFO NCCL_SOCKET_IFNAME=eth0 NCCL_SOCKET_NTHREADS=4 NCCL_NSOCKS_PERTHREAD=4 \
-python3 run_varuna.py --nstages 9 --batch_size 8192 --chunk_size 4 --total_num_stages 54 \
+python3 run_varuna.py --nstages 4 --batch_size 16 --chunk_size 1 --total_num_stages 48 \
        --ngpus_per_server 4 --nservers $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR pretrain_gpt2.py \
-       --num-layers 54 \
-       --hidden-size 1920 \
-       --num-attention-heads 20 \
+       --num-layers 48 \
+       --hidden-size 1600 \
+       --num-attention-heads 16 \
        --seq-length 1024 \
        --max-position-embeddings 1024 \
        --train-iters 18750 \
@@ -46,7 +46,7 @@ python3 run_varuna.py --nstages 9 --batch_size 8192 --chunk_size 4 --total_num_s
        --load-iteration $ckpt \
        --eval-interval 100 \
        --eval-iters 10 \
-       --loss-file varuna_2_5b_8192_lr_0.0048_clipgrads \
+       --loss-file test_dummy \
        --fp16 --varuna
 # num params = 20,753,384,400
 set +x
