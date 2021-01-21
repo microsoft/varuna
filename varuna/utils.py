@@ -7,6 +7,8 @@ import math
 from apex import amp
 from apex.amp import _amp_state
 
+VARUNA_TEMP_FOLDER = "/tmp/varuna"
+
 def scatter(input, batch_size, chunk_size):
     """
     Accepts input dictionary and splits into microbatches
@@ -80,47 +82,6 @@ def clip_grad_norm(parameters, grad_norm_sq, max_norm, norm_type=2):
             
     return clip_coef<1
 
-
-def load_varuna_checkpoint(my_stage, num_stages, total_num_pstages, common_store, \
-                        prefix="cp-pstage", pstages_to_read = None):
-    state_dict = {}
-    if pstages_to_read is None:
-        stages_per_worker = total_num_pstages // num_stages
-        pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
-    for i in pstages_to_read:
-        cp_file = os.path.join(common_store, "{}-{}".format(prefix,i))
-        if not os.path.exists(cp_file):
-            print("WARNING: DID NOT FIND CKPT FILE",cp_file,"!!!!")
-            continue
-        state_dict_ = torch.load(cp_file,map_location="cpu")
-        state_dict.update(state_dict_)
-    return state_dict
-
-def load_varuna_optimizer(optimizer, my_stage, num_stages, total_num_pstages, parameter_names, \
-                        common_store, fp16=False, pstages_to_read = None):
-    if pstages_to_read is None:
-        stages_per_worker = total_num_pstages // num_stages
-        pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
-    # reload state
-    opt_state = {}
-    for i in pstages_to_read:
-        state_ = torch.load(os.path.join(common_store,"opt-state-{}".format(i)),map_location='cpu')
-        opt_state.update(state_)
-    for p in amp.master_params(optimizer):
-        name = parameter_names[p]
-        if name in opt_state:
-            optimizer.state[p] = opt_state[name]
-    # reload master params
-    if fp16:
-        saved_master_params = dict()
-        for i in pstages_to_read:
-            params_ = torch.load(os.path.join(common_store, "opt-fp32-params-{}".format(i)),map_location="cpu")
-            saved_master_params.update(params_)
-        for p in amp.master_params(optimizer):
-            name = parameter_names[p]
-            if name in saved_master_params:
-                p.data.copy_(saved_master_params[name].data)
-
 def heartbeat(step):
     manager_ip = "10.0.3.4"
     manager_port = 5000
@@ -131,3 +92,54 @@ def heartbeat(step):
             sock.sendall(bytes(message, 'ascii'))
     except:
         print("Could not send progress update message")
+
+def generate_schedule(chunks, stage, partitions):
+    print(chunks,"chunks")
+    gensched_binary = os.path.join(os.path.dirname(os.path.abspath(__file__)),'genschedule')
+    c_schedule = os.popen( gensched_binary + ' ' +
+                            str(partitions) + ' ' +
+                            str(chunks) + ' ' +
+                            str(stage)).read()
+    schedule = list()
+    steps = c_schedule.split(';')
+    steps = steps[:-1]
+    for step in steps:
+        task = step.split(',')
+        schedule.append((int(task[0]), int(task[1])))
+    print("schedule",schedule)
+    return schedule
+
+def parse_stage_to_rank_map(stage_to_rank_map_str):
+    """ parses the stage_to_rank_map string recieved from varuna launcher """
+    # parse stage_to_rank_map
+    stage_ranks = stage_to_rank_map_str.split(";")[:-1]
+    partitions = len(stage_ranks)
+    assert partitions > 0, "Invalid stage to rank map for Varuna!"
+    stage_to_rank_map = {}
+    for i in range(partitions):
+        ranks = stage_ranks[i].split(",")
+        stage_to_rank_map[int(i)] = [int(r) for r in ranks]
+    return stage_to_rank_map
+
+def get_varuna_config(stage_to_rank_map_str):
+    """ parses the stage_to_rank_map string recieved from varuna launcher to
+        return a tuple of the form (num_pipeline_stages, num_data_parallel_replicas)"""
+    stage_to_rank_map = parse_stage_to_rank_map(stage_to_rank_map_str)
+    return len(stage_to_rank_map), len(stage_to_rank_map[0])
+
+def get_this_rank_config_varuna(stage_to_rank_map_str, rank):
+    """ parses the varuna stage_to_rank_map string and for a given rank
+        returns a tuple of the form (my_stage, my_data_parallel_rank)"""
+    stage_to_rank_map = parse_stage_to_rank_map(stage_to_rank_map_str)
+    for stage in stage_to_rank_map:
+        if rank in stage_to_rank_map[stage]:
+            my_stage = stage
+            my_dp_rank = stage_to_rank_map[stage].index(rank)
+            return my_stage, my_dp_rank
+    raise RuntimeError(f"rank {rank} not present in varuna config!!")
+
+def is_varuna_dummy_val(val):
+    if isinstance(val,tuple) and len(val)>0:
+        val = val[0]
+        return hasattr(val, "varuna_valid") and not val.varuna_valid
+    return (val is None)
