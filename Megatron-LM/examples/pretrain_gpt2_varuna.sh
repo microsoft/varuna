@@ -14,7 +14,7 @@ DATA_PATH=/home/varuna/gpt2-blob/turing/megatron
 CHECKPOINT_PATH=/home/varuna/gpt2-blob/dummy
 
 NCCL_DEBUG=INFO NCCL_SOCKET_IFNAME=eth0 NCCL_SOCKET_NTHREADS=4 NCCL_NSOCKS_PERTHREAD=4 \
-python3 -m varuna.run_varuna --nstages 4 --batch_size 512 --chunk_size 4 pretrain_gpt2.py \
+python3 -m varuna.run_varuna --nstages 4 --batch_size 512 --chunk_size 4 --no_morphing pretrain_gpt2.py \
        --num-layers 24 \
        --hidden-size 1024 \
        --num-attention-heads 16 \

@@ -14,7 +14,7 @@ import concurrent.futures
 import shutil
 
 from .partitioned_model import PartitionedModel
-from .utils import scatter, clip_grad_norm, heartbeat, VARUNA_TEMP_FOLDER, generate_schedule, parse_stage_to_rank_map
+from . import utils
 from .checkpoint import write_varuna_checkpoint, get_local_ckpt_tracker, \
          load_varuna_checkpoint, load_varuna_optimizer, num_params_written, get_prev_checkpoint
 import gc
@@ -71,19 +71,11 @@ class Varuna(Module):
 
         self.rank = dist.get_rank()
         self.local_rank = local_rank if local_rank != -1 else self.rank
-        self.stage_to_rank_map = parse_stage_to_rank_map(stage_to_rank_map)
-        self.partitions = len(self.stage_to_rank_map)
+        self.stage_to_rank_map = utils.parse_stage_to_rank_map(stage_to_rank_map)
+        self.partitions, data_depth = utils.get_varuna_config(stage_to_rank_map)
+        self.stage, rank_within_stage = utils.get_this_rank_config_varuna(stage_to_rank_map, self.rank)
+        self.manager_ip, self.manager_port = utils.get_heartbeat_server_info()
 
-        self.stage = -1
-        for stage in self.stage_to_rank_map:
-            i = 0
-            for rank in self.stage_to_rank_map[stage]:
-                if rank == self.rank:
-                    rank_within_stage = i
-                    data_depth = len(self.stage_to_rank_map[stage])
-                    self.stage = stage
-                    break
-                i += 1
         if self.stage == -1:
             raise ValueError("Rank " + str(self.rank) + " not found in stage to rank map!")
         self.data_parallel = data_depth > 1
@@ -127,22 +119,22 @@ class Varuna(Module):
             "receive_rank": self.receive_rank,
             "send_rank": self.send_rank,
             "device": self.device,
-            "data_depth": len(self.stage_to_rank_map[self.stage]),
+            "data_depth": data_depth,
             "dp_process_group": self.dp_group, 
             "pipeline_process_group": self.pipeline_group,
             "tied_group": self.tied_group,
-            "make_logfile": False, #bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
+            "make_logfile": False,
             "last_chunk_size": self.last_chunk_size,
             "shared_weights": self.shared_weights,
             "shared_weight_stages": self.shared_weight_stages,
             "stage_to_rank_map": self.stage_to_rank_map,
             "local_rank": self.local_rank,
             "chunk_size": chunk_size,
-            "rank_within_stage": self.stage_to_rank_map[self.stage].index(self.rank)
+            "rank_within_stage": rank_within_stage
         }
 
         chunks = math.ceil(self.batch_size / self.micro_batch_size)
-        self.schedule = generate_schedule(chunks, self.stage, self.partitions)
+        self.schedule = utils.generate_schedule(chunks, self.stage, self.partitions)
         self.iteration = 0
 
     def init_communication(self, rank_within_stage):
@@ -206,10 +198,8 @@ class Varuna(Module):
     def configure_checkpointing(self, dummy_inputs):
         self.param_name_to_pstage = self.partitioned_model.parameter_names_to_cuts(dummy_inputs)
         # make temp dir for local ckpt trackers
-        if self.local_rank == 0 and not os.path.exists(VARUNA_TEMP_FOLDER):
-            os.makedirs(VARUNA_TEMP_FOLDER)
-            for f in os.listdir(VARUNA_TEMP_FOLDER):
-                os.remove(os.path.join(VARUNA_TEMP_FOLDER,f))  
+        if self.local_rank == 0 and not os.path.exists(utils.VARUNA_TEMP_FOLDER):
+            os.makedirs(utils.VARUNA_TEMP_FOLDER)
 
     def forward(self, inputs):
         raise RuntimeError("Varuna uses the 'step' function for both fwd/bwd together,\
@@ -220,7 +210,7 @@ class Varuna(Module):
             assert self.optimizer is not None, "For fp16, you must set the optimizer using set_optimizer()"        
         
         # Divide a mini-batch into micro-batches.
-        batches = scatter(inputs, int(self.batch_size),self.micro_batch_size)
+        batches = utils.scatter(inputs, int(self.batch_size),self.micro_batch_size)
         
         self.config["make_logfile"] = bool(self.config["make_logfile"] and self.iteration < 10)
         batch_time = time.time()
@@ -230,7 +220,7 @@ class Varuna(Module):
         self.iteration += 1
             
         if self.rank == 0 and self.iteration%10==0:
-            heartbeat(self.iteration)
+            utils.heartbeat(self.iteration, self.manager_ip, self.manager_port)
         
         return loss, overflow
 
@@ -257,7 +247,7 @@ class Varuna(Module):
         self.partitioned_model.set_send_fn(send)
         self.partitioned_model.set_recv_fn(recv)
 
-        batches = scatter(inputs, int(self.batch_size),self.micro_batch_size)
+        batches = utils.scatter(inputs, int(self.batch_size),self.micro_batch_size)
         
         with torch.no_grad():
             avg_output = None
@@ -322,7 +312,7 @@ class Varuna(Module):
                 if p_model in parameter_names_:
                     parameter_names[p_master] = parameter_names_.pop(p_model)
                     count += p_master.numel()
-            print(count, "params found in rank", self.rank)
+            # print(count, "params found in rank", self.rank)
 
             self.parameter_names = parameter_names
         else:
@@ -334,7 +324,7 @@ class Varuna(Module):
     def zero_grad(self):
         self.model.zero_grad()
         if self.fp16:
-            for param in optimizer._amp_stash.all_fp32_from_fp16_params:
+            for param in self.optimizer._amp_stash.all_fp32_from_fp16_params:
                 param.grad = None
 
     """ Writes a varuna checkpoint with model parameters, optimizer state etc. 
@@ -425,7 +415,7 @@ class Varuna(Module):
         #     print(f'STAGE 3 {self.partitioned_model.module.lm_head_weight}')
 
         with open(get_local_ckpt_tracker(self.local_rank),"w") as f:
-            print("writing", iteration)
+            # print("writing", iteration)
             f.write(str(iteration))
 
         self.iteration = iteration
@@ -702,13 +692,10 @@ class Pipeline:
                 if (self.schedule[index+1][0]==2):      # if next task in schedule is backward  -- no recomputation
                     grad_mode=True
             
-            # if task[0]==1 and self.stage == 0:
-            #     print("stage 0 grads", self.grads_queue.qsize())
             if log_verbose:
                 print(f'{self.stage} {self.rank_within_stage} task:{task[0]} {task[1]}/{len(self.batches)}\n', end="")
             self.worker(task[0], grad_mode, self.batches[task[1]])
-            # if log_verbose:
-            #     print(f'{self.stage} {self.rank_within_stage} task done\n', end="")
+            
             i+=1
         
         
@@ -757,10 +744,6 @@ class Pipeline:
 
     def all_reduce_opt_grads(self):
         allred_init_start = time.time()
-        # if self.stage == 3:
-        #     for p in self.parameter_names:
-        #         if self.parameter_names[p] == "lm_head_weight":
-        #             print(f"lm_head_weight grad is {p.grad}")
         master_grads = [p.grad for p in amp.master_params(self.optimizer) if p.grad is not None]
         flat_grad_size = sum(p.numel() for p in master_grads)
         flat_raw = torch.empty(flat_grad_size, device=self.device, dtype=torch.float16 if self.fp16 else torch.float32)
@@ -810,7 +793,7 @@ class Pipeline:
         overflow_buf, global_grad_norm = self.global_overflow_and_norm(master_grads, overflow_buf if self.fp16 else None)
         global_grad_norm_sq = global_grad_norm ** 2
 
-        clipped = clip_grad_norm(amp.master_params(self.optimizer), global_grad_norm_sq, 1.0)
+        clipped = utils.clip_grad_norm(amp.master_params(self.optimizer), global_grad_norm_sq, 1.0)
         if clipped:
             global_grad_norm = global_grad_norm/global_grad_norm
 

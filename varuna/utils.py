@@ -1,13 +1,19 @@
 
 import os
-import torch
 import socket
 import math
 
-from apex import amp
-from apex.amp import _amp_state
-
+try:
+    import torch
+    from apex import amp
+    from apex.amp import _amp_state
+except:
+    pass
+    
 VARUNA_TEMP_FOLDER = "/tmp/varuna"
+HEARTBEAT_IP_ENV_VAR = "VARUNA_MANAGER_IP"
+HEARTBEAT_PORT_ENV_VAR = "VARUNA_HEARTBEAT_PORT"
+LOCAL_PID_FILENAME = "local_parent_pid"
 
 def scatter(input, batch_size, chunk_size):
     """
@@ -82,16 +88,15 @@ def clip_grad_norm(parameters, grad_norm_sq, max_norm, norm_type=2):
             
     return clip_coef<1
 
-def heartbeat(step):
-    manager_ip = "10.0.3.4"
-    manager_port = 5000
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            message = "progress {}".format(step)
-            sock.connect((manager_ip, manager_port))
-            sock.sendall(bytes(message, 'ascii'))
-    except:
-        print("Could not send progress update message")
+def heartbeat(step, ip, port):
+    if (ip is not None) and (port is not None):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                message = "progress {}".format(step)
+                sock.connect((ip, port))
+                sock.sendall(bytes(message, 'ascii'))
+        except:
+            print("Could not send progress update message")
 
 def generate_schedule(chunks, stage, partitions):
     print(chunks,"chunks")
@@ -143,3 +148,17 @@ def is_varuna_dummy_val(val):
         val = val[0]
         return hasattr(val, "varuna_valid") and not val.varuna_valid
     return (val is None)
+
+def get_heartbeat_server_info():
+    ip = os.environ.get(HEARTBEAT_IP_ENV_VAR, None)
+    port = os.environ.get(HEARTBEAT_PORT_ENV_VAR, None)
+    return ip, port
+
+def update_local_varuna_pid(pid):
+    with open(os.path.join(VARUNA_TEMP_FOLDER, LOCAL_PID_FILENAME), "w") as f:
+        f.write(str(pid))
+
+def get_local_varuna_pid():
+    with open(os.path.join(VARUNA_TEMP_FOLDER, LOCAL_PID_FILENAME), "w") as f:
+        pid = int(f.read().strip())
+    return pid

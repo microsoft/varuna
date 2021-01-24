@@ -10,6 +10,7 @@ import random
 import socket
 
 from .checkpoint import get_local_ckpt_tracker
+from .utils import update_local_varuna_pid, VARUNA_TEMP_FOLDER
 
 processes = []
 
@@ -119,6 +120,22 @@ def send_to_manager(message):
     except:
         print(f"Could not send message: {message}")
 
+def get_last_iter(num_local_processes):
+    last_iter = -1
+    for i in range(num_local_processes):
+        ckpt_tracker = get_local_ckpt_tracker(i)
+        if os.path.exists(ckpt_tracker):
+            with open(ckpt_tracker,"r") as f:
+                last_iter_ = int(f.read())
+        else:
+            last_iter_ = -1
+
+        if last_iter == -1:
+            last_iter = last_iter_
+        else:
+            last_iter = min(last_iter, last_iter_) 
+    return last_iter
+
 def parse_args():
     """
     Helper function parsing the command line options
@@ -177,8 +194,10 @@ if __name__ == "__main__":
 
     print("Parent process ID:",os.getpid())
 
-    with open("parent_process","w") as f:
-        f.write(str(os.getpid()))
+    if not os.path.exists(VARUNA_TEMP_FOLDER):
+        os.makedirs(VARUNA_TEMP_FOLDER)
+
+    update_local_varuna_pid(os.getpid())
 
     args = parse_args()
 
@@ -274,8 +293,6 @@ if __name__ == "__main__":
                 if process.returncode != 0:
                     for p in processes:
                         p.kill()
-                    # raise subprocess.CalledProcessError(returncode=process.returncode,
-                                                        # cmd=cmd)
         except Exception as e:
             print("run_varuna subprocesses quit with error:", e)
 
@@ -286,16 +303,3 @@ if __name__ == "__main__":
         if not loop_pending:
             print("Finished training!!")
             break
-
-def get_last_iter(num_local_processes):
-    last_iter = -1
-    for i in range(num_local_processes):
-        ckpt_tracker = get_local_ckpt_tracker(i)
-        if os.path.exists(ckpt_tracker):
-            with open(ckpt_tracker,"r") as f:
-                last_iter_ = int(f.read())
-        if last_iter == -1:
-            last_iter = last_iter_
-        else:
-            last_iter = min(last_iter, last_iter_) 
-    return last_iter
