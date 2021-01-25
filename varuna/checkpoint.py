@@ -180,7 +180,7 @@ def create_ckpt_dirs(global_store, tempdir, rank, local_rank, step):
         os.makedirs(marker_dir_name)
     if local_rank == 0 and (tempdir is not None) and (not os.path.exists(tempdir)):
         os.makedirs(tempdir)
-    while not os.path.exists(marker_dir):
+    while not os.path.exists(marker_dir_name):
         pass
     return cp_dir_name, marker_dir_name
 
