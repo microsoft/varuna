@@ -540,9 +540,6 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     if args.varuna:
         model.step = args.iteration
 
-    model.out_dir = args.save
-    if args.rank == 0 and not os.path.exists(os.path.join(args.save,"stats")):
-        os.makedirs(os.path.join(args.save,"stats"))
     loss_file = None
     eval_loss_file = None
     if (args.varuna and args.stage == args.partitions - 1) or (not args.varuna and torch.distributed.get_rank() == 0):

@@ -2,13 +2,17 @@ import torch
 import torch.distributed as dist
 from torch.nn import Module
 
-import os
+import os, sys
+import inspect
 import time
 import pickle
+
+from .utils import save_rng_states, restore_rng_states
 
 from collections import OrderedDict 
 
 class CutPoint(Module):
+
     def __init__(self):
         super(CutPoint, self).__init__()
         # start with 1 and end before last stage (total num_stages - 1 )
@@ -22,6 +26,8 @@ class CutPoint(Module):
         self.fp16 = False
         self.pruning = False
         self.barrier_event = None
+        self.boundary_func = None
+        self.forward_input_shapes = None
     
     def set_pruning(self, boolean):
         self.pruning = boolean
@@ -30,16 +36,20 @@ class CutPoint(Module):
         # not set by ModelParallel, pass through as is
         if self.barrier_event is not None:
             self.barrier_event.record()
+        if self.boundary_func is not None:
+            self.boundary_func()
         
         if self.cp_func is None:
             return inputs[0]
 
         if len(inputs) < 0 or (len(inputs) == 1 and inputs[0] is None):
             if self.pruning:
-                inputs = (torch.tensor([-1.0],requires_grad = True),)
+                inputs = (torch.tensor([-1.0], requires_grad = True))
             else:
                 dtype = torch.float16 if self.fp16 else torch.float32
-                inputs = (torch.tensor([-1.0],requires_grad = True, dtype=dtype).to(self.device),)
+                inputs = torch.tensor([-1.0], requires_grad = True, dtype=dtype).to(self.device)
+            # inputs.varuna_valid = False
+            inputs = (inputs,)
 
         if isinstance(self.cp_func, torch.autograd.Function):
             out = self.cp_func.apply(*inputs, **kwargs)            
@@ -60,9 +70,7 @@ class CutPoint(Module):
             def forward(ctx, i):
                 # recieve activations
                 if is_in_next_stage and self.recv_fn is not None:
-                    # recv_time = time.time()
                     i = self.recv_fn()
-                    # recv_time = time.time() - recv_time
                 # send activations
                 elif is_in_prev_stage and self.send_fn is not None:
                     self.send_fn(i)
@@ -72,10 +80,7 @@ class CutPoint(Module):
             def backward(ctx, grad_output):
                 # receive gradients.
                 if is_in_prev_stage and self.recv_fn is not None:
-                    # recv_time = time.time()
                     grad_output = self.recv_fn(grads = True)
-                    # recv_time = time.time() - recv_time
-                    # self.logfile.write("rcv grads " + str(recv_time) + "\n")
                 # send gradients
                 elif is_in_next_stage and self.send_fn is not None:
                     self.send_fn(grad_output, grads = True)
@@ -96,6 +101,10 @@ class PartitionedModel(Module):
         self.local_rank = local_rank
         self.fp16 = fp16
         self.shared_weights = shared_weights
+
+        
+        self.grads_send_queue = self.acts_send_queue = None
+        self.acts_queue = self.grads_queue = None
         
         torch.cuda.set_device(device)
         self.device = torch.device("cuda", device)
@@ -135,27 +144,80 @@ class PartitionedModel(Module):
         if self.local_rank == 0 and not (from_cache and os.path.exists("_tmp_ord_mod") and os.path.exists("_tmp_inp_shapes")):
             # store input shapes for each module (or atleast each cp)
             print("Initializing partitioned model!")
-
+  
             def get_hook(name):
                 def add_module_hook(module, inputs, _output):
                     self.ordered_modules[name] = module
                     if isinstance(module, CutPoint):
-                        # if len(inputs) > 1: error
                         self.input_shapes[name] = [list(inputs[0].size())]
                 return add_module_hook
 
+            param_access = dict()
+            for p in self.module.parameters():
+                param_access[p] = set()
+
+            self.track_cp = 0
+            
+            def trace_param_access(frame, event, arg):
+                if event != 'call':
+                    return
+                co = frame.f_code
+                func_name = co.co_name
+                if func_name in ['write','__hash__']:
+                    return
+                arg_info = inspect.getargvalues(frame)
+                arg_values = [arg_info.locals[n] for n in arg_info.args]
+                for arg in arg_values:
+                    if isinstance(arg, torch.nn.Parameter):
+                        if arg in param_access:
+                            param_access[arg].add(self.track_cp)
+            
             modules = self.module.named_modules()
             hooks = []
 
+            def boundary_func():
+                self.track_cp += 1
             for name, module in modules:
                 if name == "":
                     continue
                 hooks.append( module.register_forward_hook(get_hook(name)))
                 if isinstance(module, CutPoint):
+                    module.boundary_func = boundary_func
                     self.num_cutpoints += 1
-            
+            sys.settrace(trace_param_access)
             with torch.no_grad():
                 self.module(**dummy_inputs)
+            sys.settrace(None)
+            self.track_cp = None
+        
+            for name in self.ordered_modules:
+                m = self.ordered_modules[name]
+                if isinstance(m, CutPoint):
+                    m.boundary_func = None
+
+            param_name_to_pstage = dict()
+            for n,p in self.module.named_parameters():
+                assert len(param_access[p]) < 2, f"Parameter {n} in multiple cuts: {param_access[p]}, mark as two shared parameters?"
+                accesed_cps = list(param_access[p])
+                if len(accesed_cps) > 0:
+                    if n not in param_name_to_pstage:
+                        param_name_to_pstage[n] = accesed_cps[0]
+                    assert (param_name_to_pstage[n] == int(accesed_cps[0])), \
+                            f"Parameter {n} accesed in cut {accesed_cps[0]} but was created in cut {param_name_to_pstage[n]}!"
+            
+            cp_index = 0
+            modules = self.ordered_modules
+            for name in modules:
+                module = modules[name]
+                if isinstance(module, CutPoint):
+                    cp_index += 1
+                    continue
+                for n,p in module.named_parameters(recurse=False):
+                    full_name = name + '.' + n
+                    if full_name not in param_name_to_pstage:
+                        param_name_to_pstage[full_name] = cp_index
+
+            self.param_name_to_pstage = param_name_to_pstage
 
             for h in hooks:
                 h.remove()
@@ -165,6 +227,8 @@ class PartitionedModel(Module):
                 pickle.dump(list(self.ordered_modules.keys()),f)
             with open("_tmp_inp_shapes",'wb') as f:
                 pickle.dump(self.input_shapes,f)
+            with open("_tmp_pstage_mapping",'wb') as f:
+                pickle.dump(self.param_name_to_pstage,f)
             dist.barrier()
 
         else:
@@ -181,7 +245,13 @@ class PartitionedModel(Module):
 
             with open("_tmp_inp_shapes",'rb') as f:
                 self.input_shapes = pickle.load(f)
+            with open("_tmp_pstage_mapping", 'rb') as f:
+                self.param_name_to_pstage = pickle.load(f)
             self.num_cutpoints = len(self.input_shapes)
+        
+        # if self.local_rank == 0:
+        #     for name in self.param_name_to_pstage:
+        #         print(f"{name} {self.param_name_to_pstage[name]}\n", end = "")
     
     def find_shared_weight_stages(self):
 
@@ -308,145 +378,163 @@ class PartitionedModel(Module):
 
         self.check_unused_parameters(dummy_inputs)
 
-    """For each partition/stage, the first rank in that stage saves state_dict 
-    of the cutpoints used by that stage to a common store. So checkpoint is sharded 
-    along cutpoints (as many checkpoint files as cutpoints)"""
-    def checkpoint(self, checkpoint_dir = "model-checkpoint"):
-        # only 1 rank per stage for data ||
-        if self.rank != self.stage_to_rank_map[self.stage][0]:
-            return
+
+    def parameter_names_to_cuts(self, dummy_inputs):
         
-        # we only want to checkpoint leaf modules (For ex. bert.embedding.weight and not bert.embeddings)
-        leaf_modules = {}
-        non_leaf_modules = {}
-
-        # this assumes that a non-leaf module is added after all it's descendants to the order (which is true so far)
-        for m in self.ordered_modules:
-            if (m not in leaf_modules) and (m not in non_leaf_modules):
-                leaf_modules[m] = True
-                # mark all ancestors as non-leaf
-                path = m.split(".")
-                key = path[0]
-                for i in range(1,len(path)):
-                    non_leaf_modules[key] = True
-                    key = key + "." + path[i]
-
-        modules = list(leaf_modules.keys())
+        return self.param_name_to_pstage
 
         stage_index = 0
-        state_dict = {}
-        cp_count = 0
         param_name_to_pstage = dict()
-        temp_param_names = []
-
-        for name in modules:
+        
+        print("NAME TO STAGE")
+        
+        for name in self.ordered_modules:
             module = self.ordered_modules[name]
-            if name == "" or module is None:
+            if module is None:
                 continue
             if isinstance(module, CutPoint):
-                if len(state_dict.keys()) > 0:
-                    if not self.fp16:
-                        torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
-                    for p in temp_param_names:
-                        param_name_to_pstage[p] = stage_index
-                    temp_param_names = []
-                    cp_count += 1
-                if cp_count >= self.cuts_per_stage:
-                    break
                 stage_index += 1
-                state_dict = {}
-            else:
-                module_state_dict = module.state_dict()
-                module_state_dict_ = OrderedDict()
-                for key, val in module_state_dict.items():
-                    param_name = name + "." + key
-                    module_state_dict_[param_name] = val
-                    temp_param_names.append(param_name)
+            for n,p in module.named_parameters(recurse=False):
+                param_name = name + '.' + n
+                if param_name in param_name_to_pstage:
+                    print(f"Duplicate param!! {param_name} {param_name_to_pstage[param_name]} {stage_index}")
+                param_name_to_pstage[param_name] = stage_index
+                # print(f"{self.stage} {param_name} , {stage_index}")
 
-                state_dict.update(module_state_dict_)
+        # for n,p in self.module.named_parameters():
+        #     assert n in param_name_to_pstage, f"{n} param not in stage {self.stage}"
 
-        # last cutpoint
-        if len(state_dict.keys()) > 0 and (cp_count < self.cuts_per_stage):
-            state_dict["lm_head_weight"] = self.module.lm_head_weight
-            # state_dict["cls.predictions.bias"] = self.module.cls.predictions.bias
-            # param_name_to_pstage["cls.predictions.bias"] = self.num_cutpoints
-            if not self.fp16:
-                torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
-            for p in temp_param_names:
-                param_name_to_pstage[p] = stage_index
-            # param_name_to_pstage["lm_head_weight"] = stage_index
-            
-        print("checkpointed!!")
+        param_access = dict()
+        for p in self.module.parameters():
+            param_access[p] = set()
+
+        self.track_cp = 0
+        def boundary_func():
+            self.track_cp += 1
+        for n in self.ordered_modules:
+            m = self.ordered_modules[n]
+            if isinstance(m, CutPoint):
+                m.boundary_func = boundary_func
+        
+        def trace_param_access(frame, event, arg):
+            if event != 'call':
+                return
+            co = frame.f_code
+            func_name = co.co_name
+            if func_name in ['write','__hash__']:
+                return
+            arg_info = inspect.getargvalues(frame)
+            arg_values = [arg_info.locals[n] for n in arg_info.args]
+            for arg in arg_values:
+                if isinstance(arg, torch.nn.Parameter):
+                    if arg in param_access:
+                        param_access[arg].add(self.track_cp)
+
+        for k in dummy_inputs:
+            if isinstance(dummy_inputs[k], torch.Tensor):
+                dummy_inputs[k] = dummy_inputs[k].to(self.device)
+
+        recv_fn = (lambda grads=False: torch.zeros(self.forward_input_shapes[0],  
+                                        dtype=torch.float32, device=self.device) )    
+        if self.pre_cp is not None:
+            self.pre_cp.recv_fn = recv_fn
+                
+        sys.settrace(trace_param_access)
+        with torch.no_grad():
+            try:
+                self.module(**dummy_inputs)
+            except Exception as e:
+                if self.ret_val is None:
+                    raise e
+        self.ret_val = None
+        sys.settrace(None)
+        self.track_cp = None
+        for n in self.ordered_modules:
+            m = self.ordered_modules[n]
+            if isinstance(m, CutPoint):
+                m.boundary_func = None
+
+        for n,p in self.module.named_parameters():
+            assert len(param_access[p]) < 2, f"Parameter {n} in multiple cuts: {param_access[p]}, mark as shared parameters?"
+            accesed_cps = list(param_access[p])
+            if len(accesed_cps) > 0:
+                if n not in param_name_to_pstage:
+                    param_name_to_pstage[n] = accesed_cps[0]
+                assert (param_name_to_pstage[n] == int(accesed_cps[0])), \
+                         f"Parameter {n} accesed in cut {accesed_cps[0]} but was created in cut {param_name_to_pstage[n]}!"
+                # print(f"{self.stage} {n} , {accesed_cps[0]}")      
         return param_name_to_pstage
 
     def check_unused_parameters(self, dummy_inputs):
-        # set eval mode and clear grads
-        prev_training = self.module.training
-        self.module.eval()
-        for p in self.module.parameters():
-            p.grad = None
-
-        for n in self.ordered_modules:
-            m = self.ordered_modules[n]
-            if isinstance(m,CutPoint):
-                m.set_pruning(True)
-
-        # forward
-        self.set_recv_fn(lambda grads=False: torch.zeros(self.forward_input_shapes[0], dtype=torch.float32))     
-        try:
-            calc_val = self.module(**dummy_inputs)
-            ret_val = self.ret_val if self.ret_val is not None else calc_val
-        except Exception as e:
-            if self.ret_val is None:
-                raise e
-            ret_val = self.ret_val
         
-        # backward
-        self.set_recv_fn(None)
-        if self.stage != self.num_stages - 1:
-            ret_val.backward(torch.ones(list(ret_val.size()), dtype=torch.float32))
-        else:
-            ret_val.backward()
+        start_pstage = self.cuts_per_stage * self.stage
+        end_pstage = self.cuts_per_stage * (self.stage+1)
 
-        self.ret_val = None
-        to_remove = []
         for n,p in self.module.named_parameters():
-            if p.grad is None:
-                to_remove.append(n)
+            if n not in self.param_name_to_pstage:
+                # print(f"{n} not in pstage map")
+                continue
+            pstage = self.param_name_to_pstage[n]
+            if pstage != -1 and (pstage < start_pstage or pstage >= end_pstage):
+                # to_remove.append(n)
                 path = n.split(".")
                 parent = self.module
                 for i in range(len(path) - 1):
                     parent = getattr(parent, path[i])
                 setattr(parent,path[-1], None)
-        
-        # reset grads and train mode
-        for p in self.module.parameters():
-            p.grad = None
-        if prev_training:
-            self.module.train()
-
-        for m in self.ordered_modules:
-            m = self.ordered_modules[m]
-            if isinstance(m,CutPoint):
-                m.set_pruning(False)
 
         self.model_pruned = True
-
-        
+           
     def set_ret_val(self, val):
         self.ret_val = val
 
-    def set_send_fn(self, send_fn):
-        if self.pre_cp is not None:
-            self.pre_cp.send_fn = send_fn
-        if self.post_cp is not None:
-            self.post_cp.send_fn = send_fn
+    def set_queues(self, acts_send, grad_send, acts_recv, grad_recv, recompute):
+        self.acts_send_queue = acts_send
+        self.grads_send_queue = grad_send
+        self.acts_queue = acts_recv
+        self.grads_queue = grad_recv
+        self.recompute_queue = recompute
 
-    def set_recv_fn(self, recv_fn):
+    def set_send_fn(self, recompute = False):
+        def send(tensor, grads = False):
+            if grads:
+                self.grads_send_queue.put(tensor.cpu())
+            else:
+                if not recompute:
+                    self.acts_send_queue.put(tensor.cpu())
+
         if self.pre_cp is not None:
-            self.pre_cp.recv_fn = recv_fn
+            self.pre_cp.send_fn = send
         if self.post_cp is not None:
-            self.post_cp.recv_fn = recv_fn
+            self.post_cp.send_fn = send
+
+    def set_recv_fn(self, recompute=False):
+        acts = None
+        if recompute:
+            ctx, acts = self.recompute_queue.get()
+            restore_rng_states(ctx, self.device)
+        else:
+            acts = self.acts_queue.get() if self.stage > 0 else None
+        if self.stage > 0:
+            acts = acts.to(self.device) 
+
+        def recv(grads = False):
+            if grads:
+                g = self.grads_queue.get().to(self.device)
+                return g
+            else:
+                return acts
+        if self.pre_cp is not None:
+            self.pre_cp.recv_fn = recv
+        if self.post_cp is not None:
+            self.post_cp.recv_fn = recv
+        return acts
+
+    def clear_recv_fn(self):
+        if self.pre_cp is not None:
+            self.pre_cp.recv_fn = None
+        if self.post_cp is not None:
+            self.post_cp.recv_fn = None
 
     def set_recording_events(self):
         self.recording_events = []
@@ -482,29 +570,43 @@ class PartitionedModel(Module):
                 )
         return times
 
-    def forward(self, *inputs, **kwargs):
+    def forward(self, inputs_as_dict, recompute=False, save_ctx=False, 
+                recording=False, handle_comm=False):
         
-        recording = 'record' in kwargs and kwargs['record']
-        kwargs.pop('record')
+        if save_ctx:
+            # if these acts are going to be recomputed
+            rng_states = save_rng_states(self.device)
+
         if recording:
             self.set_recording_events()
             if self.stage == 0:
                 self.recording_events[0].record()
 
+        if handle_comm:
+            self.set_send_fn(recompute)
+            recv_acts = self.set_recv_fn(recompute)
         try:
-            calc_val = self.module(*inputs, **kwargs)
+            calc_val = self.module(**inputs_as_dict)
             ret_val = self.ret_val if self.ret_val is not None else calc_val
         except Exception as e:
             if self.ret_val is None:
                 raise e
             ret_val = self.ret_val
-        # self.logfile.flush()
         self.ret_val = None
 
         if recording:
             if self.stage == self.num_stages - 1:
                 self.recording_events[-1].record()
             self.clear_recording_events()
+        
+        if save_ctx:
+            if self.stage > 0:
+                recv_acts = recv_acts.cpu()
+            ctx = (rng_states, recv_acts)
+            self.recompute_queue.put(ctx)
+
+        if handle_comm:
+            self.clear_recv_fn()
 
         return ret_val 
 
@@ -518,17 +620,3 @@ class PassThroughModule(Module):
         return None
 
 
-def load_varuna_checkpoint(my_stage, num_stages, total_num_pstages, common_store, \
-                        prefix="cp-pstage", pstages_to_read = None):
-    state_dict = {}
-    if pstages_to_read is None:
-        stages_per_worker = total_num_pstages // num_stages
-        pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
-    for i in pstages_to_read:
-        cp_file = os.path.join(common_store, "{}-{}".format(prefix,i))
-        if not os.path.exists(cp_file):
-            print("WARNING: DID NOT FIND CKPT FILE",cp_file,"!!!!")
-            continue
-        state_dict_ = torch.load(cp_file,map_location="cpu")
-        state_dict.update(state_dict_)
-    return state_dict
