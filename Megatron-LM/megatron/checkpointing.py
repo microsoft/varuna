@@ -90,7 +90,7 @@ def get_checkpoint_tracker_filename(checkpoints_path):
     return os.path.join(checkpoints_path, 'latest_checkpointed_iteration.txt')
 
 
-def save_checkpoint(iteration, model, optimizer, lr_scheduler, on_demand=False):
+def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=None, on_demand=False):
     """Save a model checkpoint."""
     args = get_args()
     global mv_futures
@@ -162,12 +162,12 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, on_demand=False):
             torch.save(state_dict, checkpoint_name)
 
         if args.varuna:
-            # assert parameter_names is not None, "No parameter names given!"
+            assert parameter_names is not None, "No parameter names given!"
             while not (os.path.exists(model_cp_dir) and os.path.exists(opt_cp_dir)):
                 pass
             param_name_to_pstage = model.checkpoint(model_cp_dir)
             param_name_to_pstage["lm_head_weight"] = args.num_layers + 1
-            mv_futures = model.checkpoint_optimizer(optimizer, param_name_to_pstage, opt_cp_dir, tempdir=tempdir)
+            mv_futures = model.checkpoint_optimizer(optimizer, parameter_names, param_name_to_pstage, opt_cp_dir, tempdir=tempdir)
 
         # remove old checkpoints
         if args.max_num_ckpts is not None and torch.distributed.get_rank() == 0:
@@ -247,9 +247,12 @@ def parse_last_ckpt_iteration():
     return iteration, release
 
 
-def load_checkpoint(model, optimizer, lr_scheduler):
+def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
     """Load a model checkpoint and return the iteration."""
     args = get_args()
+
+    if args.varuna:
+        assert parameter_names is not None, "parameter_names not given while loading checkpoint!"
 
     if isinstance(model, torchDDP):
         model = model.module
@@ -326,7 +329,7 @@ def load_checkpoint(model, optimizer, lr_scheduler):
                             if k != 'params':
                                 optimizer.param_groups[i][k] = v
                     opt_cp_dir = os.path.join(args.load, "opt_ckpt_{}".format(iteration))
-                    load_varuna_optimizer(optimizer, args.stage, args.partitions, args.num_layers+2, opt_cp_dir, args.fp16, pstages_to_read = None)
+                    load_varuna_optimizer(optimizer, args.stage, args.partitions, args.num_layers+2, parameter_names, opt_cp_dir, args.fp16, pstages_to_read = None)
                     device = args.local_rank
                     for state in optimizer.state.values():
                         for k, v in state.items():
