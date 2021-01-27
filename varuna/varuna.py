@@ -80,6 +80,14 @@ class Varuna(Module):
             raise ValueError("Rank " + str(self.rank) + " not found in stage to rank map!")
         self.data_parallel = data_depth > 1
 
+        model_in_cpu = not next(model.parameters()).is_cuda
+        assert model_in_cpu, "Model should be on CPU before passing to varuna!"
+        assert isinstance(dummy_inputs, dict), "Sample inputs should be a dictionary!"
+        for key in dummy_inputs:
+            val = dummy_inputs[key]
+            if isinstance(val, torch.Tensor) and val.is_cuda:
+                dummy_inputs[key] = val.cpu()
+
         if device == -1:
             device = self.local_rank
         torch.cuda.set_device(device)
@@ -206,6 +214,8 @@ class Varuna(Module):
                              or the 'evaluate' function for evaluation.")
 
     def step(self, inputs):
+        assert isinstance(inputs, dict), "Varuna inputs should be a dictionary!"
+
         if self.fp16:
             assert self.optimizer is not None, "For fp16, you must set the optimizer using set_optimizer()"        
         
@@ -231,46 +241,29 @@ class Varuna(Module):
         loss_scale = scaler.loss_scale()
         return loss_scale    
 
-    def evaluate(self, inputs):
+    def evaluate(self, inputs, batch_size=None):
         assert isinstance(inputs, dict), "input must be a dictionary!"
 
-        # self.partitioned_model.eval()
+        if batch_size is None:
+            batch_size = self.batch_size
+        fwd_inp_shape = list(self.fwd_inp_shape)
+        fwd_inp_shape[0] = batch_size
+
         def send(x, grads=False):
             # print("sending to rank", self.send_rank, x.size())
             dist.send(x.cpu(), self.send_rank)
         def recv(grads=False):
-            x_shape = self.fwd_inp_shape
-            x = torch.zeros(x_shape, dtype=torch.float16 if self.fp16 else torch.float32)
+            x = torch.zeros(fwd_inp_shape, dtype=torch.float16 if self.fp16 else torch.float32)
             # print("receiving from rank", self.receive_rank, x_shape)
             dist.recv(x, self.receive_rank)
             return x.to(self.device)
         self.partitioned_model.set_send_fn(send)
         self.partitioned_model.set_recv_fn(recv)
-
-        batches = utils.scatter(inputs, int(self.batch_size),self.micro_batch_size)
         
         with torch.no_grad():
-            avg_output = None
-            for mb in batches[:-1]:
-                output = self.partitioned_model(**mb)
-                avg_output = output if avg_output is None else avg_output + output
-            mb = batches[-1]
-            def recv(grads=False):
-                x_shape = list(self.fwd_inp_shape)
-                if self.last_chunk_size > 0:
-                    x_shape[0] = self.last_chunk_size
-                x = torch.zeros(x_shape, dtype=torch.float16 if self.fp16 else torch.float32)
-                # print("last receiving from rank", self.receive_rank, x_shape)
-                dist.recv(x, self.receive_rank)
-                return x.to(self.device)
-            self.partitioned_model.set_recv_fn(recv)
-            output = self.partitioned_model(**mb)
-            if self.stage == self.partitions - 1:
-                avg_output = output if avg_output is None else avg_output + output
-
-        if self.stage == self.partitions - 1:
-            avg_output /= len(batches)
-        return avg_output
+            output = self.partitioned_model(inputs)
+            
+        return output
 
     def eval(self):
         self.model.eval()

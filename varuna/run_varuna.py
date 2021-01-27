@@ -1,9 +1,9 @@
 
 import os, subprocess
 from argparse import ArgumentParser, REMAINDER
-import socket
+import socket, time
 
-from .utils import HEARTBEAT_IP_ENV_VAR, HEARTBEAT_PORT_ENV_VAR, VARUNA_TEMP_FOLDER
+from .utils import HEARTBEAT_IP_ENV_VAR, HEARTBEAT_PORT_ENV_VAR, VARUNA_TEMP_FOLDER, MORPH_PORT_ENV_VAR
 
 HEARTBEAT_PORT = 5000 
 MORPH_PORT = 4200
@@ -29,12 +29,19 @@ def start_morph_listeners(available_machine_list):
           + f"{available_machine_list} {running_machines_list} {MORPH_PORT} "\
           + " > varuna_morph.out 2>varuna_morph.err &"
     os.system(cmd)
+    # TODO : check system errors
 
     # heartbeat server
     cmd = f"python -m varuna.catch_all " \
           + f"{running_machines_list} {HEARTBEAT_PORT} "\
           + " > varuna_catch.out 2>varuna_catch.err &"
     os.system(cmd)
+    # wait for startup
+    time.sleep(5)
+
+def kill_morph_listeners():
+    os.system("sudo pkill -f varuna.morph")
+    os.system("sudo pkill -f varuna.catch")
 
 def get_launch_cmd_format(args):
     launch_cmd = []
@@ -80,7 +87,7 @@ def parse_args():
     parser.add_argument("--resume", action="store_true", 
                         help="Resume a varuna run.")
 
-    parser.add_argument("training_script", type=str,
+    parser.add_argument("training_script", type=str, default=None, nargs='?',
                         help="The full path to the single GPU training "
                              "program/script to be launched in parallel, "
                              "followed by all the arguments for the "
@@ -95,8 +102,11 @@ if __name__ == "__main__":
     args = parse_args()
 
     with open(args.machine_list, "r") as f:
-        reachable_machines = f.read().split("\n")
+        content = f.read()
+        reachable_machines = content.split("\n")
         reachable_machines = [m for m in reachable_machines if len(m) > 0]  
+        with open(running_machines_list, "w") as of:
+            of.write(content)
     print(reachable_machines)  
     
     reachable_count = len(reachable_machines)
@@ -104,8 +114,8 @@ if __name__ == "__main__":
         print("Empty machine list, nothing to run!")
         exit()
 
-    if any([args is None for arg in [args.batch_size, args.nstages, args.chunk_size]]):
-        assert args.resume, "Batch size, num of partitions and micro-batch size required!"
+    if any([arg is None for arg in [args.batch_size, args.nstages, args.chunk_size, args.training_script]]):
+        assert args.resume, "Training script, batch size, num of partitions and micro-batch size required!"
 
     if args.code_dir is None:
         args.code_dir = os.getcwd()
@@ -113,10 +123,10 @@ if __name__ == "__main__":
         args.manager_ip = socket.gethostbyname(socket.gethostname())
         
     if not args.no_morphing:
-        if args.resume:
-            assert check_morph_listeners(), "Listeners not in place for morphing!"
-        else:
-            start_morph_listeners()
+        if not args.resume:
+            kill_morph_listeners()
+            start_morph_listeners(args.machine_list)
+        assert check_morph_listeners(args.manager_ip), "Listeners not in place for morphing!"
 
     if not os.path.exists(VARUNA_TEMP_FOLDER):
         os.makedirs(VARUNA_TEMP_FOLDER)
@@ -135,13 +145,17 @@ if __name__ == "__main__":
     current_env = os.environ.copy()
     current_env[HEARTBEAT_IP_ENV_VAR] = str(args.manager_ip)
     current_env[HEARTBEAT_PORT_ENV_VAR] = str(HEARTBEAT_PORT)
+    current_env[MORPH_PORT_ENV_VAR] = str(MORPH_PORT)
    # current_env["PATH"] = "PATH=\"/home/varuna/anaconda3/bin:$PATH\""
     
     for i,machine in enumerate(reachable_machines):
         launch_cmd = launch_cmd_format.format(i, reachable_count, master_addr)
         cmd = ["ssh"]
         cmd.append(machine)
-        cmd.append(f"echo \"{launch_cmd}\" > launch_varuna.sh; export PATH=\"/home/varuna/anaconda3/bin:$PATH\"; bash launch_varuna.sh")
+        cmd.append(f"echo \"{launch_cmd}\" > launch_varuna.sh; ")
+        cmd.append("export PATH=\"/home/varuna/anaconda3/bin:$PATH\";" )
+        cmd.append(f"{HEARTBEAT_IP_ENV_VAR}={args.manager_ip} {MORPH_PORT_ENV_VAR}={MORPH_PORT} {HEARTBEAT_PORT_ENV_VAR}={HEARTBEAT_PORT}")
+        cmd.append("bash launch_varuna.sh")
         print(" ".join(cmd ))
         out_file = open(f"ssh_logs/ssh_out_{i}", "w")
         err_file = open(f"ssh_logs/ssh_err_{i}", "w")

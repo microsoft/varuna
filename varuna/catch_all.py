@@ -45,7 +45,7 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 def check_progress():
     global completed_steps
-    last_checked_iter = 0
+    last_checked_iter = -1
     while True:
         try:
             if last_checked_iter == completed_steps:
