@@ -56,11 +56,11 @@ def restore_rng_states(rng_states, device):
     torch.cuda.set_rng_state(gpu_rng_states, device)
 
 
-def clip_grad_norm(parameters, grad_norm_sq, max_norm, norm_type=2):
+def clip_grad_norm(parameters, total_norm, max_norm):
     """Clips gradient norm of an iterable of parameters.
 
     This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
-    added functionality to handle model parallel parameters. Note that
+    modified to handle pipeline parallel parameters. Note that
     the gradients are modified in place.
 
     Arguments:
@@ -77,9 +77,7 @@ def clip_grad_norm(parameters, grad_norm_sq, max_norm, norm_type=2):
         parameters = [parameters]
     parameters = list(filter(lambda p: p.grad is not None, parameters))
     max_norm = float(max_norm)
-    norm_type = float(norm_type)
     
-    total_norm = grad_norm_sq.item() ** (1. / norm_type)
     # print(f'clip_grad_norm() total_norm = {total_norm}')
     clip_coef = max_norm / (total_norm + 1e-6)
     if clip_coef < 1:

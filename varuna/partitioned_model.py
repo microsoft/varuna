@@ -7,7 +7,7 @@ import inspect
 import time
 import pickle
 
-from .utils import save_rng_states, restore_rng_states
+from .utils import save_rng_states, restore_rng_states, VARUNA_TEMP_FOLDER
 
 from collections import OrderedDict 
 
@@ -141,7 +141,13 @@ class PartitionedModel(Module):
         self.input_shapes = {}
         self.num_cutpoints = 0
 
-        if self.local_rank == 0 and not (from_cache and os.path.exists("_tmp_ord_mod") and os.path.exists("_tmp_inp_shapes")):
+        ord_mod_cache = os.path.join(VARUNA_TEMP_FOLDER, "_tmp_ord_mod" )
+        inp_shape_cache = os.path.join(VARUNA_TEMP_FOLDER, "_tmp_inp_shapes")
+        pstage_map_cache = os.path.join(VARUNA_TEMP_FOLDER, "_tmp_pstage_mapping")
+        cache_present = os.path.exists(ord_mod_cache) and os.path.exists(inp_shape_cache) \
+                        and os.path.exists(pstage_map_cache)
+
+        if self.local_rank == 0 and not (from_cache and cache_present):
             # store input shapes for each module (or atleast each cp)
             print("Initializing partitioned model!")
   
@@ -222,18 +228,20 @@ class PartitionedModel(Module):
             for h in hooks:
                 h.remove()
 
+            if not os.path.exists(VARUNA_TEMP_FOLDER):
+                os.makedir(VARUNA_TEMP_FOLDER)
             # actually just need the order as a list of names
-            with open("_tmp_ord_mod",'wb') as f:
+            with open(ord_mod_cache,'wb') as f:
                 pickle.dump(list(self.ordered_modules.keys()),f)
-            with open("_tmp_inp_shapes",'wb') as f:
+            with open(inp_shape_cache,'wb') as f:
                 pickle.dump(self.input_shapes,f)
-            with open("_tmp_pstage_mapping",'wb') as f:
+            with open(pstage_map_cache,'wb') as f:
                 pickle.dump(self.param_name_to_pstage,f)
             dist.barrier()
 
         else:
             dist.barrier() 
-            with open("_tmp_ord_mod",'rb') as f:
+            with open(ord_mod_cache,'rb') as f:
                 ordered_modules = pickle.load(f)
 
             for n in ordered_modules:
@@ -243,9 +251,9 @@ class PartitionedModel(Module):
                     modules = modules[path[i]]._modules
                 self.ordered_modules[n] = modules[path[-1]]
 
-            with open("_tmp_inp_shapes",'rb') as f:
+            with open(inp_shape_cache,'rb') as f:
                 self.input_shapes = pickle.load(f)
-            with open("_tmp_pstage_mapping", 'rb') as f:
+            with open(pstage_map_cache, 'rb') as f:
                 self.param_name_to_pstage = pickle.load(f)
             self.num_cutpoints = len(self.input_shapes)
         
