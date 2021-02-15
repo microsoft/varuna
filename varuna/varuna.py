@@ -29,9 +29,50 @@ log_verbose = False
 TASK = ["fwd", "rec", "bwd"]
     
 class Varuna(Module):
-    """
-    Wrapper class for Varuna training.
+    r"""Module to implement varuna training. The model must be wrapped in an instance 
+    of ``Varuna`` before training. This should be done before optimizer creation and the 
+    :attr:`model` passed should be on CPU.
+
+    Creating a ``Varuna`` instance profiles the model briefly using :attr:`dummy_inputs`
+    and partitions it according to the distributed rank and launcher arguments.
+    The partitioned model is then moved to the allocated cuda device. The profiling
+    information is cached and can be re-used on resuming, unless :attr:`from_cache` is False.
+    The ``Varuna`` module performs mixed precision training internally if enabled through the 
+    :attr:`fp16` arg, no external handling is required. 
+
     Args:
+        model (nn.Module): The model to initialize for training.
+        
+        stage_to_rank_map (str): Placement of pipeline stages in the distribued job, encoded as a string. 
+        Passed by ``varuna.launcher`` to each worker as an argument.
+        
+        dummy_inputs (dict): Sample inputs to the model as a dictionary. These are used to profile the             model as ``model(**dummy_inputs)``. The batch size dimention in these inputs can be any ``n>=1``,
+        but is recommended to be small for speed.
+        
+        batch_size (int): Global batch size for the distributed training job.
+        
+        chunk_size (int): The micro-batch size to be used for pipeline parallelism.
+        
+        fp16 (bool): whether to enable mixed precision training.
+        
+        local_rank (int): The local rank as passed by ``varuna.launcher``. If not given, 
+        defaults to the global rank.
+        
+        device (int): index of the cuda device to use. Recommended to be the same as local_rank,
+        which is the default if not specified.
+        
+        shared_weights (list or None): A list of tuples, where each each tuple is a pair of weight names (strings),
+        such that the two weights are shared in the model (see weight sharing)
+        
+        from_cache (bool): Whether to use cached profiling information if available.
+
+    .. note::
+
+        Optimizer initiliastion should be done after  ``Varuna`` initialisation, so that the ``param_group`` s
+        for the optimizer only contain parameters from the partitioned model. This is important both for memory 
+        usage and correctness of fp16 training. Once ``Varuna`` and the optimizer are initialised, :func:`set_optimizer`
+        should be called to connect the two.
+
     """
     def __init__(self,
                 model,
@@ -42,7 +83,8 @@ class Varuna(Module):
                 fp16 = False, 
                 local_rank=-1,
                 device=-1,
-                shared_weights=None):
+                shared_weights=None,
+                from_cache=True):
         super().__init__()
 
         self.rank = dist.get_rank()
@@ -78,7 +120,7 @@ class Varuna(Module):
 
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
         self.model = PartitionedModel(model, self.rank, self.local_rank, device, self.stage_to_rank_map, self.fp16, shared_weights)
-        self.model.initialize( dummy_inputs, from_cache=True )
+        self.model.initialize( dummy_inputs, from_cache=from_cache )
         self.partitioned_model = self.model
         self.shared_weight_stages = self.model.shared_weight_stages if self.shared_weights is not None else None
 
@@ -185,10 +227,26 @@ class Varuna(Module):
                              or the 'evaluate' function for evaluation.")
 
     def step(self, inputs, clip_grad_max_norm=None):
+        r""" Perform a single training step. Executes forward and backward passes for 
+        the global batch. This function must be called by all distributed workers in the training loop.
+        After this function, the optimizer gradients are reduced accross data parallel replicas and
+        overflow is checked for mixed precision training.
+
+        Returns average loss and a boolean for overflow.
+
+        Args:
+            inputs (dict): The inputs to the model as a dictionary. These should be coordinated amongst workers -
+            the global batch is sharded across data parallel replicas, so each worker should have 
+            ``global_batch_size / data_parallel_depth`` number of examples. And all pipeline stages of the same
+            data parallel replica should recieve the same inputs.
+
+            clip_grad_max_norm (float or None, optional): If given, the L2 gradient norm of the entire model
+            is clipped to this upper bound.
+        """
         assert isinstance(inputs, dict), "Varuna inputs should be a dictionary!"
 
-        if self.fp16:
-            assert self.optimizer is not None, "For fp16, you must set the optimizer using set_optimizer()"        
+        # if self.fp16:
+        assert self.optimizer is not None, "You must set the optimizer using set_optimizer()"        
         
         # Divide a mini-batch into micro-batches.
         batches = utils.scatter(inputs, int(self.batch_size),self.micro_batch_size)
@@ -234,6 +292,12 @@ class Varuna(Module):
         return loss_scale    
 
     def evaluate(self, inputs):
+        r"""Evaluate the model on the given inputs. Returns loss.
+            
+            Args:
+                inputs (dict): Model inputs as dictionary. The number of examples
+                for these inputs should be the same as the batch_size defined for training.
+        """
         assert isinstance(inputs, dict), "input must be a dictionary!"
 
         # self.partitioned_model.eval()
@@ -280,8 +344,23 @@ class Varuna(Module):
     def train(self):
         self.model.train()
 
-    def set_optimizer(self, optimizer, amp_opt_level="O2", loss_scale = "dynamic",
-                            init_loss_scale = 2**20, min_loss_scale=None):
+    def set_optimizer(self, optimizer, loss_scale = "dynamic",
+                            init_loss_scale = 2**20, min_loss_scale=1.0):
+        r"""Configure optimizer for training. if ``fp16`` is enabled, this function
+            initializes the mixed precision state in apex.
+
+            Args:
+                optimizer (nn.Optimizer): the optimizer for training.
+
+                loss_scale (float or "dynamic", optional): A floating point number for a static loss scale 
+                or the string "dynamic" for dynamic loss scaling.
+
+                init_loss_scale (float, optional): Initial loss scale (for dynamic scaling)
+
+                min_loss_scale (float, optional): minimum loss scale (for dynamic scaling)
+
+        """
+        amp_opt_level="O2"
         self.optimizer = optimizer
         
         basemodel = self.partitioned_model.module
@@ -457,18 +536,22 @@ class Varuna(Module):
             for param in self.optimizer._amp_stash.all_fp32_from_fp16_params:
                 param.grad = None
 
-    """ Writes a varuna checkpoint with model parameters, optimizer state etc. 
+    def checkpoint(self, global_store, step=None, tempdir=None, shard=False, on_demand=False):
+        r""" Writes a varuna checkpoint with model parameters, optimizer state etc. 
         Each checkpoint is a directory, written under the given path.
         
         Args:
-        global_store: string, path to a folder accessible by all nodes/ranks in the training job. 
-                For example, path to a mounted blob storage. This is where the varuna checkpoint folder is written.
-        step: int, iteration number for checkpoint. If None, it'll be taken from varuna's tracked progress.
-        tempdir: string, path to a local directory to which to write checkpoints temporarily, and sync
-                with the global store in the background. Lowers checkpoint write time in the critical path.
-        shard: bool, whether to shard checkpoint writes over data parallel workers as well. Speeds up checkpoint 
-    """
-    def checkpoint(self, global_store, step=None, tempdir=None, shard=False, on_demand = False):
+            global_store (str): path to a folder accessible by all nodes/ranks in the training job. 
+            For example, path to a mounted blob storage. This is where the varuna checkpoint folder is written.
+            
+            step (int or None): iteration number for checkpoint. If None, it'll be taken from varuna's tracked progress.
+            
+            tempdir (str): path to a local directory to which to write checkpoints temporarily, and sync
+            with the global store in the background. Lowers checkpoint write time in the critical path.
+            
+            shard (bool): whether to shard checkpoint writes over data parallel workers as well. Speeds up checkpoint 
+            
+        """
         if step is None:
             step = self.iteration
 
@@ -481,6 +564,19 @@ class Varuna(Module):
         self.model.to(device)
 
     def load_checkpoint(self, global_store, iteration, check_complete = True):
+        r"""Loads a varuna checkpoint from a shared directory. Each varuna checkpoint is a directory
+        named as "varuna_ckpt_<iteration>". So the path under which all such checkpoints were written
+        should be specified.
+            
+            Args:
+                global_store (str): path under which varuna checkpoints were written. 
+                Should be accessible by all workers.
+
+                iteration (int): Which iteration checkpoint to load.
+
+                check_complete (bool, optional): Check that the checkpoint is complete before loading it.
+                A checkpoint can be incomplete if the write was interrupted.   
+        """
         cp_dir_name = os.path.join(global_store, "varuna_ckpt_{}".format(iteration))
 
         if check_complete:

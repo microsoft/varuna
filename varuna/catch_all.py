@@ -11,9 +11,7 @@ from collections import defaultdict
 
 last_heartbeat_time = datetime.now()
 completed_steps = 0
-running_machines_list = sys.argv[1]
-HOST = socket.gethostbyname(socket.gethostname())
-PORT = int(sys.argv[2])
+running_machines_list = None
 
 class Handler(socketserver.BaseRequestHandler):
 
@@ -78,7 +76,11 @@ def check_progress():
         time.sleep(60*30)
 
 if __name__ == "__main__":
-
+    global running_machines_list
+    
+    running_machines_list = sys.argv[1]
+    HOST = socket.gethostbyname(socket.gethostname())
+    PORT = int(sys.argv[2])
     server = ThreadedTCPServer((HOST, PORT), Handler)
 
     check_progress_thread = Thread(target=check_progress, args=())
