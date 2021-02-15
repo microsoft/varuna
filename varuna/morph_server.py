@@ -134,11 +134,10 @@ class Handler(socketserver.BaseRequestHandler):
                     checkpointed = last_iter
                 if is_preempting:
                     print('Preempt successful {}'.format(last_iter), flush=True)
-                    Handler.notify()
                     time.sleep(120)     # wait for scheduled event to occur 
                     Handler.kill_all()
                     curr_world_size = 0
-                    Handler.update_available()
+                    # Handler.update_available()
                     Handler.start_remote(checkpointed)
                     is_preempting = False
                 elif is_morphing:
@@ -153,11 +152,10 @@ class Handler(socketserver.BaseRequestHandler):
                     (recv_time - last_ckpt_signal).total_seconds() > 100:
                         print("Handling restart", last_ckpt_signal)
                         last_iter = int(str(data).split(" ")[-1])
-                        Handler.notify()
-                        time.sleep(120)    # wait for transient errors to pass
+                        time.sleep(60)    # wait for transient errors to pass
                         Handler.kill_all()
                         curr_world_size = 0
-                        Handler.update_available()
+                        # Handler.update_available()
                         Handler.start_remote(checkpointed)
                         is_restarting = False
             except Exception as e:
@@ -178,7 +176,7 @@ class Handler(socketserver.BaseRequestHandler):
                     is_restarting = True
                     is_morphing = True
                     response = Handler.send_signal()
-                    Handler.update_available()
+                    # Handler.update_available()
                     if curr_world_size == 0:
                         print("Nothing running currently, will start")
                         Handler.kill_all()

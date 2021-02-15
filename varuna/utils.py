@@ -13,6 +13,7 @@ except:
 VARUNA_TEMP_FOLDER = "/tmp/varuna"
 HEARTBEAT_IP_ENV_VAR = "VARUNA_MANAGER_IP"
 HEARTBEAT_PORT_ENV_VAR = "VARUNA_HEARTBEAT_PORT"
+MORPH_PORT_ENV_VAR = "VARUNA_MORPH_PORT"
 LOCAL_PID_FILENAME = "local_parent_pid"
 
 def scatter(input, batch_size, chunk_size):

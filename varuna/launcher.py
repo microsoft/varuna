@@ -10,7 +10,7 @@ import random
 import socket
 
 from .checkpoint import get_local_ckpt_tracker
-from .utils import update_local_varuna_pid, VARUNA_TEMP_FOLDER
+from .utils import update_local_varuna_pid, VARUNA_TEMP_FOLDER, MORPH_PORT_ENV_VAR, HEARTBEAT_IP_ENV_VAR
 
 processes = []
 
@@ -110,15 +110,13 @@ def calculate_config(args):
 
     return dist_world_size, stage_to_rank_map, ranks_in_server, total_batch_size, gpus_per_stage
     
-def send_to_manager(message):
-    manager_ip = "10.0.3.4"
-    manager_port = 4200
+def send_to_manager(message, manager_ip, manager_port):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.connect((manager_ip, manager_port))
             sock.sendall(bytes(message, 'ascii'))
-    except:
-        print(f"Could not send message: {message}")
+    except Exception as e:
+        print(f"Could not send message: {message}", e)
 
 def get_last_iter(num_local_processes):
     last_iter = -1
@@ -200,6 +198,8 @@ if __name__ == "__main__":
     update_local_varuna_pid(os.getpid())
 
     args = parse_args()
+    manager_ip = os.environ[HEARTBEAT_IP_ENV_VAR]
+    manager_port = int(os.environ[MORPH_PORT_ENV_VAR])
 
     def handler(signum,_):
         global loop_pending
@@ -243,7 +243,7 @@ if __name__ == "__main__":
         alias_ranks = list(range(dist_world_size))
 
         if args.node_rank == 0:
-            send_to_manager("starting job of size {}".format(dist_world_size))
+            send_to_manager("starting job of size {}".format(dist_world_size), manager_ip, manager_port)
 
         current_env["WORLD_SIZE"] = str(dist_world_size)
         print("World size is",dist_world_size)
@@ -298,7 +298,7 @@ if __name__ == "__main__":
 
 
         last_iter = get_last_iter(len(ranks_in_server))
-        send_to_manager("checkpoint done {}".format(last_iter))
+        send_to_manager("checkpoint done {}".format(last_iter), manager_ip, manager_port)
             
         if not loop_pending:
             print("Finished training!!")
