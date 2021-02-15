@@ -56,3 +56,6 @@ wheels/
 MANIFEST
 varuna/varuna_pretraining_megatron_not_converging.py
 varuna/varuna_pretraining_sansdataparallel.py
+docs/_static
+docs/_templates
+docs/_build
