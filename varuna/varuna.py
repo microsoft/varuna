@@ -40,32 +40,32 @@ class Varuna(Module):
     The ``Varuna`` module performs mixed precision training internally if enabled through the 
     :attr:`fp16` arg, no external handling is required. 
 
-    Args:
-        model (nn.Module): The model to initialize for training.
-        
-        stage_to_rank_map (str): Placement of pipeline stages in the distribued job, encoded as a string. 
+    :param model: The model to initialize for training.
+    :type model: torch.nn.Module
+    :param stage_to_rank_map: Placement of pipeline stages in the distribued job, encoded as a string. 
         Passed by ``varuna.launcher`` to each worker as an argument.
-        
-        dummy_inputs (dict): Sample inputs to the model as a dictionary. These are used to profile the             model as ``model(**dummy_inputs)``. The batch size dimention in these inputs can be any ``n>=1``,
+    :type stage_to_rank_map: dict
+    :param dummy_inputs: Sample inputs to the model as a dictionary. These are used to profile the             model as ``model(**dummy_inputs)``. The batch size dimention in these inputs can be any ``n>=1``,
         but is recommended to be small for speed.
-        
-        batch_size (int): Global batch size for the distributed training job.
-        
-        chunk_size (int): The micro-batch size to be used for pipeline parallelism.
-        
-        fp16 (bool): whether to enable mixed precision training.
-        
-        local_rank (int): The local rank as passed by ``varuna.launcher``. If not given, 
+    :type dummy_inputs: dict
+    :param batch_size: Global batch size for the distributed training job.
+    :type batch_size: int
+    :param chunk_size: The micro-batch size to be used for pipeline parallelism.
+    :type chunk_size: int
+    :param fp16: whether to enable mixed precision training.
+    :type fp16: bool
+    :param local_rank: The local rank as passed by ``varuna.launcher``. If not given, 
         defaults to the global rank.
-        
-        device (int): index of the cuda device to use. Recommended to be the same as local_rank,
+    :type local_rank: int
+    :param device: index of the cuda device to use. Recommended to be the same as local_rank,
         which is the default if not specified.
-        
-        shared_weights (list or None): A list of tuples, where each each tuple is a pair of weight names (strings),
+    :type device: int
+    :param shared_weights: A list of tuples, where each each tuple is a pair of weight names (strings),
         such that the two weights are shared in the model (see weight sharing)
-        
-        from_cache (bool): Whether to use cached profiling information if available.
-
+    :type shared_weights: list or None
+    :param from_cache: Whether to use cached profiling information if available.
+    :type from_cache: bool
+    
     .. note::
 
         Optimizer initiliastion should be done after  ``Varuna`` initialisation, so that the ``param_group`` s
@@ -238,18 +238,18 @@ class Varuna(Module):
         r""" Perform a single training step. Executes forward and backward passes for 
         the global batch. This function must be called by all distributed workers in the training loop.
         After this function, the optimizer gradients are reduced accross data parallel replicas and
-        overflow is checked for mixed precision training.
+        overflow is checked for mixed precision training. Returns average loss and a boolean for overflow.
 
-        Returns average loss and a boolean for overflow.
-
-        Args:
-            inputs (dict): The inputs to the model as a dictionary. These should be coordinated amongst workers -
+        :param inputs: The inputs to the model as a dictionary. These should be coordinated amongst workers -
             the global batch is sharded across data parallel replicas, so each worker should have 
             ``global_batch_size / data_parallel_depth`` number of examples. And all pipeline stages of the same
             data parallel replica should recieve the same inputs.
-
-            clip_grad_max_norm (float or None, optional): If given, the L2 gradient norm of the entire model
+        :type inputs: dict
+        :param clip_grad_max_norm: If given, the L2 gradient norm of the entire model
             is clipped to this upper bound.
+        :type clip_grad_max_norm: float or None, optional
+        :return: A tuple of the form (average_loss, overflow)
+        :rtype: tuple[float, bool]
         """
         assert isinstance(inputs, dict), "Varuna inputs should be a dictionary!"
 
@@ -301,10 +301,12 @@ class Varuna(Module):
 
     def evaluate(self, inputs):
         r"""Evaluate the model on the given inputs. Returns loss.
-            
-            Args:
-                inputs (dict): Model inputs as dictionary. The number of examples
-                for these inputs should be the same as the batch_size defined for training.
+
+        :param inputs: Model inputs as dictionary. The number of examples
+            for these inputs should be the same as the batch_size defined for training.
+        :type inputs: dict
+        :return: average loss
+        :rtype: float
         """
         assert isinstance(inputs, dict), "input must be a dictionary!"
 
@@ -338,18 +340,17 @@ class Varuna(Module):
     def set_optimizer(self, optimizer, loss_scale = "dynamic",
                             init_loss_scale = 2**20, min_loss_scale=1.0):
         r"""Configure optimizer for training. if ``fp16`` is enabled, this function
-            initializes the mixed precision state in apex.
+        initializes the mixed precision state in apex.
 
-            Args:
-                optimizer (nn.Optimizer): the optimizer for training.
-
-                loss_scale (float or "dynamic", optional): A floating point number for a static loss scale 
-                or the string "dynamic" for dynamic loss scaling.
-
-                init_loss_scale (float, optional): Initial loss scale (for dynamic scaling)
-
-                min_loss_scale (float, optional): minimum loss scale (for dynamic scaling)
-
+        :param optimizer: the optimizer for training.
+        :type optimizer: torch.nn.Optimizer
+        :param loss_scale: A floating point number for a static loss scale 
+            or the string "dynamic" for dynamic loss scaling.
+        :type loss_scale: float or "dynamic", optional
+        :param init_loss_scale: Initial loss scale (for dynamic scaling)
+        :type init_loss_scale: float, optional
+        :param min_loss_scale: minimum loss scale (for dynamic scaling)
+        :type min_loss_scale: float, optional
         """
         amp_opt_level="O2"
         self.optimizer = optimizer
@@ -531,17 +532,16 @@ class Varuna(Module):
         r""" Writes a varuna checkpoint with model parameters, optimizer state etc. 
         Each checkpoint is a directory, written under the given path.
         
-        Args:
-            global_store (str): path to a folder accessible by all nodes/ranks in the training job. 
+        :param global_store: path to a folder accessible by all nodes/ranks in the training job. 
             For example, path to a mounted blob storage. This is where the varuna checkpoint folder is written.
-            
-            step (int or None): iteration number for checkpoint. If None, it'll be taken from varuna's tracked progress.
-            
-            tempdir (str): path to a local directory to which to write checkpoints temporarily, and sync
+        :type global_store: dict
+        :param step: iteration number for checkpoint. If None, it'll be taken from varuna's tracked progress.
+        :type step: int or None, optional
+        :param tempdir: path to a local directory to which to write checkpoints temporarily, and sync
             with the global store in the background. Lowers checkpoint write time in the critical path.
-            
-            shard (bool): whether to shard checkpoint writes over data parallel workers as well. Speeds up checkpoint 
-            
+        :type tempdir: str, optional
+        :param shard: whether to shard checkpoint writes over data parallel workers as well. Speeds up checkpoint 
+        :type shard: bool, optional
         """
         if step is None:
             step = self.iteration
@@ -559,14 +559,14 @@ class Varuna(Module):
         named as "varuna_ckpt_<iteration>". So the path under which all such checkpoints were written
         should be specified.
             
-            Args:
-                global_store (str): path under which varuna checkpoints were written. 
-                Should be accessible by all workers.
-
-                iteration (int): Which iteration checkpoint to load.
-
-                check_complete (bool, optional): Check that the checkpoint is complete before loading it.
-                A checkpoint can be incomplete if the write was interrupted.   
+        :param global_store: path under which varuna checkpoints were written. 
+            Should be accessible by all workers.
+        :type global_store: str
+        :param iteration: Which iteration checkpoint to load.
+        :type iteration: int
+        :param check_complete: Check that the checkpoint is complete before loading it.
+            A checkpoint can be incomplete if the write was interrupted.  
+        :type check_complete: bool, optional 
         """
         cp_dir_name = os.path.join(global_store, "varuna_ckpt_{}".format(iteration))
 
