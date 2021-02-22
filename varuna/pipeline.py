@@ -279,6 +279,7 @@ class Pipeline:
             
             i+=1
         
-        torch.distributed.barrier(group=self.pipeline_group)
+        if self.pipeline_group is not None:
+            torch.distributed.barrier(group=self.pipeline_group)
         self.close_comm_threads()
         return self.average_loss

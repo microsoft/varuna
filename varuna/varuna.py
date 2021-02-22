@@ -299,12 +299,17 @@ class Varuna(Module):
         loss_scale = scaler.loss_scale()
         return loss_scale    
 
-    def evaluate(self, inputs):
-        r"""Evaluate the model on the given inputs. Returns loss.
+    def evaluate(self, inputs, batch_size=None):
+        r"""Evaluate the model on the given inputs. This must be called on all workers
+        because it uses pipeline & data parallelism. Inputs should be for the respective data parallel replica
+        and have ``batch_size/data_parallel_depth`` examples, similar to :func:`step`.
+        Returns loss averaged over all workers.
 
         :param inputs: Model inputs as dictionary. The number of examples
             for these inputs should be the same as the batch_size defined for training.
         :type inputs: dict
+        :param batch_size: Batch size for evaluation, if not given it's the same as training batch size.
+        :type batch_size: int, optional
         :return: average loss
         :rtype: float
         """
@@ -312,24 +317,39 @@ class Varuna(Module):
 
         if batch_size is None:
             batch_size = self.batch_size
-        fwd_inp_shape = list(self.fwd_inp_shape)
-        fwd_inp_shape[0] = batch_size
-
-        def send(x, grads=False):
-            # print("sending to rank", self.send_rank, x.size())
-            dist.send(x.cpu(), self.send_rank)
-        def recv(grads=False):
-            x = torch.zeros(fwd_inp_shape, dtype=torch.float16 if self.fp16 else torch.float32)
-            # print("receiving from rank", self.receive_rank, x_shape)
-            dist.recv(x, self.receive_rank)
-            return x.to(self.device)
-        self.partitioned_model.set_send_fn(send)
-        self.partitioned_model.set_recv_fn(recv)
+        
+        fwd_inp_shape = None
+        if self.fwd_inp_shape is not None:
+            fwd_inp_shape = list(self.fwd_inp_shape)
+            fwd_inp_shape[0] = self.micro_batch_size
+        
+        batches = utils.scatter(inputs, int(batch_size),self.micro_batch_size)
         
         with torch.no_grad():
-            output = self.partitioned_model(inputs)
+            avg_output = None
+            chunks = len(batches)
+            for i, mb in enumerate(batches):
+                if i==(chunks-1) and self.last_chunk_size > 0 and fwd_inp_shape is not None:
+                    fwd_inp_shape[0] = self.last_chunk_size
+                
+                if self.stage > 0:
+                    self.partitioned_model.set_recv_acts(fwd_inp_shape, self.receive_rank)
+                output = self.partitioned_model(mb)
+                if self.stage < self.partitions-1:
+                    dist.send(output.cpu(), self.send_rank)
+
+                avg_output = output if avg_output is None else avg_output + output
+            self.partitioned_model.clear_recv_fn()
             
-        return output
+        if self.stage == self.partitions - 1:
+            output = avg_output / len(batches)
+        else:
+            output = 0
+        output = torch.Tensor([output])
+        torch.distributed.all_reduce(output)
+        loss = output.item() / self.data_depth     # only last stage on each replica returns >0 loss
+
+        return loss
 
     def eval(self):
         self.model.eval()
@@ -418,6 +438,8 @@ class Varuna(Module):
         master_grads, overflow_buf = self.all_reduce_dp_grads()
 
         overflow_buf = overflow_buf.to(torch.float32)
+        if overflow_buf.item():
+            print(f"{self.rank} Overflow !!")
         overflow_buf, global_grad_norm, reduced_loss = self.all_reduce_pipeline_meta(master_grads, 
                                                                     overflow_buf if self.fp16 else None)
         self.average_loss = reduced_loss
@@ -443,6 +465,13 @@ class Varuna(Module):
         flat_grad_size = sum(p.numel() for p in master_grads)
         flat_raw = torch.empty( flat_grad_size, device=self.device, 
                                 dtype=torch.float16 if self.fp16 else torch.float32)
+
+        if self.rank == 0:
+            for p in self.parameter_names:
+                if p.grad is not None:
+                    cpu_sum = p.grad.float().sum()
+                    if cpu_sum == float('inf') or cpu_sum == -float('inf') or cpu_sum != cpu_sum:
+                        print(f"{self.parameter_names[p]} grad bad")
         
         if self.fp16:        
             scaler = _amp_state.loss_scalers[0]

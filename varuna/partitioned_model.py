@@ -519,8 +519,8 @@ class PartitionedModel(Module):
     def set_recv_fn(self, recompute=False):
         acts = None
         if recompute:
-            ctx, acts = self.recompute_queue.get()
-            restore_rng_states(ctx, self.device)
+            rng_states, acts = self.recompute_queue.get()
+            restore_rng_states(rng_states, self.device)
         else:
             acts = self.acts_queue.get() if self.stage > 0 else None
         if self.stage > 0:
@@ -537,6 +537,15 @@ class PartitionedModel(Module):
         if self.post_cp is not None:
             self.post_cp.recv_fn = recv
         return acts
+
+    def set_recv_acts(self, shape, receive_rank):
+        def recv(grads=False):
+            x = torch.zeros(shape, dtype=torch.float16 if self.fp16 else torch.float32)
+            dist.recv(x, receive_rank)
+            return x.to(self.device)
+        if self.pre_cp is not None:
+            self.pre_cp.recv_fn = recv
+
 
     def clear_recv_fn(self):
         if self.pre_cp is not None:
