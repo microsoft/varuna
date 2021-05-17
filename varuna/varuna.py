@@ -827,7 +827,7 @@ class Pipeline:
             
             if log_verbose:
                 print(f'{self.rank} {self.rank_within_stage} task:{task[0]} {task[1]}/{len(self.batches)}')
-            self.worker(task[0], grad_mode, self.batches[task[1]], task[1])
+            self.worker(task[0], grad_mode, self.batches[task[1]])
 
             i+=1
         
