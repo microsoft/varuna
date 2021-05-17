@@ -35,6 +35,7 @@ from varuna import load_varuna_checkpoint, load_varuna_optimizer
 from apex import amp
 
 mv_futures = None
+user="rahul"
 
 def check_checkpoint_args(checkpoint_args):
     """Ensure fixed arguments for a model are the same for the input
@@ -76,8 +77,6 @@ def get_checkpoint_name(checkpoints_path, iteration, on_demand=False, dp_rank=0,
     if mp_rank is None:
         mp_rank = mpu.get_model_parallel_rank() if mpu.model_parallel_is_initialized() else 0
     filename = 'model_optim_rng.pt'
-    if on_demand:
-        filename = filename + "_" + str(dp_rank)
     return os.path.join(checkpoints_path, directory,
                         'mp_rank_{:02d}'.format(mp_rank),
                         filename)
@@ -89,21 +88,11 @@ def get_checkpoint_tracker_filename(checkpoints_path):
     return os.path.join(checkpoints_path, 'latest_checkpointed_iteration.txt')
 
 
-def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=None, on_demand=False):
+def save_checkpoint(iteration, model, optimizer, lr_scheduler, \
+                    parameter_names=None, on_demand=False, bgd=True):
     """Save a model checkpoint."""
     args = get_args()
     global mv_futures
-
-    # if not on_demand and mv_futures is not None and len(mv_futures) > 0:
-    #     print("waiting on futures...")
-    #     done, notdone = concurrent.futures.wait(mv_futures)
-    #     if len(notdone) > 0:
-    #         print("{} ckpts not moved\n".format(len(notdone)))
-    #     for future in done:
-    #         try:
-    #             data = future.result()
-    #         except Exception as exc:
-    #             print('future generated an exception: %s' % ( exc))
 
     # Only rank zero of the data parallel writes to the disk.
     if not args.varuna and isinstance(model, torchDDP):
@@ -119,14 +108,11 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
     if on_demand or data_parallel_rank == 0:
 
         tempdir = "/mnt/nitika/varuna_ckpts/"
-        checkpoint_name = get_checkpoint_name(args.save, iteration, on_demand, data_parallel_rank)
+        checkpoint_name = get_checkpoint_name(args.save, iteration, data_parallel_rank)
 
         model_cp_dir = os.path.join(args.save, "model_ckpt_{}".format(iteration))
         opt_cp_dir = os.path.join(args.save, "opt_ckpt_{}".format(iteration))
-        if on_demand:
-            model_cp_dir += "_" + str(data_parallel_rank)
-            opt_cp_dir += "_" + str(data_parallel_rank)
-        if args.stage == 0:
+        if args.rank == 0:
             ensure_directory_exists(checkpoint_name)
             if not os.path.exists(model_cp_dir):
                 os.makedirs(model_cp_dir)
@@ -137,35 +123,35 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
                 os.makedirs(tempdir)
 
         # Arguments, iteration, and model.
-        state_dict = {}
-        state_dict['args'] = args
-        state_dict['iteration'] = iteration
-        if not args.varuna:
-            state_dict['model'] = model.state_dict_for_save_checkpoint()
+        if args.rank == 0:
+            state_dict = {}
+            state_dict['args'] = args
+            state_dict['iteration'] = iteration
+            if not args.varuna:
+                state_dict['model'] = model.state_dict_for_save_checkpoint()
 
-        # Optimizer stuff.
-        if not args.no_save_optim:
-            if optimizer is not None:
-                opt_state = optimizer.state_dict()
-                if args.varuna:
-                    opt_state["state"] = {}
-                state_dict['optimizer'] = opt_state
-            if lr_scheduler is not None:
-                state_dict['lr_scheduler'] = lr_scheduler.state_dict()
+            # Optimizer stuff.
+            if not args.no_save_optim:
+                if optimizer is not None:
+                    opt_state = optimizer.state_dict()
+                    if args.varuna:
+                        opt_state["state"] = {}
+                    state_dict['optimizer'] = opt_state
+                if lr_scheduler is not None:
+                    state_dict['lr_scheduler'] = lr_scheduler.state_dict()
 
-        # RNG states.
-        if not args.no_save_rng:
-            state_dict['random_rng_state'] = random.getstate()
-            state_dict['np_rng_state'] = np.random.get_state()
-            state_dict['torch_rng_state'] = torch.get_rng_state()
-            state_dict['cuda_rng_state'] = torch.cuda.get_rng_state()
-            state_dict['rng_tracker_states'] \
-                = mpu.get_cuda_rng_tracker().get_states()
+            # RNG states.
+            if not args.no_save_rng:
+                state_dict['random_rng_state'] = random.getstate()
+                state_dict['np_rng_state'] = np.random.get_state()
+                state_dict['torch_rng_state'] = torch.get_rng_state()
+                state_dict['cuda_rng_state'] = torch.cuda.get_rng_state()
+                state_dict['rng_tracker_states'] \
+                    = mpu.get_cuda_rng_tracker().get_states()
 
-        if args.fp16:
-            state_dict['amp'] = amp.state_dict()
+            if args.fp16:
+                state_dict['amp'] = amp.state_dict()
 
-        if on_demand or args.rank == 0:
             # Save.
             print('global rank {} is saving checkpoint at iteration {:7d} to {}'.
                 format(torch.distributed.get_rank(), iteration, checkpoint_name))
@@ -177,10 +163,13 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
                 pass
             param_name_to_pstage = model.checkpoint(model_cp_dir)
             param_name_to_pstage["lm_head_weight"] = args.num_layers - 1
-            mv_futures = model.checkpoint_optimizer(optimizer, parameter_names, param_name_to_pstage, opt_cp_dir, tempdir=None)
-            
+            mv_futures = model.checkpoint_optimizer(optimizer, parameter_names, \
+                                    param_name_to_pstage, opt_cp_dir, \
+                                    tempdir=tempdir if bgd else None,
+                                    shard = on_demand)
+                    
         # remove old checkpoints
-        if args.max_num_ckpts is not None and torch.distributed.get_rank() == 0:
+        if (not on_demand) and args.max_num_ckpts is not None and torch.distributed.get_rank() == 0:
             all_ckpted_iters = sorted([int(f.split("_")[-1]) for f in os.listdir(args.save) if f.startswith("opt_ckpt")])
             # assert all_ckpted_iters[-1] == iteration, "The latest checkpoint is corrupted?"
             if len(all_ckpted_iters) > args.max_num_ckpts:
@@ -213,7 +202,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, parameter_names=N
     torch.distributed.barrier()
 
     if (mv_futures is None or len(mv_futures) == 0) and args.local_rank == 0:
-        with open("/home/varuna/local_ckpt_tracker.txt","w") as f:
+        with open(f"/home/{user}/local_ckpt_tracker.txt","w") as f:
             f.write(str(iteration))
 
 def parse_last_ckpt_iteration():
@@ -268,7 +257,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
 
     if iteration == 0:
         if args.local_rank == 0:
-            with open("/home/varuna/local_ckpt_tracker.txt","w") as f:
+            with open(f"/home/{user}/local_ckpt_tracker.txt","w") as f:
                 f.write("-1")
         return 0
         
@@ -390,7 +379,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
 
     
     if args.local_rank == 0:
-        with open("/home/varuna/local_ckpt_tracker.txt","w") as f:
+        with open(f"/home/{user}/local_ckpt_tracker.txt","w") as f:
             print("writing", iteration)
             f.write(str(iteration))
 
@@ -414,6 +403,6 @@ def future_on_futures(local_rank, iteration):
             print('future generated an exception: %s' % ( exc))
             error = True
     if not error and local_rank == 0:
-        with open("/home/varuna/local_ckpt_tracker.txt","w") as f:
+        with open(f"/home/{user}/local_ckpt_tracker.txt","w") as f:
             f.write(str(iteration))
     mv_futures = None

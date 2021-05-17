@@ -52,7 +52,7 @@ class GPT2Model(MegatronModule):
                                                          args.num_layers))
 
         self.lm_head_weight = torch.nn.Parameter(self.language_model.embedding.word_embeddings.weight)
-        self.last_cutpoint = CutPoint()
+        # self.last_cutpoint = CutPoint()
 
     def forward(self, input_ids, position_ids, attention_mask, loss_mask, labels,
                 tokentype_ids=None, layer_past=None, get_key_value=False,

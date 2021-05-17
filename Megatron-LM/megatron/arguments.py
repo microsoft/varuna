@@ -268,7 +268,7 @@ def _add_checkpointing_args(parser):
     group.add_argument('--save', type=str, default=None,
                        help='Output directory to save checkpoints to.')
     group.add_argument('--save-interval', type=int, default=None,
-                       help='Number of iterations between checkpoint saves.')
+                       help='Time in seconds between checkpoint saves.')
     group.add_argument('--max-num-ckpts', type=int, default=None,
                         help="Cap on number of checkpoints stored, removes older checkpoints accordingly")
     group.add_argument('--min-ckpt-iter-to-remove', type=int, default=0)

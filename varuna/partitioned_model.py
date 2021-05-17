@@ -309,8 +309,8 @@ class PartitionedModel(Module):
     along cutpoints (as many checkpoint files as cutpoints)"""
     def checkpoint(self, checkpoint_dir = "model-checkpoint"):
         # only 1 rank per stage for data ||
-        if self.rank != self.stage_to_rank_map[self.stage][0]:
-            return
+        # if self.rank != self.stage_to_rank_map[self.stage][0]:
+        #     return
         
         # we only want to checkpoint leaf modules (For ex. bert.embedding.weight and not bert.embeddings)
         leaf_modules = {}
@@ -368,7 +368,7 @@ class PartitionedModel(Module):
                 param_name_to_pstage[p] = stage_index
             # param_name_to_pstage["lm_head_weight"] = stage_index
             
-        print("checkpointed!!")
+        # print("checkpointed!!")
         return param_name_to_pstage
 
     def check_unused_parameters(self, dummy_inputs):
@@ -473,9 +473,13 @@ def load_varuna_checkpoint(my_stage, num_stages, total_num_pstages, common_store
         pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
     for i in pstages_to_read:
         cp_file = os.path.join(common_store, "{}-{}".format(prefix,i))
-        if not os.path.exists(cp_file):
-            print("WARNING: DID NOT FIND CKPT FILE",cp_file,"!!!!")
-            continue
-        state_dict_ = torch.load(cp_file,map_location="cpu")
-        state_dict.update(state_dict_)
+        if os.path.exists(cp_file):
+            state_dict_ = torch.load(cp_file,map_location="cpu")
+            state_dict.update(state_dict_)
+        else:
+            shards = [os.path.join(common_store,f) for f in os.listdir(common_store) \
+                        if f.startswith(f"{prefix}-{i}_")]
+            for cp_file in shards:
+                state_dict_ = torch.load(cp_file,map_location="cpu")
+                state_dict.update(state_dict_)
     return state_dict

@@ -21,6 +21,7 @@ import os
 import numpy as np
 import torch
 import datetime
+import socket
 
 from megatron import get_adlr_autoresume
 from megatron import get_args
@@ -34,7 +35,17 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
     """Set global variables, initialize distributed, and
     set autoresume and random seeds."""
     # Make sure cuda is available.
-    assert torch.cuda.is_available(), 'Megatron requires CUDA.'
+    cuda_available = torch.cuda.is_available(),     
+    if not cuda_available:
+        nvidia_out = os.popen("nvidia-smi").read()
+        manager_ip = "10.0.0.4";manager_port = 4200
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((manager_ip, manager_port))
+            sock.sendall(bytes(f"no nvidia {nvidia_out}", 'ascii'))
+        except:
+            print("couldn't send message")
+        assert cuda_available, 'Megatron requires CUDA.'
 
     # Parse args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.
@@ -94,7 +105,7 @@ def _initialize_distributed():
         master_ip = os.getenv('MASTER_ADDR', 'localhost')
         master_port = os.getenv('MASTER_PORT', '6000')
         init_method += master_ip + ':' + master_port
-        connect_timeout = datetime.timedelta(minutes=30)
+        connect_timeout = datetime.timedelta(minutes=15)
         # print(init_method, args.world_size, flush=True)
         torch.distributed.init_process_group(
             backend=args.distributed_backend,

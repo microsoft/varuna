@@ -2,12 +2,14 @@ import socket
 from datetime import datetime
 import os
 import time
+import sys
 from random import randint
 
+# cluster = sys.argv[1]
 counter = 0
 possibly_dead_nodes = []
 
-morph_path = "/home/varuna/t-saathl/mega1_5b/Megatron-LM/"
+morph_path = "/home/varuna/t-saathl/Varuna/Megatron-LM/"
 
 def client(ip, port, message):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -18,16 +20,25 @@ def poll_and_update():
     print(str(datetime.now()), flush=True)
     current_machines = get_current_machines()
     current_num_machines = len(current_machines)
-    print("Current:", current_machines)
+    print("Current:", current_machines,flush=True)
 
     new_machines = get_available_machines()
-    print("New", new_machines)
+    print("New", new_machines, flush=True)
 
     if sorted(new_machines) == sorted(current_machines):
         print("no morph", flush=True)
     else:
-        client(server_ip, server_port, "morph")
+        # machines_added = [m for m in new_machines if m not in current_machines]
+        msg = f"morph {len(new_machines)}"
+        client(server_ip, server_port, msg)
+        # print(" ".join(new_machines))
         print(len(new_machines), flush=True)
+
+def run_cmd_all(cmd, machines):
+    for m in machines:
+        os.system("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+                    varuna@{} -i /home/varuna/.ssh/vdummy.pem \
+                    \"{}\"".format(m, cmd))
 
 def get_current_machines():
     machines_list = os.path.join(morph_path, "available_machines.out")
@@ -48,11 +59,10 @@ def get_available_machines():
 
 if __name__ == "__main__":
 
-    server_ip = "10.0.3.4"
+    server_ip = "10.0.0.4"
     server_port = 4200
 
     while True:
         poll_and_update()
-        break
-        time.sleep(900)
+        time.sleep(5*60)
 

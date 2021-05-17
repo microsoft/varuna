@@ -57,6 +57,7 @@ OPTIMIZER = None
 LR_SCHEDULER = None
 ITERATION = None
 PARAMETER_NAMES = None
+CKPT_AND_EXIT_SIGNAL=False
 
 def pretrain(train_valid_test_dataset_provider, model_provider,
              forward_step_func, eval_step_varuna, extra_args_provider=None, args_defaults={}):
@@ -393,6 +394,24 @@ def train_step(forward_step_func, data_iterator,
 
     return loss_reduced, skipped_iter
 
+def log_memory_usage(task_name=None, task_no=0, reset_max=False):
+    torch.cuda.synchronize(torch.cuda.current_device())
+    if reset_max:
+        torch.cuda.reset_max_memory_cached()
+        torch.cuda.reset_max_memory_allocated()
+        return
+
+    mem = torch.cuda.memory_allocated()
+    max_mem = torch.cuda.max_memory_allocated()
+
+    # delta_alloced = mem - self.mem_previous
+    # delta_max_alloced = max_mem - self.max_mem_previous
+
+    # self.mem_previous = mem
+    # self.max_mem_previous = max_mem
+
+    # logfile.write(f"mem {time.time()} {task_name} {task_no} {mem} {max_mem}\n")
+
 def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler, iteration):
     """Single training step varuna."""
     args = get_args()
@@ -403,11 +422,11 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
     loss, loss_reduced, overflow, global_grad_norm = varuna_step(data_iterator, model)
     # timers('forward').stop()
 
-    if args.clip_grad > 0:
-        if not args.fp16:
-            mpu.clip_grad_norm(model.parameters(), args.clip_grad)
-        else:
-            mpu.clip_grad_norm(amp.master_params(optimizer), args.clip_grad)
+    # if args.clip_grad > 0:
+    #     if not args.fp16:
+    #         mpu.clip_grad_norm(model.parameters(), args.clip_grad)
+    #     else:
+    #         mpu.clip_grad_norm(amp.master_params(optimizer), args.clip_grad)
 
     # Update parameters.
     timers('optimizer').start()
@@ -415,7 +434,7 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
         # print("setup_model() pre opt step: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
         # print('setup_model() pre opt step:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
     if not overflow:
-        optimizer.step(global_grad_norm)
+        optimizer.step(global_grad_norm=global_grad_norm)
     else:
         for param in optimizer._amp_stash.all_fp32_from_fp16_params:
             param.grad = None
@@ -516,7 +535,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
 def train(forward_step_func, model, optimizer, lr_scheduler,
           train_data_iterator, valid_data_iterator, parameter_names, eval_step_varuna=None,setup_time=0):
     """Train the model function."""
-    global ITERATION
+    global ITERATION, CKPT_AND_EXIT_SIGNAL
 
     args = get_args()
     timers = get_timers()
@@ -564,6 +583,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     report_memory_flag = True
 
     train_start_time = time.time()
+    last_ckpt_time = train_start_time
 
     step_func = train_step_varuna if args.varuna else train_step
 
@@ -582,6 +602,11 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             complete_steps += 1
             ITERATION += 1
 
+        if CKPT_AND_EXIT_SIGNAL:
+            save_checkpoint(complete_steps, model, optimizer, \
+                lr_scheduler, parameter_names, on_demand=True, bgd=False)
+            exit()
+
         # Logging.
         total_train_time = time.time() - train_start_time
         loss_scale = None
@@ -599,25 +624,27 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                               lr_scheduler)
 
         # Checkpointing
-        if args.save and args.save_interval and complete_steps > 0 and \
-           complete_steps % args.save_interval == 0:
+        time_since_ckpt = time.time() - last_ckpt_time
+        if args.save and (time_since_ckpt >= args.save_interval) and complete_steps > 0:
             ckpt_time = time.time()           
             save_checkpoint(complete_steps, model, optimizer, lr_scheduler, parameter_names)
             ckpt_time = time.time() - ckpt_time
             print(args.rank, "ckpt time", ckpt_time)
+            last_ckpt_time = time.time()
             
         # Evaluation
-        if args.eval_interval and complete_steps > 0 and complete_steps % args.eval_interval == 0 and \
-           args.do_valid:
+        if (not CKPT_AND_EXIT_SIGNAL) and args.eval_interval and complete_steps > 0 and \
+             complete_steps % args.eval_interval == 0 and args.do_valid:
             prefix = 'iteration {}'.format(complete_steps)
             evaluate_and_print_results(prefix, forward_step_func if not args.varuna else eval_step_varuna,
                                        valid_data_iterator, model,
                                        complete_steps, False, loss_file=eval_loss_file)
 
-        if args.exit_interval and complete_steps > 0 and complete_steps % args.exit_interval == 0:
-            torch.distributed.barrier()
-            time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            rank = torch.distributed.get_rank()
+        if CKPT_AND_EXIT_SIGNAL or \
+             (args.exit_interval and complete_steps > 0 and complete_steps % args.exit_interval == 0):
+            # torch.distributed.barrier()
+            # time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            # rank = torch.distributed.get_rank()
             print_rank_0('rank: {} | time: {} | exiting the program at '
                          'iteration {}'.format(rank, time_str, complete_steps))
             sys.exit()
@@ -737,12 +764,17 @@ def build_train_valid_test_data_iterators(
         train_ds, valid_ds, test_ds = build_train_valid_test_datasets_provider(
             train_val_test_num_samples)
 
-        dry_run_input = train_ds[0]
-
-        # Build dataloders.
-        train_dataloader = make_data_loader(train_ds)
-        valid_dataloader = make_data_loader(valid_ds)
-        test_dataloader = make_data_loader(test_ds)
+        # Build dataloders.   
+        if not args.varuna or args.stage in [0, args.partitions-1]:
+            dry_run_input = train_ds[0]
+            train_dataloader = make_data_loader(train_ds)
+            valid_dataloader = make_data_loader(valid_ds)
+            test_dataloader = make_data_loader(test_ds)
+        else:
+            dry_run_input = torch.load("/home/rahul/gpt2-blob/turing-dry-run-input")
+            train_dataloader = [None, None, None, None]
+            valid_dataloader = [None, None, None, None]
+            test_dataloader = [None, None, None, None]
 
         # Flags to know if we need to do training/validation/testing.
         do_train = train_dataloader is not None and args.train_iters > 0
@@ -764,12 +796,12 @@ def build_train_valid_test_data_iterators(
     args.do_test = flags[2].item()
 
     # Shift the start iterations.
-    if train_dataloader is not None:
+    if isinstance(train_dataloader, torch.utils.data.DataLoader):
         train_dataloader.batch_sampler.start_iter = args.iteration % \
             len(train_dataloader)
         print('setting training data start iteration to {}'.
                      format(train_dataloader.batch_sampler.start_iter))
-    if valid_dataloader is not None:
+    if isinstance(valid_dataloader, torch.utils.data.DataLoader):
         start_iter_val = (args.iteration // args.eval_interval) * \
             args.eval_iters
         valid_dataloader.batch_sampler.start_iter = start_iter_val % \
@@ -799,12 +831,20 @@ def build_train_valid_test_data_iterators(
 
 
 def on_demand_checkpoint():
-    global MODEL, OPTIMIZER, LR_SCHEDULER, PARAMETER_NAMES, ITERATION
-
-    ckpt_vars = [MODEL, OPTIMIZER, LR_SCHEDULER, PARAMETER_NAMES, ITERATION]
-    assert not any([v is None for v in ckpt_vars]), "CKPT VARS NOT SET!"
-    
-    save_checkpoint(ITERATION, MODEL, OPTIMIZER, LR_SCHEDULER, PARAMETER_NAMES, on_demand=True)
+    global CKPT_AND_EXIT_SIGNAL,MODEL, OPTIMIZER,\
+            LR_SCHEDULER, PARAMETER_NAMES, ITERATION
+    print("setting exit signal to true!")
+    CKPT_AND_EXIT_SIGNAL = True
+    varuna_status = MODEL.get_status()
+    print("varuna status is", varuna_status)
+    # if step not done yet and not in all-reduce, ckpt & exit, else wait
+    if varuna_status in ["init","pipeline"]:
+        ckpt_vars = [MODEL, OPTIMIZER, LR_SCHEDULER, PARAMETER_NAMES, ITERATION]
+        assert not any([v is None for v in ckpt_vars]), "CKPT VARS NOT SET!"
+        
+        save_checkpoint(ITERATION, MODEL, OPTIMIZER, LR_SCHEDULER, \
+                PARAMETER_NAMES, on_demand=True, bgd=False)
+        exit()
 
 
 def get_eval_numbers(train_valid_test_dataset_provider, model_provider,

@@ -1,0 +1,2 @@
+
+python profile_gpt2.py --num-layers 54 --hidden-size 1920 --num-attention-heads 20 --seq-length 1024 --max-position-embeddings 1024 --train-iters 18750 --lr-decay-iters 18750 --data-path /home/rahul/gpt2-blob/turing/megatron --vocab-file gpt2-vocab.json --merge-file gpt2-merges.txt --data-impl mmap --split 949,50,1 --lr 0.00001 --min-lr 1e-5 --lr-decay-style cosine --weight-decay 1e-2 --clip-grad 1.0 --warmup .05 --fp16 --varuna --partitions 1 --chunk_size 1 --stage_to_rank_map "0;"

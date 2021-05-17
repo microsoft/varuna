@@ -6,20 +6,23 @@ import signal
 import math
 import random
 import socket
-# import atexit
+
+from varuna import AutoConfig
 
 local_rank_to_device = [0,1,2,3]
-
+user = "rahul"
 # different for diff kinds of GPUs
 MAX_GPU_MEM = 16280000000
 processes = []
 
-manager_ip = "10.0.3.4"
-manager_port = 4201
+manager_ip = "10.0.0.4"
+manager_port = 4200
 
 def calculate_config(args):
     # world size in terms of number of processes
     gpus_available = args.ngpus_per_server * args.nservers
+    if args.nstages is None:
+        args.nstages, args.chunk_size = num_partitions(gpus_available, args.ngpus_per_server, args.batch_size)
     gpus_per_stage = (gpus_available // args.nstages) if args.gpus_per_stage == 0 else args.gpus_per_stage
     # args.gpus_per_stage = gpus_per_stage
     print(gpus_per_stage, "per stage")
@@ -27,15 +30,7 @@ def calculate_config(args):
     assert dist_world_size <= gpus_available, "Too many gpus_per_stage - {}!".format(gpus_per_stage)
 
     # some servers unused
-    if args.custom_placement:
-        servers_for_embeddings = math.ceil(gpus_per_stage / float(args.ngpus_per_server))
-        other_servers = math.ceil((dist_world_size - gpus_per_stage) / float(args.ngpus_per_server))
-        num_servers = other_servers + servers_for_embeddings
-        if num_servers > args.nservers:
-            raise RuntimeError("Not enough servers for cutom placement")
-        args.nservers = num_servers
-    else:
-        args.nservers = math.ceil(dist_world_size / float(args.ngpus_per_server))
+    args.nservers = math.ceil(dist_world_size / float(args.ngpus_per_server))
 
     print(args.nservers, "servers!")
     if args.node_rank >= args.nservers:
@@ -46,58 +41,30 @@ def calculate_config(args):
     stage_to_rank_map = {}
     rank_to_stage_map = {}
 
-    if args.custom_placement:
-        # seperate VMs for embeddings
-        stage_to_rank_map[0] = range(0, gpus_per_stage)
-        for i in range(1, args.nstages):
-            stage_to_rank_map[i] = \
-                range( gpus_per_stage + i-1, dist_world_size, args.nstages-1)
-    else:
-        # clustered
-        for i in range(args.nstages):
-            stage_to_rank_map[i] = range(i, dist_world_size, args.nstages) 
-            for r in stage_to_rank_map[i]:
-                rank_to_stage_map[r] = i
+    # clustered
+    for i in range(args.nstages):
+        stage_to_rank_map[i] = range(i, dist_world_size, args.nstages) 
+        for r in stage_to_rank_map[i]:
+            rank_to_stage_map[r] = i
 
-        # scattered
-        # for i in range(0,dist_world_size,gpus_per_stage):
-        #    stage_to_rank_map[int(i//gpus_per_stage)] = range(i,i+gpus_per_stage)
+    # scattered
+    # for i in range(0,dist_world_size,gpus_per_stage):
+    #    stage_to_rank_map[int(i//gpus_per_stage)] = range(i,i+gpus_per_stage)
 
 
     # # batch size should be divisible by num of data parallel workers
     per_gpu_batch_size = args.batch_size // gpus_per_stage
     total_batch_size = per_gpu_batch_size * gpus_per_stage     
 
-    if args.custom_placement:
-        last_unused_gpus = 0
-        if ((dist_world_size - gpus_per_stage) % args.ngpus_per_server) != 0:
-            last_unused_gpus = args.ngpus_per_server - ((dist_world_size - gpus_per_stage) % args.ngpus_per_server)
+    last_unused_gpus = 0
+    if (dist_world_size % args.ngpus_per_server) != 0:
+        last_unused_gpus = args.ngpus_per_server - (dist_world_size % args.ngpus_per_server)
+    
+    first_rank_in_server = args.node_rank * args.ngpus_per_server
+    ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
+    if args.node_rank == args.nservers - 1:
+        ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server - last_unused_gpus)
 
-        last_embedding_node_rank = math.ceil(gpus_per_stage / args.ngpus_per_server) - 1
-        # unused_gpus = (args.nservers - last_embedding_node_rank - 1) * args.ngpus_per_server
-        if args.node_rank == last_embedding_node_rank:
-            first_rank_in_server = args.node_rank * args.ngpus_per_server
-            ranks_in_server = range(first_rank_in_server, gpus_per_stage)
-        elif args.node_rank < last_embedding_node_rank:
-            first_rank_in_server = args.node_rank * args.ngpus_per_server
-            ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
-        elif args.node_rank < (args.nservers - 1):
-            first_rank_in_server = (args.node_rank * args.ngpus_per_server) - (args.ngpus_per_server - gpus_per_stage % args.ngpus_per_server)
-            ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
-        else:
-            first_rank_in_server = (args.node_rank * args.ngpus_per_server) - (args.ngpus_per_server - gpus_per_stage % args.ngpus_per_server)
-            ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server - last_unused_gpus)
-    
-    else:
-        last_unused_gpus = 0
-        if (dist_world_size % args.ngpus_per_server) != 0:
-            last_unused_gpus = args.ngpus_per_server - (dist_world_size % args.ngpus_per_server)
-        
-        first_rank_in_server = args.node_rank * args.ngpus_per_server
-        ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
-        if args.node_rank == args.nservers - 1:
-            ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server - last_unused_gpus)
-    
 
     # shuffle ranks for some razzle dazzle
     alias_map_str = None
@@ -144,6 +111,12 @@ def calculate_config(args):
 
     return dist_world_size, stage_to_rank_map, ranks_in_server, total_batch_size, gpus_per_stage, alias_map_str
     
+def num_partitions(world_size, ngpus_per_server, batch_size):
+    auto = AutoConfig(world_size, ngpus_per_server, batch_size)
+    num_partitions, chunk_size, time = auto.get_min()
+    print("best config is:", num_partitions, chunk_size)
+    print("expected time is", time, flush=True)
+    return num_partitions, chunk_size
 
 def parse_args():
     """
@@ -163,13 +136,13 @@ def parse_args():
     parser.add_argument("--node_rank", type=int, default=0,
                         help="Rank of node amongst servers.")
 
-    parser.add_argument("--nstages", type=int, required = True,
+    parser.add_argument("--nstages", type=int, default=None,
                         help="Depth of pipeline (number of stages)")
 
     parser.add_argument("--batch_size", required=True, type=int,
                         help="Total effective batch size required")
     
-    parser.add_argument("--chunk_size", type=int, required=True,
+    parser.add_argument("--chunk_size", type=int, default=None,
                         help="Micro-batch size per mini-batch")
 
     # need a better way to pass this information ?
@@ -206,41 +179,56 @@ def parse_args():
         
 
 if __name__ == "__main__":
+    args = parse_args()
+
+    if os.path.exists("parent_process"):
+        print("path exists")
+        with open("parent_process","r") as f:
+            pid = int(f.read())
+        print("PID: ",pid)
+        already_running = True
+        try:
+            os.kill(pid, 0)
+            print("process exists")
+        except OSError as e:
+            print("os error:",e)
+            already_running = False
+        if already_running:
+            print("Varuna is already running!")
+            if args.node_rank == 0:
+                try:
+                    with open('nservers', 'r') as f:
+                        nservers = int(f.read())
+                    with open('ngpus', 'r') as f:
+                        ngpus = int(f.read())
+                    world_size = ngpus * nservers
+                except:
+                    world_size = 1
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                        message = "already running job of size {}".format(world_size)
+                        sock.connect((manager_ip, manager_port))
+                        sock.sendall(bytes(message, 'ascii'))
+                except:
+                    print("Could not send already_running message")
+            exit()
 
     print("Parent process ID:",os.getpid())
 
     with open("parent_process","w") as f:
         f.write(str(os.getpid()))
 
-    args = parse_args()
 
     def handler(signum,_):
         global loop_pending
         print('Signal handler called with signal', signum, flush=True)
-        with open('ngpus','r') as f:
-            ngpus_per_server = int(f.read())
-        with open('nservers','r') as f:
-            nservers = int(f.read())
-        with open('nstages','r') as f:
-            nstages = int(f.read())
-        with open('gpus_per_stage','r') as f:
-            gpus_per_stage = int(f.read())
-        if args.ngpus_per_server == ngpus_per_server and args.nservers == nservers and args.nstages == nstages and args.gpus_per_stage == gpus_per_stage:
-            return
-        loop_pending = True
-        if args.node_rank >= nservers:
-            loop_pending = False
-        args.ngpus_per_server = ngpus_per_server
-        args.nservers = nservers
-        args.gpus_per_stage = gpus_per_stage
-        args.nstages = nstages
         try:
             for p in processes:
                 p.send_signal(signal.SIGUSR1)
         except Exception as e:
             print("run_varuna: error while sending signal:- ", e)
             
-        print("\n\n CONFIG CHANGED TO ",args.nservers, "x",args.ngpus_per_server,"!!\n\n\n", flush=True)
+        # print("\n\n CONFIG CHANGED TO ",args.nservers, "x",args.ngpus_per_server,"!!\n\n\n", flush=True)
 
     signal.signal(signal.SIGUSR1, handler)
 
@@ -257,6 +245,7 @@ if __name__ == "__main__":
             "please further tune the variable for optimal performance in "
             "your application as needed. \n"
             "*****************************************".format(current_env["OMP_NUM_THREADS"]))
+    # torch.set_num_threads(24)
 
     loop_count = 0
 
@@ -368,8 +357,8 @@ if __name__ == "__main__":
 
 
         last_iter = -1
-        if os.path.exists("/home/varuna/local_ckpt_tracker.txt"):
-            with open("/home/varuna/local_ckpt_tracker.txt","r") as f:
+        if os.path.exists(f"/home/{user}/local_ckpt_tracker.txt"):
+            with open(f"/home/{user}/local_ckpt_tracker.txt","r") as f:
                 last_iter = int(f.read())
 
         print("done and trying to send here", flush=True)
