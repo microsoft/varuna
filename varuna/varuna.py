@@ -456,22 +456,71 @@ class Pipeline:
     def __init__(self, batches, model, config, schedule, optimizer):
         self.status = "init"
         self.batches = batches
-        self.partitions = config["partitions"]
-        self.stage = config["stage"]
-        self.data_depth = config["data_depth"]
-        self.data_parallel = bool(self.data_depth > 1)
-        self.process_group = config["dp_process_group"]
-        self.pipeline_group = config["pipeline_process_group"]
-        self.tied_group = config["tied_group"]
-        self.rank_within_stage = config["rank_within_stage"]
         self.chunks = len(self.batches)
 
         self.model = model
-        self.partitioned_model = self.model#.module if self.data_parallel else self.model
-        self.device = config["device"]
+        self.partitioned_model = self.model
         self.schedule = schedule
-        self.fp16 = config["fp16"]
         self.rank = dist.get_rank()
+        self.opportunistic = True
+
+        self.read_config(config)
+        self.data_parallel = bool(self.data_depth > 1)
+
+        if self.make_logfile:
+            replica_num = self.stage_to_rank_map[self.stage].index(self.rank)
+            microBS = config["chunk_size"]
+            logfilename = "varuna_logs-"+str(self.data_depth)+"dp-" + str(microBS) + "mBS-stage" + str(self.stage) + "of" + str(self.partitions) + "_" + str(replica_num)
+            # logfilename = os.path.join("/home/varuna/gpt2-blob/perf_analysis_2.5b","stats",logfilename)
+            self.logfile = open(logfilename,"a")
+            self.logfile.write("start time {}\n".format(time.time()))
+
+        self.optimizer = optimizer
+
+        self.spawn_send_workers()
+        # self.spawn_receive_workers()
+        self.acts_queue = Queue()
+        self.grads_queue = Queue()
+
+
+        self.recompute_queue = Queue()
+
+        self.back_start_times = Queue()
+
+        # communication queues
+        self.partitioned_model.set_queues(self.acts_send_queue, self.grads_send_queue,
+                                          self.acts_queue, self.grads_queue, self.recompute_queue  )
+
+        # stores output of recompute(/forward) pass to be used by backward()
+        self.loss = None
+        self.average_loss = 0
+
+        self.dummy_attention_mask = config["dummy_attention_mask"]
+        self.attention_mask = batches[0]["attention_mask"].cpu() if self.stage in [0,self.partitions-1] \
+                            else torch.ones_like(self.dummy_attention_mask)
+        if self.stage > 0 and self.stage < self.partitions - 1:
+            dist.recv(self.attention_mask, src = self.receive_rank)
+        if self.stage < self.partitions - 2:
+            dist.send(self.attention_mask, dst = self.send_rank)
+        self.attention_mask = self.attention_mask.to(self.device)
+        
+        self.pre_fwd_events = []
+        self.post_fwd_events = []
+        self.avg_fwd_time = 0
+
+    def read_config(self, config):
+
+        self.partitions = config["partitions"]
+        self.stage = config["stage"]
+        self.data_depth = config["data_depth"]
+
+        self.dp_group = config["dp_process_group"]
+        self.pipeline_group = config["pipeline_process_group"]
+        self.tied_group = config["tied_group"]
+        self.rank_within_stage = config["rank_within_stage"]
+
+        self.device = config["device"]
+        self.fp16 = config["fp16"]
 
         self.fwd_inp_shape = config["fwd_inp_shape"]
         self.bwd_grad_shape = config["bwd_grad_shape"]
@@ -483,57 +532,14 @@ class Pipeline:
         self.local_rank = config["local_rank"]
 
         self.make_logfile = config["make_logfile"]
-        if self.make_logfile:
-            replica_num = self.stage_to_rank_map[self.stage].index(self.rank)
-            microBS = config["chunk_size"]
-            logfilename = "/home/rahul/gpt2-blob/gantts/vlogs-"+str(self.data_depth)+"dp-" + str(microBS) + "mBS-stage" + str(self.stage) + "of" + str(self.partitions) + "_" + str(replica_num)
-            # logfilename = os.path.join("/home/varuna/gpt2-blob/perf_analysis_1.5b","stats",logfilename)
-            self.logfile = open(logfilename,"a")
-            self.logfile.write("start time {}\n".format(time.time()))
-
         self.receive_rank = config["receive_rank"]
         self.send_rank = config["send_rank"]
-
         self.last_chunk_size = config["last_chunk_size"]
-
-        self.optimizer = optimizer
-        self.fp16 = config["fp16"]
-
-        # self.mem_previous = self.max_mem_previous = 0
-        self.dummy_attention_mask = config["dummy_attention_mask"]
-        self.attention_mask = batches[0]["attention_mask"].cpu() if self.stage in [0,self.partitions-1] \
-                            else torch.ones_like(self.dummy_attention_mask)
-        if self.stage > 0 and self.stage < self.partitions - 1:
-            dist.recv(self.attention_mask, src = self.receive_rank)
-        if self.stage < self.partitions - 2:
-            dist.send(self.attention_mask, dst = self.send_rank)
-        self.attention_mask = self.attention_mask.to(self.device)
-        # print("attn mask", self.attention_mask)
-
-        self.grads_send_queue = Queue()
-        self.acts_send_queue = Queue()
-        self.spawn_send_workers()
-
-        self.acts_queue = Queue()       # activation at the boundary, rename as input_acts
-        self.grads_queue = Queue()
-        self.recompute_queue = Queue()
-
+    
+    def spawn_receive_workers(self):
         self.acts_receive_thread = None
         self.grads_receive_thread = None
-        self.acts_send_thread = None
-        self.grads_send_thread = None
 
-        self.back_start_times = Queue()
-
-        # stores output of recompute(/forward) pass to be used by backward()
-        self.loss = None
-        self.average_loss = 0
-
-        self.pre_fwd_events = []
-        self.post_fwd_events = []
-        self.avg_fwd_time = 0
-
-    def spawn_receive_workers(self):
         if self.stage > 0:
             self.acts_receive_thread = Thread(target=self.acts_receiver, args=())
             self.acts_receive_thread.daemon=True
@@ -545,6 +551,11 @@ class Pipeline:
             self.grads_receive_thread.start()
     
     def spawn_send_workers(self):
+        self.grads_send_queue = Queue()
+        self.acts_send_queue = Queue()
+        self.acts_send_thread = None
+        self.grads_send_thread = None
+
         if self.stage < self.partitions-1:
             self.acts_send_thread = Thread(target=self.acts_sender, args=())
             self.acts_send_thread.daemon=True
@@ -608,14 +619,8 @@ class Pipeline:
         for task,index in self.schedule:
             if task == 0:
                 count += 1
-        # count = len(self.batches)   # worsens performance if used instead of for loop. Why?
-
         send_handles = Queue()
 
-        # wait_handler = Thread(target=self.handle_wait, args=(send_handles, count))
-        # wait_handler.daemon=True
-        # wait_handler.start()
-        
         while count > 0:
             output_acts = self.acts_send_queue.get()
             handle = dist.isend(output_acts, dst=self.send_rank)
@@ -627,20 +632,14 @@ class Pipeline:
         while not send_handles.empty():
             handle = send_handles.get()
             handle.wait()
-        # wait_handler.join()
 
     def grads_sender(self):
         count = 0
         for task,index in self.schedule:
             if task == 2:
                 count += 1
-        # count = len(self.batches)   # worsens performance if used instead of for loop. Why?
         
         send_handles = Queue()
-
-        # wait_handler = Thread(target=self.handle_wait, args=(send_handles, count))
-        # wait_handler.daemon=True
-        # wait_handler.start()
 
         while count > 0:
             input_grads = self.grads_send_queue.get()
@@ -653,71 +652,28 @@ class Pipeline:
         while not send_handles.empty():
             handle = send_handles.get()
             handle.wait()
-        # wait_handler.join()
         
-    # tells the model where to send acts and gradients
-    def set_model_send_fn(self, recompute = False):
-        def send(tensor, grads = False):
-            if grads:
-                self.grads_send_queue.put(tensor.cpu())
-            else:
-                if not recompute:
-                    self.acts_send_queue.put(tensor.cpu())
+    def close_comm_threads(self):
+        if self.acts_receive_thread is not None:
+            self.acts_receive_thread.join()
+        if self.grads_receive_thread is not None:
+            self.grads_receive_thread.join()
         
-        self.partitioned_model.set_send_fn(send)
-
-    # tells the model how to receive acts and gradients
-    def set_model_recv_fn(self, recompute = False):
-        if recompute:
-            ctx, acts = self.recompute_queue.get()
-            if self.stage > 0:
-                acts = acts.to(self.device)
-            utils.restore_rng_states(ctx, self.device)
-
-        else:
-            recv_time_start = time.time()
-            acts = self.acts_queue.get() if self.stage > 0 else None
-            acts = acts.to(self.device) if self.stage > 0 else None
-            if self.make_logfile:
-                torch.cuda.synchronize(self.device)
-                recv_time = time.time() - recv_time_start
-                self.logfile.write("{} {} {} {}\n".format("recvacts", 0, recv_time_start, recv_time))
-
-        def recv(grads = False):
-            if grads:
-                recv_time_start = time.time()
-                g = self.grads_queue.get().to(self.device)
-                if self.make_logfile:  
-                    torch.cuda.synchronize(self.device)
-                    recv_time = time.time() - recv_time_start 
-                    self.logfile.write("{} {} {} {}\n".format("recvgrads", 0, recv_time_start, recv_time))
-                self.back_start_times.put(time.time())
-                return g
-            else:
-                return acts
-        
-        self.partitioned_model.set_recv_fn(recv)
-        # because there's no peek/front method for these queues
-        return acts
+        if self.acts_send_thread is not None:
+            self.acts_send_thread.join()
+        if self.grads_send_thread is not None:
+            self.grads_send_thread.join()
 
     def worker(self, task, grad_mode, inputs_as_dict):
         """ Main body of worker loop """
         if task == 0:
             torch.set_grad_enabled(grad_mode)
-
-            rng_states=None
-            if grad_mode == False:
-                # if these acts are going to be recomputed
-                rng_states = utils.save_rng_states(self.device)
-
-            self.set_model_send_fn(recompute = False)
-            acts = self.set_model_recv_fn(recompute = False)
             task_time_start = time.time()
             pre_fwd = torch.cuda.Event(enable_timing=True)
             post_fwd = torch.cuda.Event(enable_timing=True)
             pre_fwd.record()
             inputs_as_dict["attention_mask"] = self.attention_mask
-            output = self.model(**inputs_as_dict)
+            output = self.model(inputs_as_dict, save_ctx=not grad_mode, handle_comm=True)
             post_fwd.record()
             self.pre_fwd_events.append(pre_fwd)
             self.post_fwd_events.append(post_fwd)
@@ -726,22 +682,15 @@ class Pipeline:
                 task_time = time.time() - task_time_start
                 self.logfile.write("{} {} {} {}\n".format(TASK[0], 0, str(task_time_start), str(task_time)))
 
-            if grad_mode == False:
-                if self.stage > 0:
-                    acts = acts.cpu()
-                ctx = (rng_states, acts)
-                self.recompute_queue.put(ctx)
-            else:
+            if grad_mode == True:
                 # save loss and input activations for the backward pass to use
                 self.loss = output[0] if isinstance(output,tuple) else output
 
         elif task == 1:
             torch.set_grad_enabled(True)
-            self.set_model_send_fn(recompute = True)
-            self.set_model_recv_fn(recompute = True)
             task_time_start = time.time()
             inputs_as_dict["attention_mask"] = self.attention_mask
-            output = self.model(**inputs_as_dict)
+            output = self.model(inputs_as_dict, recompute=True, handle_comm=True)
             if self.make_logfile:
                 torch.cuda.synchronize(self.device)
                 task_time = time.time() - task_time_start
@@ -750,45 +699,31 @@ class Pipeline:
             self.loss = output[0] if isinstance(output,tuple) else output
         
         else:
-            if self.stage != self.partitions-1:
-                grads = torch.ones(self.loss.size(), dtype = torch.float32).to(self.device)
-                if self.fp16:
-                    # task_time_start = time.time()
-                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=True, last_partition=False) as scaled_loss:
-                        scaled_loss.backward(grads)
-                    if self.make_logfile:
-                        torch.cuda.synchronize(self.device)
-                        task_time_start = self.back_start_times.get()
-                        task_time = time.time() - task_time_start
-                        self.logfile.write("{} {} {} {}\n".format(TASK[2], 0, str(task_time_start), str(task_time)))
-                else:
-                    self.loss.backward(grads)
+            grads = torch.ones(self.loss.size(), dtype = torch.float32).to(self.device)
 
-            else:
+            if self.stage == self.partitions - 1:
+                grads = None
                 chunks = len(self.batches)
                 # self.loss = self.loss/chunks
                 self.average_loss += (self.loss.item()/chunks)
 
-                if self.fp16:
-                    task_time_start = time.time()
-                    with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=True) as scaled_loss:
-                        scaled_loss.backward()
-                    if self.make_logfile:
-                        torch.cuda.synchronize(self.device)
-                        task_time = time.time() - task_time_start
-                        self.logfile.write("{} {} {} {}\n".format(TASK[2], 0, str(task_time_start), str(task_time)))
+            if self.fp16:
+                task_time_start = time.time()
+                with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=True, 
+                            last_partition=(self.stage == self.partitions-1)) as scaled_loss:
+                    scaled_loss.backward(grads)
+                if self.make_logfile:
+                    torch.cuda.synchronize(self.device)
+                    task_time = time.time() - task_time_start
+                    self.logfile.write("{} {} {} {}\n".format(TASK[2], 0, str(task_time_start), str(task_time)))
 
-                    # self.optimizer.backward(self.loss)
-                else:
-                    self.loss.backward()
+            else:
+                self.loss.backward(grads)
 
-            # print(self.stage, 'backward done')
             del self.loss
             self.loss = None
         
     def run(self):
-        # dist.barrier()
-        # time.sleep(10)
         if log_verbose:
             print(f'{self.rank} {self.rank_within_stage} starting pipeline')        
         self.spawn_receive_workers()
@@ -803,7 +738,7 @@ class Pipeline:
         while (i<len(schedule)):
             grad_mode = False
             index, task = schedule[i]
-            if (task[0]==1 and count_fwd<len(self.batches) and self.grads_queue.empty()):
+            if self.opportunistic and (task[0]==1 and count_fwd<len(self.batches) and self.grads_queue.empty()):
             # if (task[0]==1 and count_fwd<len(self.batches) and not self.acts_queue.empty()):
                 j=i
                 while (j<len(schedule)):
@@ -819,7 +754,7 @@ class Pipeline:
                     grad_mode=True
             
             if log_verbose:
-                print(f'{self.rank} {self.rank_within_stage} task:{task[0]} {task[1]}/{len(self.batches)}')
+                print(f'{self.stage} {self.rank_within_stage} task:{task[0]} {task[1]}/{len(self.batches)}\n', end="")
             self.worker(task[0], grad_mode, self.batches[task[1]])
 
             i+=1
@@ -837,7 +772,7 @@ class Pipeline:
         dist.barrier()
 
         if log_verbose:
-            print(f'{self.rank} {self.rank_within_stage} going to share embedding grads')
+            print(f'{self.stage} {self.rank_within_stage} going to share embedding grads')
         
         if self.partitions > 1 and self.shared_weights is not None:
             self.status = "share_weights"
@@ -871,19 +806,11 @@ class Pipeline:
         if self.make_logfile:
             self.logfile.write("\n\nBATCH END {} {}\n\n".format(batchstart, batchtime))
             self.logfile.close()        
-        if self.acts_receive_thread is not None:
-            self.acts_receive_thread.join()
-        if self.grads_receive_thread is not None:
-            self.grads_receive_thread.join()
 
-        if self.acts_send_thread is not None:
-            self.acts_send_thread.join()
-        if self.grads_send_thread is not None:
-            self.grads_send_thread.join()
+        self.close_comm_threads()
 
         self.status = "done"
 
-        # return loss
         return self.average_loss, overflow, global_grad_norm, self.avg_fwd_time
 
     def all_reduce_opt_grads(self):
