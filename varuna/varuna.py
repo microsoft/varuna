@@ -15,9 +15,11 @@ import concurrent.futures
 import shutil
 
 from .partitioned_model import PartitionedModel
+from . import utils
+# from .checkpoint import write_varuna_checkpoint, get_local_ckpt_tracker, \
+#          load_varuna_checkpoint, load_varuna_optimizer, num_params_written, get_prev_checkpoint
 import gc
 import numpy
-# from hashlib import sha1
 import socket
 
 import os
@@ -53,12 +55,8 @@ def share_weight_grads(model, tied_group):
     
 class Varuna(Module):
     """
-    model = nn.Sequential(a,b,c,d)
-    model = Varuna(model, microbatches/minibatch, list_of_devices)
-    for iteration in epoch:
-        model(input)   # execute Varuna's pipeline (forward and backward pass)
-        optimizer.step()
-        optimizer.zero_grad()
+    Wrapper class for Varuna training.
+    Args:
     """
     def __init__(self,
                 model,
@@ -72,25 +70,24 @@ class Varuna(Module):
                 shared_weights=None):
         super().__init__()
 
-        self.partitions = len(stage_to_rank_map)
         self.rank = dist.get_rank()
         self.local_rank = local_rank if local_rank != -1 else self.rank
-        self.stage_to_rank_map = stage_to_rank_map
-
-        self.stage = -1
-        for stage in self.stage_to_rank_map:
-            i = 0
-            for rank in self.stage_to_rank_map[stage]:
-                if rank == self.rank:
-                    rank_within_stage = i
-                    data_depth = len(self.stage_to_rank_map[stage])
-                    self.stage = stage
-                    break
-                i += 1
+        self.stage_to_rank_map = utils.parse_stage_to_rank_map(stage_to_rank_map)
+        self.partitions, data_depth = utils.get_varuna_config(stage_to_rank_map)
+        self.stage, rank_within_stage = utils.get_this_rank_config_varuna(stage_to_rank_map, self.rank)
+        self.manager_ip, self.manager_port = utils.get_heartbeat_server_info()
         self.rank_within_stage = rank_within_stage
         if self.stage == -1:
             raise ValueError("Rank " + str(self.rank) + " not found in stage to rank map!")
         self.data_parallel = data_depth > 1
+
+        model_in_cpu = not next(model.parameters()).is_cuda
+        assert model_in_cpu, "Model should be on CPU before passing to varuna!"
+        assert isinstance(dummy_inputs, dict), "Sample inputs should be a dictionary!"
+        for key in dummy_inputs:
+            val = dummy_inputs[key]
+            if isinstance(val, torch.Tensor) and val.is_cuda:
+                dummy_inputs[key] = val.cpu()
 
         if device == -1:
             device = self.local_rank
@@ -120,6 +117,7 @@ class Varuna(Module):
 
         self.model.to(self.device)        
         self.init_distributed()
+        # self.configure_checkpointing(dummy_inputs)
 
         self.config = {
             "stage": self.stage,
@@ -130,23 +128,24 @@ class Varuna(Module):
             "receive_rank": self.receive_rank,
             "send_rank": self.send_rank,
             "device": self.device,
-            "data_depth": len(self.stage_to_rank_map[self.stage]),
-            "dp_process_group": self.process_group, 
+            "data_depth": data_depth,
+            "dp_process_group": self.dp_group, 
             "pipeline_process_group": self.pipeline_group,
             "tied_group": self.tied_group,
-            "make_logfile": False, #bool(self.rank == self.stage_to_rank_map[self.stage][-1]),
+            "make_logfile": False,
             "last_chunk_size": self.last_chunk_size,
             "shared_weights": self.shared_weights,
             "shared_weight_stages": self.shared_weight_stages,
             "stage_to_rank_map": self.stage_to_rank_map,
             "local_rank": self.local_rank,
             "chunk_size": chunk_size,
-            "rank_within_stage": stage_to_rank_map[self.stage].index(self.rank),
+            "rank_within_stage": rank_within_stage,
             "dummy_attention_mask": dummy_inputs["attention_mask"].cpu()
         }
 
-        self.schedule = self.generate_schedule()
-        self.step = 0
+        chunks = math.ceil(self.batch_size / self.micro_batch_size)
+        self.schedule = utils.generate_schedule(chunks, self.stage, self.partitions)
+        self.iteration = 0
         self.current_step = 0
 
     def init_communication(self, rank_within_stage):
@@ -165,100 +164,85 @@ class Varuna(Module):
         if self.stage > 0:
             self.fwd_inp_shape = self.model.forward_input_shapes[0]
             self.fwd_inp_shape[0] = self.micro_batch_size
-            # print("Varuna fwd inp shape ", self.fwd_inp_shape)
         if self.stage < (self.partitions-1):
             self.bwd_grad_shape = self.model.backward_grad_shapes[0]
             self.bwd_grad_shape[0] = self.micro_batch_size
-            # print("Varuna bwd grad shape", self.bwd_grad_shape)
 
     def init_distributed(self):
         # create same process groups on all ranks
-        self.process_group = None
-        process_groups = {}
+        
+        # data parallel groups
+        self.dp_group = None
+        dp_groups = {}
         for stage in range(self.partitions):
             ranks = self.stage_to_rank_map[stage]
             if len(ranks) > 1:
-                process_groups[stage] = dist.new_group(ranks=ranks, backend='nccl')
+                dp_groups[stage] = dist.new_group(ranks=ranks,backend='nccl')
             else:
-                process_groups[stage] = None
+                dp_groups[stage] = None
+        if dp_groups[self.stage] is not None:
+            self.dp_group = dp_groups[self.stage]
 
-        if process_groups[self.stage] is not None:
-            self.process_group = process_groups[self.stage]
-
-        # get stream to rank map
-        depth = len(self.stage_to_rank_map[self.stage])
-        world_size = depth * self.partitions
-
-        stream_to_rank_map = {}
-        for i in range(depth):
-            stream = []
-            for stage in range(self.partitions):
-                stream.append(self.stage_to_rank_map[stage][i])
-            stream_to_rank_map[i] = stream
-
+        # pipeline parallel groups
+        data_depth = len(self.stage_to_rank_map[self.stage])
         self.tied_group = None
         self.pipeline_group = None
         pipeline_groups = {}
         tied_groups = {}
-        for stream in range(depth):
-            ranks = stream_to_rank_map[stream]
+        for replica in range(data_depth):
+            ranks = [self.stage_to_rank_map[i][replica] for i in range(self.partitions)]
             if len(ranks) > 1:
-                pipeline_groups[stream] = dist.new_group(ranks=ranks)
+                pipeline_groups[replica] = dist.new_group(ranks=ranks)
                 recv_stage, send_stage = self.shared_weight_stages[0]
                 tied_ranks = [ranks[recv_stage], ranks[send_stage]]
-                tied_groups[stream] = dist.new_group(ranks=tied_ranks)
+                tied_groups[replica] = dist.new_group(ranks=tied_ranks)
             else:
-                pipeline_groups[stream] = None
-                tied_groups[stream] = None
+                pipeline_groups[replica] = None
+                tied_groups[replica] = None
             
-        current_stream = self.stage_to_rank_map[self.stage].index(self.rank)
-        print("this rank ", self.rank, "is part of pipeline stream ", current_stream)
-        if pipeline_groups[current_stream] is not None:
-            self.pipeline_group = pipeline_groups[current_stream]
-            self.tied_group = tied_groups[current_stream]
+        current_replica = self.stage_to_rank_map[self.stage].index(self.rank)
+        print("this rank ", self.rank, "is part of pipeline replica ", current_replica)
+        if pipeline_groups[current_replica] is not None:
+            self.pipeline_group = pipeline_groups[current_replica]
+            self.tied_group = tied_groups[current_replica]
+
+    def configure_checkpointing(self, dummy_inputs):
+        self.param_name_to_pstage = self.partitioned_model.parameter_names_to_cuts(dummy_inputs)
+        # make temp dir for local ckpt trackers
+        if self.local_rank == 0 and not os.path.exists(utils.VARUNA_TEMP_FOLDER):
+            os.makedirs(utils.VARUNA_TEMP_FOLDER)
 
     def forward(self, inputs):
+        raise RuntimeError("Varuna uses the 'step' function for both fwd/bwd together,\
+                             or the 'evaluate' function for evaluation.")
+
+    def step(self, inputs):
+        assert isinstance(inputs, dict), "Varuna inputs should be a dictionary!"
+
         if self.fp16:
             assert self.optimizer is not None, "For fp16, you must set the optimizer using set_optimizer()"        
         
         # Divide a mini-batch into micro-batches.
-        batches = scatter(inputs, int(self.batch_size),self.micro_batch_size)
+        batches = utils.scatter(inputs, int(self.batch_size),self.micro_batch_size)
         
-        # need not pass the first argument if rank!=0
-        # avoid dataloader compute in machines other than the first
-        # ask the model writer to pass the input batch generating dataloader function to Varuna::__init__
-        # and Varuna can take care of input dataloader explicitly
-        self.config["make_logfile"] = bool(self.config["make_logfile"] and self.current_step<3)
-        self.config["parameter_names"] = self.parameter_names
+        self.config["make_logfile"] = bool(self.config["make_logfile"] and self.current_step < 5)
         batch_time = time.time()
         self.pipeline = Pipeline(batches, self.model, self.config, self.schedule, self.optimizer)
         loss, overflow, global_grad_norm, fwd_time = self.pipeline.run()
         batch_time = time.time() - batch_time
-        self.step += 1
+        self.iteration += 1
         self.current_step += 1
         
-        manager_ip = "10.0.0.4"
-        manager_port = 5000
-
         if self.current_step <= 5:
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    message = "slowcheck {} {} {} {}".\
+            message = "slowcheck {} {} {} {}".\
                         format(self.current_step, self.stage, self.rank_within_stage,fwd_time)
-                    sock.connect((manager_ip, manager_port))
-                    sock.sendall(bytes(message, 'ascii'))
-            except:
-                print("Could not send slowcheck update message")
+            utils.heartbeat(message, self.manager_ip, self.manager_port)
+            
+                    
+        if self.rank == 0 and self.iteration%5==0:
+            message = "progress {} {}".format(batch_time, self.iteration)
+            utils.heartbeat(message, self.manager_ip, self.manager_port)
 
-        if self.rank == 0 and self.step%5==0:    # disable morphing for hypercluster
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    message = "progress {} {}".format(batch_time, self.step)
-                    sock.connect((manager_ip, manager_port))
-                    sock.sendall(bytes(message, 'ascii'))
-            except:
-                print("Could not send progress update message")
-        
         return loss, overflow, global_grad_norm
 
     def get_status(self):
@@ -322,8 +306,48 @@ class Varuna(Module):
     def train(self):
         self.model.train()
 
-    def set_optimizer(self, optimizer):
+    def set_optimizer(self, optimizer, amp_opt_level="O2", loss_scale = "dynamic",
+                            init_loss_scale = 2**20, min_loss_scale=None):
         self.optimizer = optimizer
+        
+        basemodel = self.partitioned_model.module
+        parameter_names_ = dict()
+        for n,p in basemodel.named_parameters():
+            parameter_names_[p] = n
+
+        if self.fp16:
+            assert  loss_scale == 'dynamic' or type(loss) == float, \
+                    "Loss scale must either be a floating point or the string 'dynamic'"
+            
+            basemodel, optimizer = amp.initialize(  basemodel, self.optimizer, opt_level=amp_opt_level, 
+                                                    loss_scale=loss_scale, min_loss_scale=min_loss_scale )
+            if loss_scale == 'dynamic':
+                amp._amp_state.loss_scalers[0]._loss_scale = init_loss_scale
+            
+            self.partitioned_model.module = basemodel
+            self.optimizer = optimizer
+
+            # fp32 param names for checkpointing
+            optimizer._amp_lazy_init()
+
+            fp16_model_params = optimizer._amp_stash.all_fp16_params
+            fp32_master_params = optimizer._amp_stash.all_fp32_from_fp16_params
+            # print("stash lens",len(fp16_model_params), len(fp32_master_params))
+            
+            count = 0
+            parameter_names = dict()
+            for p_model, p_master in zip(fp16_model_params, fp32_master_params):
+                if p_model in parameter_names_:
+                    parameter_names[p_master] = parameter_names_.pop(p_model)
+                    count += p_master.numel()
+            # print(count, "params found in rank", self.rank)
+
+            self.parameter_names = parameter_names
+        else:
+            self.parameter_names = parameter_names_
+
+        self.config["parameter_names"] = self.parameter_names
+
 
     def zero_grad(self):
         self.model.zero_grad()
@@ -425,37 +449,6 @@ class Varuna(Module):
     def to(self, device):
         self.model.to(device)
     
-    def generate_schedule(self):
-        chunks = math.ceil(self.batch_size / self.micro_batch_size)
-        print(chunks,"chunks")
-        c_schedule = os.popen(os.path.join(os.path.dirname(os.path.abspath(__file__)),'genschedule ')+str(self.partitions)+' '+str(chunks)+' '+str(self.stage)).read()
-        schedule = list()
-        steps = c_schedule.split(';')
-        steps = steps[:-1]
-        for step in steps:
-            task = step.split(',')
-            schedule.append((int(task[0]), int(task[1])))
-        
-        return schedule
-                
-
-def save_rng_states(device):
-    """capture current CPU, GPU random number generator states to reuse while recomputing activations
-    in order to ensure Referential Transparency
-    """
-    cpu_rng_state = torch.get_rng_state()
-
-    gpu_rng_states: Optional[ByteTensor]
-    # gpu_rng_states = torch.cuda.get_rng_state_all() 
-    gpu_rng_states = torch.cuda.get_rng_state(device)
-    return (cpu_rng_state, gpu_rng_states)
-
-def restore_rng_states(rng_states, device):
-    cpu_rng_state, gpu_rng_states = rng_states
-    torch.set_rng_state(cpu_rng_state)
-    # torch.cuda.set_rng_state_all(gpu_rng_states)        # todo: verify correctness;   batchNorm, dropouts, convlayers?
-    torch.cuda.set_rng_state(gpu_rng_states, device)
-
 
 class Pipeline:
     """ Pipeline parallelism for Varuna """
@@ -679,7 +672,7 @@ class Pipeline:
             ctx, acts = self.recompute_queue.get()
             if self.stage > 0:
                 acts = acts.to(self.device)
-            restore_rng_states(ctx, self.device)
+            utils.restore_rng_states(ctx, self.device)
 
         else:
             recv_time_start = time.time()
@@ -715,7 +708,7 @@ class Pipeline:
             rng_states=None
             if grad_mode == False:
                 # if these acts are going to be recomputed
-                rng_states = save_rng_states(self.device)
+                rng_states = utils.save_rng_states(self.device)
 
             self.set_model_send_fn(recompute = False)
             acts = self.set_model_recv_fn(recompute = False)
@@ -998,7 +991,7 @@ class Pipeline:
                 global_grad_norm = local_grad_norm
                 global_grad_norm_sq = local_grad_norm**2
             
-            clipped = clip_grad_norm(amp.master_params(self.optimizer), global_grad_norm_sq, 1.0)
+            clipped = utils.clip_grad_norm(amp.master_params(self.optimizer), global_grad_norm_sq, 1.0)
             if clipped:
                 global_grad_norm = global_grad_norm/global_grad_norm # * args.clip_grad (max_norm)
             
@@ -1016,31 +1009,6 @@ class Pipeline:
 
         # return had_overflow
         return had_overflow, global_grad_norm
-
-def scatter(input, batch_size, chunk_size):
-    """
-    Accepts input dictionary and splits into microbatches
-    """
-    assert isinstance(input,dict) , "varuna inputs must be given as a dictionary" 
-    
-    microbatches = []
-    num_microbatches = math.ceil(batch_size / chunk_size)
-    for k,v in input.items():
-        # TODO: what will happen for indivisibilities in uneven data parallelism !!
-        # print(dist.get_rank(),k,v.size())
-        # special case for GPT-2 attention mask
-        if v is None:
-            chunked_values = [None for _ in range(num_microbatches)]
-        elif v.size(0) == 1:
-            chunked_values = [v for _ in range(num_microbatches)]
-        else:
-            chunked_values = v.split(chunk_size)
-        for i,value in enumerate(chunked_values):
-            if len(microbatches) <= i:
-                microbatches.append(dict())
-            microbatches[i][k]=value
-    
-    return microbatches
 
 
 def load_varuna_optimizer(optimizer, my_stage, num_stages, total_num_pstages, parameter_names, \
@@ -1084,32 +1052,3 @@ def load_varuna_optimizer(optimizer, my_stage, num_stages, total_num_pstages, pa
             name = parameter_names[p]
             if name in saved_master_params:
                 p.data.copy_(saved_master_params[name].data)
-
-def clip_grad_norm(parameters, grad_norm_sq, max_norm, norm_type=2):
-    """Clips gradient norm of an iterable of parameters.
-    This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
-    added functionality to handle model parallel parameters. Note that
-    the gradients are modified in place.
-    Arguments:
-        parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
-            single Tensor that will have gradients normalized
-        max_norm (float or int): max norm of the gradients
-        norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
-            infinity norm.
-    Returns:
-        Total norm of the parameters (viewed as a single vector).
-    """
-    if isinstance(parameters, torch.Tensor):
-        parameters = [parameters]
-    parameters = list(filter(lambda p: p.grad is not None, parameters))
-    max_norm = float(max_norm)
-    norm_type = float(norm_type)
-    
-    total_norm = grad_norm_sq.item() ** (1. / norm_type)
-    # print(f'clip_grad_norm() total_norm = {total_norm}')
-    clip_coef = max_norm / (total_norm + 1e-6)
-    if clip_coef < 1:
-        for p in parameters:
-            p.grad.data.mul_(clip_coef)
-            
-    return clip_coef<1

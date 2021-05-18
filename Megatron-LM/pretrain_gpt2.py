@@ -145,7 +145,7 @@ def varuna_step(data_iterator, model):
         "labels": labels
     })
 
-    loss, overflow, global_grad_norm = model(inputs)
+    loss, overflow, global_grad_norm = model.step(inputs)
 
     # Reduce loss for logging.
     # reduced_loss = reduce_losses([loss])

@@ -257,47 +257,13 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
         print('setup_model() post optimizer init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
     lr_scheduler = get_learning_rate_scheduler(optimizer)
 
-    basemodel = model
-    while isinstance(basemodel, (Varuna,PartitionedModel, torchDDP)):
-        basemodel = basemodel.module if hasattr(basemodel, "module") else basemodel.model
+    if args.varuna:
+        model.set_optimizer(optimizer, amp_opt_level="O2", loss_scale="dynamic",
+                            init_loss_scale=2**20, min_loss_scale=args.min_scale)
 
-    if args.fp16:
-        if args.dynamic_loss_scale:
-            basemodel, optimizer = amp.initialize(basemodel, optimizer, opt_level="O2", loss_scale="dynamic",min_loss_scale=args.min_scale)
-            amp._amp_state.loss_scalers[0]._loss_scale = 2**20
-        else:
-            basemodel, optimizer = amp.initialize(basemodel, optimizer, opt_level="O2", loss_scale=args.loss_scale, min_loss_scale=args.min_scale)
     
     if args.local_rank==0:
         print('setup_model() post amp init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
-        if args.varuna:
-            model.model.module = basemodel
-
-    if args.varuna:
-        model.set_optimizer(optimizer)
-
-    # fp32 param names for checkpointing
-    optimizer._amp_lazy_init()
-    if args.local_rank==0:
-        print('setup_model() post amp opt init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
-    parameter_names_ = dict()
-    for n,p in basemodel.named_parameters():
-        parameter_names_[p] = n
-    fp16_model_params = optimizer._amp_stash.all_fp16_params
-    fp32_master_params = optimizer._amp_stash.all_fp32_from_fp16_params
-    print("stash lens",len(fp16_model_params), len(fp32_master_params))
-    count = 0
-    parameter_names = dict()
-    for p_model, p_master in zip(fp16_model_params, fp32_master_params):
-        if p_model in parameter_names_:
-            parameter_names[p_master] = parameter_names_.pop(p_model)
-            count += 1
-    print(count, "params found in rank", args.rank)
-    # if args.local_rank==0:
-        # print("setup_model() post opt init: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
-        # print('setup_model() post opt int:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
-    # print(args.rank, parameter_names)
-    # '''
 
     # Wrap model for distributed training."""
     if args.DDP_impl == 'torch':
@@ -314,18 +280,19 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
     else:
         args.iteration = 0
 
-    # this needs to be fixed asap
-    if args.varuna and args.stage == args.partitions - 1:
-        param = None
-        for p in parameter_names:
-            if parameter_names[p] == "lm_head_weight":
-                param = p
-                break
-        with torch.no_grad():
-            basemodel.lm_head_weight.data.copy_(param.data) 
+    parameter_names = model.parameter_names
+
+    # # this needs to be fixed asap
+    # if args.varuna and args.stage == args.partitions - 1:
+    #     param = None
+    #     for p in parameter_names:
+    #         if parameter_names[p] == "lm_head_weight":
+    #             param = p
+    #             break
+    #     with torch.no_grad():
+    #         basemodel.lm_head_weight.data.copy_(param.data) 
 
 
-    model.parameter_names = parameter_names
     return model, optimizer, lr_scheduler, parameter_names
 
 
@@ -555,7 +522,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     complete_steps = args.iteration
     ITERATION = complete_steps
     if args.varuna:
-        model.step = args.iteration
+        model.iteration = args.iteration
 
     loss_file = None
     eval_loss_file = None

@@ -1,7 +1,6 @@
 _tmp_inp_shapes
 _tmp_ord_mod
 runs/
-varuna/genschedule
 genschedule
 n_stages
 ngpus
@@ -19,7 +18,11 @@ profiles/
 Megatron-LM/logs/*
 available_machines.out
 Megatron-LM/setup_remote.sh
-varuna
+
+varuna/genschedule
+varuna/apex/
+varuna/versions
+
 # Byte-compiled / optimized / DLL files
 *__pycache__/
 *.py[cod]
@@ -46,5 +49,3 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
-varuna/varuna_pretraining_megatron_not_converging.py
-varuna/varuna_pretraining_sansdataparallel.py

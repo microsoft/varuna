@@ -86,7 +86,7 @@ def parse_args(extra_args_provider=None, defaults={},
             if args.rank in stage_to_rank_map[i]:
                 args.stage = i
         args.data_depth = len(ranks)
-        args.stage_to_rank_map = stage_to_rank_map
+        # args.stage_to_rank_map = stage_to_rank_map
         assert args.stage != -1, "Invalid stage to rank map!"
 
     # Fp16 loss scaling.

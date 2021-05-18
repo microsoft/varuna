@@ -31,6 +31,7 @@ import concurrent.futures
 
 
 from varuna import load_varuna_checkpoint, load_varuna_optimizer
+from varuna import get_this_rank_config_varuna
 
 from apex import amp
 
@@ -99,7 +100,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, \
         model = model.module
 
     if args.varuna:
-        data_parallel_rank = args.stage_to_rank_map[args.stage].index(args.rank)
+        _, data_parallel_rank = get_this_rank_config_varuna(args.stage_to_rank_map, args.rank)
     elif mpu.model_parallel_is_initialized():
         data_parallel_rank = mpu.get_data_parallel_rank()
     else:

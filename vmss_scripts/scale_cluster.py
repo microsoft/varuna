@@ -126,8 +126,7 @@ if __name__ == "__main__":
                 success = success or len(new_up) > current_size
                 if success:
                     print("Scaled out to {}!".format(len(new_up)))
-                    if len(new_up) >=10:
-                        setup_machines()
+                    setup_machines()
                     break
                 remove_dead(new_down,[])
                 scale_size -= 10
