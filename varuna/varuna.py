@@ -514,7 +514,7 @@ class Pipeline:
         self.stage = config["stage"]
         self.data_depth = config["data_depth"]
 
-        self.dp_group = config["dp_process_group"]
+        self.process_group = config["dp_process_group"]
         self.pipeline_group = config["pipeline_process_group"]
         self.tied_group = config["tied_group"]
         self.rank_within_stage = config["rank_within_stage"]
@@ -815,13 +815,11 @@ class Pipeline:
 
     def all_reduce_opt_grads(self):
         allred_init_start = time.time()
-        # 1. allocate an uninitialized buffer for flattened gradient
         master_grads = [p.grad for p in amp.master_params(self.optimizer) if p.grad is not None]
-        
-        # 2. combine unflattening and predivision of unscaled 'raw' gradient
         flat_grad_size = sum(p.numel() for p in master_grads)
-        flat_raw = torch.empty(flat_grad_size, device=self.device, dtype=torch.float16)
-        if self.fp16:
+        flat_raw = torch.empty(flat_grad_size, device=self.device, dtype=torch.float16 if self.fp16 else torch.float32)
+        
+        if self.fp16:        
             scaler = _amp_state.loss_scalers[0]
             loss_scale = scaler.loss_scale()
         else:
@@ -833,7 +831,7 @@ class Pipeline:
         amp_C.multi_tensor_scale(65536,
             overflow_buf,
             [master_grads, allreduced_views],
-            scaler.loss_scale() / (self.data_depth*chunks))
+            loss_scale / (self.data_depth*chunks))
         
         if self.make_logfile:
             torch.cuda.synchronize(self.device)
@@ -844,10 +842,7 @@ class Pipeline:
             print(f'{self.rank} {self.rank_within_stage} starting gradient all-reduce')
 
         if self.data_parallel:
-            # 3. sum gradient across ranks. Because of the predivision, this averages the gradient
             allred_time_start = time.time()
-            # if self.rank == 0:
-            #     print("issue allreduce 1",flush=True)
             torch.distributed.all_reduce(flat_raw, group=self.process_group)
             if self.make_logfile:
                 torch.cuda.synchronize(self.device)
@@ -859,15 +854,70 @@ class Pipeline:
         if log_verbose:
             print(f'{self.rank} {self.rank_within_stage} gradient all-reduce done')
             
-        # 4. combine unscaling and unflattening of allreduced gradient
-        amp_C.multi_tensor_scale(65536,
-            overflow_buf,
-            [allreduced_views, master_grads],
-            1./loss_scale)
+        if self.fp16:
+            amp_C.multi_tensor_scale(65536,
+                overflow_buf,
+                [allreduced_views, master_grads],
+                1./loss_scale)
 
+        overflow_buf = overflow_buf.to(torch.float32)
+        overflow_buf, global_grad_norm = self.global_overflow_and_norm(master_grads, overflow_buf if self.fp16 else None)
+        global_grad_norm_sq = global_grad_norm ** 2
+
+        clipped = utils.clip_grad_norm(amp.master_params(self.optimizer), global_grad_norm_sq, 1.0)
+        if clipped:
+            global_grad_norm = global_grad_norm/global_grad_norm
+
+        had_overflow = False
+        if self.fp16:
+            overflow_buf = torch.cuda.IntTensor([0 if overflow_buf.item()==0 else 1])
+            old_overflow_buf = scaler._overflow_buf
+            scaler._overflow_buf = overflow_buf
+            had_overflow = scaler.update_scale()
+            scaler._overflow_buf = old_overflow_buf
+
+        return had_overflow, global_grad_norm
+
+    
+    def global_overflow_and_norm(self, master_grads, overflow_buf=None):
+        
         local_grad_norm = multi_tensor_applier(amp_C.multi_tensor_l2norm,
                                              torch.cuda.IntTensor([0]),
                                              [master_grads], False)[0]
+
+        local_grad_norm_sq = (local_grad_norm ** 2) - self.extra_grad_norm_sq()
+
+        if self.partitions > 1:
+            osync_time_start = time.time()
+            allred_tensor = local_grad_norm_sq
+            if overflow_buf is not None:
+                allred_tensor = torch.cat((overflow_buf, allred_tensor))
+            if log_verbose:
+                print(f'{self.rank} {self.rank_within_stage} starting overflow all_reduce')
+            torch.distributed.all_reduce(allred_tensor, group=self.pipeline_group)
+            if log_verbose:
+                print(f'{self.rank} {self.rank_within_stage} overflow all_reduce done')
+            
+            if overflow_buf is not None:
+                overflow_buf, global_grad_norm_sq = allred_tensor
+            else:
+                global_grad_norm_sq = allred_tensor
+            global_grad_norm = global_grad_norm_sq ** 0.5
+
+            if self.make_logfile:
+                x = overflow_buf.item() + 1
+                torch.cuda.synchronize(self.device)
+                osync_time = time.time() - osync_time_start
+                self.logfile.write("overflow 0 {} {}\n".format(osync_time_start, osync_time))
+        
+        else:
+            global_grad_norm_sq = local_grad_norm_sq
+            global_grad_norm = global_grad_norm_sq ** 0.5
+
+        return overflow_buf, global_grad_norm
+        
+    
+    def extra_grad_norm_sq(self):
         extra_norm_sq = 0.0
         for i,w in enumerate(self.shared_weights):
             recv_stage, send_stage = self.shared_weight_stages[i]
@@ -878,64 +928,7 @@ class Pipeline:
                     if self.parameter_names[p] == w[1]:
                         extra_norm_sq += torch.norm(p.grad) ** 2
                         break
-        local_grad_norm_sq = (local_grad_norm ** 2) - extra_norm_sq
-        
-        # TODO: perform all-reduce for grad norm computation separately for fp32 (without overflow buf)
-        
-
-        if self.fp16:
-            # 5. update loss scale
-            if overflow_buf:
-                print("Overflow at rank", self.rank)
-            scaler = _amp_state.loss_scalers[0]
-            # all-reduce to sync overflow
-            if self.partitions > 1:
-                osync_time_start = time.time()
-                # if self.rank == 0:
-                #     print("issue allreduce 2", flush=True)
-                # torch.distributed.all_reduce(overflow_buf, group=self.pipeline_group)
-                
-                overflow_buf = overflow_buf.to(torch.float32)
-                allred_tensor = torch.cat((overflow_buf, local_grad_norm_sq))
-                if log_verbose:
-                    print(f'{self.rank} {self.rank_within_stage} starting overflow all_reduce')
-                torch.distributed.all_reduce(allred_tensor, group=self.pipeline_group)
-                if log_verbose:
-                    print(f'{self.rank} {self.rank_within_stage} overflow all_reduce done')
-                overflow_buf = allred_tensor[0]
-                global_grad_norm_sq = allred_tensor[1]
-                global_grad_norm = allred_tensor[1] ** 0.5
-
-                if self.local_rank == 0:
-                    print("global norm at rank",self.rank,"is",global_grad_norm)
-
-                if self.make_logfile:
-                    x = overflow_buf.item() + 1
-                    torch.cuda.synchronize(self.device)
-                    osync_time = time.time() - osync_time_start
-                    self.logfile.write("overflow 0 {} {}\n".format(osync_time_start, osync_time))
-            else:
-                global_grad_norm = local_grad_norm
-                global_grad_norm_sq = local_grad_norm**2
-            
-            clipped = utils.clip_grad_norm(amp.master_params(self.optimizer), global_grad_norm_sq, 1.0)
-            if clipped:
-                global_grad_norm = global_grad_norm/global_grad_norm # * args.clip_grad (max_norm)
-            
-            if overflow_buf.item()==0:
-                overflow_buf = torch.cuda.IntTensor([0])
-            else:
-                overflow_buf = torch.cuda.IntTensor([1])
-            
-            old_overflow_buf = scaler._overflow_buf
-            scaler._overflow_buf = overflow_buf
-            had_overflow = scaler.update_scale()
-            scaler._overflow_buf = old_overflow_buf
-        else:
-            had_overflow = False
-
-        # return had_overflow
-        return had_overflow, global_grad_norm
+        return extra_norm_sq
 
 
 def load_varuna_optimizer(optimizer, my_stage, num_stages, total_num_pstages, parameter_names, \
