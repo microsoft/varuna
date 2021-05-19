@@ -46,7 +46,6 @@ from megatron.utils import report_memory
 from megatron.utils import get_ltor_masks_and_position_ids
 
 from varuna import Varuna, PartitionedModel
-from varuna import load_varuna_checkpoint
 
 from apex import amp
 from apex.amp import _amp_state
@@ -260,7 +259,6 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
     if args.varuna:
         model.set_optimizer(optimizer, amp_opt_level="O2", loss_scale="dynamic",
                             init_loss_scale=2**20, min_loss_scale=args.min_scale)
-
     
     if args.local_rank==0:
         print('setup_model() post amp init:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
@@ -276,23 +274,12 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
         model = LocalDDP(model)
         
     if args.load is not None:
-        args.iteration = load_checkpoint(basemodel, optimizer, lr_scheduler, parameter_names)
+        args.iteration = load_checkpoint(model, optimizer, lr_scheduler)
     else:
         args.iteration = 0
 
     parameter_names = model.parameter_names
-
-    # # this needs to be fixed asap
-    # if args.varuna and args.stage == args.partitions - 1:
-    #     param = None
-    #     for p in parameter_names:
-    #         if parameter_names[p] == "lm_head_weight":
-    #             param = p
-    #             break
-    #     with torch.no_grad():
-    #         basemodel.lm_head_weight.data.copy_(param.data) 
-
-
+    
     return model, optimizer, lr_scheduler, parameter_names
 
 
@@ -371,14 +358,6 @@ def log_memory_usage(task_name=None, task_no=0, reset_max=False):
     mem = torch.cuda.memory_allocated()
     max_mem = torch.cuda.max_memory_allocated()
 
-    # delta_alloced = mem - self.mem_previous
-    # delta_max_alloced = max_mem - self.max_mem_previous
-
-    # self.mem_previous = mem
-    # self.max_mem_previous = max_mem
-
-    # logfile.write(f"mem {time.time()} {task_name} {task_no} {mem} {max_mem}\n")
-
 def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler, iteration):
     """Single training step varuna."""
     args = get_args()
@@ -389,25 +368,13 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
     loss, loss_reduced, overflow, global_grad_norm = varuna_step(data_iterator, model)
     # timers('forward').stop()
 
-    # if args.clip_grad > 0:
-    #     if not args.fp16:
-    #         mpu.clip_grad_norm(model.parameters(), args.clip_grad)
-    #     else:
-    #         mpu.clip_grad_norm(amp.master_params(optimizer), args.clip_grad)
-
     # Update parameters.
     timers('optimizer').start()
-    # if args.local_rank==0:
-        # print("setup_model() pre opt step: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
-        # print('setup_model() pre opt step:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())
     if not overflow:
         optimizer.step(global_grad_norm=global_grad_norm)
     else:
         for param in optimizer._amp_stash.all_fp32_from_fp16_params:
             param.grad = None
-    # if args.local_rank==0:
-        # print("setup_model() post opt step: ", args.local_rank, torch.cuda.memory_summary(torch.cuda.current_device()))
-        # print('setup_model() post opt step:', args.local_rank, torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated())        
     timers('optimizer').stop()
 
     for param in model.parameters():
@@ -593,7 +560,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         # Checkpointing
         time_since_ckpt = time.time() - last_ckpt_time
         if args.save and (time_since_ckpt >= args.save_interval) and complete_steps > 0:
-            ckpt_time = time.time()           
+            ckpt_time = time.time()
             save_checkpoint(complete_steps, model, optimizer, lr_scheduler, parameter_names)
             ckpt_time = time.time() - ckpt_time
             print(args.rank, "ckpt time", ckpt_time)

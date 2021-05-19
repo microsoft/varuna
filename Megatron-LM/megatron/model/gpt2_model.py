@@ -102,7 +102,9 @@ class GPT2Model(MegatronModule):
 
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""
-
+        if "lm_head_weight" in state_dict:
+            with torch.no_grad():
+                self.lm_head_weight.copy_(state_dict["lm_head_weight"])
         if self._language_model_key in state_dict:
             state_dict = state_dict[self._language_model_key]
         self.language_model.load_state_dict(state_dict, strict=strict)

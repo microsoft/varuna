@@ -16,8 +16,8 @@ import shutil
 
 from .partitioned_model import PartitionedModel
 from . import utils
-# from .checkpoint import write_varuna_checkpoint, get_local_ckpt_tracker, \
-#          load_varuna_checkpoint, load_varuna_optimizer, num_params_written, get_prev_checkpoint
+from .checkpoint import write_varuna_checkpoint, get_local_ckpt_tracker, \
+         load_varuna_checkpoint, load_varuna_optimizer, num_params_written, get_prev_checkpoint
 import gc
 import numpy
 import socket
@@ -117,7 +117,7 @@ class Varuna(Module):
 
         self.model.to(self.device)        
         self.init_distributed()
-        # self.configure_checkpointing(dummy_inputs)
+        self.configure_checkpointing(dummy_inputs)
 
         self.config = {
             "stage": self.stage,
@@ -207,7 +207,7 @@ class Varuna(Module):
             self.tied_group = tied_groups[current_replica]
 
     def configure_checkpointing(self, dummy_inputs):
-        self.param_name_to_pstage = self.partitioned_model.parameter_names_to_cuts(dummy_inputs)
+        self.param_name_to_pstage = self.partitioned_model.parameter_names_to_cuts()
         # make temp dir for local ckpt trackers
         if self.local_rank == 0 and not os.path.exists(utils.VARUNA_TEMP_FOLDER):
             os.makedirs(utils.VARUNA_TEMP_FOLDER)
@@ -248,8 +248,18 @@ class Varuna(Module):
     def get_status(self):
         return self.pipeline.status
 
-    def evaluate(self, inputs):
+    def get_loss_scale(self):
+        if not self.fp16:
+            return None
+        scaler = _amp_state.loss_scalers[0]
+        loss_scale = scaler.loss_scale()
+        return loss_scale    
+
+    def evaluate(self, inputs, batch_size=None):
         assert isinstance(inputs, dict), "input must be a dictionary!"
+
+        if batch_size is None:
+            batch_size = self.batch_size
 
         dummy_attention_mask = self.config["dummy_attention_mask"]
         attention_mask = inputs["attention_mask"].cpu() if self.stage in [0,self.partitions-1] \
@@ -260,26 +270,25 @@ class Varuna(Module):
             dist.send(attention_mask, dst = self.send_rank)
         attention_mask = attention_mask.to(self.device)
 
-        # self.partitioned_model.eval()
         def send(x, grads=False):
-            # print("sending to rank", self.send_rank, x.size())
             dist.send(x.cpu(), self.send_rank)
         def recv(grads=False):
             x_shape = self.fwd_inp_shape
             x = torch.zeros(x_shape, dtype=torch.float16 if self.fp16 else torch.float32)
-            # print("receiving from rank", self.receive_rank, x_shape)
             dist.recv(x, self.receive_rank)
             return x.to(self.device)
-        self.partitioned_model.set_send_fn(send)
-        self.partitioned_model.set_recv_fn(recv)
-
-        batches = scatter(inputs, int(self.batch_size),self.micro_batch_size)
+        if self.partitioned_model.pre_cp is not None:
+            self.partitioned_model.pre_cp.recv_fn = recv
+        if self.partitioned_model.post_cp is not None:
+            self.partitioned_model.post_cp.send_fn = send
+        
+        batches = utils.scatter(inputs, int(self.batch_size), self.micro_batch_size)
         
         with torch.no_grad():
             avg_output = None
             for mb in batches[:-1]:
                 mb["attention_mask"] = attention_mask
-                output = self.partitioned_model(**mb)
+                output = self.partitioned_model(mb, handle_comm=False)
                 avg_output = output if avg_output is None else avg_output + output
             mb = batches[-1]
             mb["attention_mask"] = attention_mask
@@ -291,8 +300,9 @@ class Varuna(Module):
                 # print("last receiving from rank", self.receive_rank, x_shape)
                 dist.recv(x, self.receive_rank)
                 return x.to(self.device)
-            self.partitioned_model.set_recv_fn(recv)
-            output = self.partitioned_model(**mb)
+            if self.partitioned_model.pre_cp is not None:
+                self.partitioned_model.pre_cp.recv_fn = recv
+            output = self.partitioned_model(mb, handle_comm=False)
             if self.stage == self.partitions - 1:
                 avg_output = output if avg_output is None else avg_output + output
 
@@ -352,100 +362,66 @@ class Varuna(Module):
     def zero_grad(self):
         self.model.zero_grad()
     
-    def checkpoint(self, cp_dir_name):
-        return self.partitioned_model.checkpoint(cp_dir_name)
+    """ Writes a varuna checkpoint with model parameters, optimizer state etc. 
+        Each checkpoint is a directory, written under the given path.
+        
+        Args:
+        global_store: string, path to a folder accessible by all nodes/ranks in the training job. 
+                For example, path to a mounted blob storage. This is where the varuna checkpoint folder is written.
+        step: int, iteration number for checkpoint. If None, it'll be taken from varuna's tracked progress.
+        tempdir: string, path to a local directory to which to write checkpoints temporarily, and sync
+                with the global store in the background. Lowers checkpoint write time in the critical path.
+        shard: bool, whether to shard checkpoint writes over data parallel workers as well. Speeds up checkpoint 
+    """
+    def checkpoint(self, global_store, step=None, tempdir=None, shard=False, on_demand = False):
+        if step is None:
+            step = self.iteration
 
-    def checkpoint_optimizer(self, optimizer, parameter_to_name, param_name_to_pstage, \
-                                cp_dir_name, tempdir=None, on_demand = False, shard=False):
-        cp_time = time.time()
-        mv_futures = []
-        if tempdir is not None:
-            executor = concurrent.futures.ThreadPoolExecutor()
-
-        rank_within_stage = self.stage_to_rank_map[self.stage].index(self.rank)
-        depth = len(self.stage_to_rank_map[self.stage]) if shard else 1
-
-        # shard checkpoint over DP workers
-        if rank_within_stage == 0 or shard:
-            cuts_per_stage = self.partitioned_model.cuts_per_stage
-            # save param states for each cutpoint separately
-            pstages = range(cuts_per_stage * self.stage, (self.stage+1)* cuts_per_stage)
-            pstage_state_dicts = dict()
-            for i in pstages:
-                pstage_state_dicts[i] = dict()
-
-            ind = 0
-            for key in optimizer.state:
-                # for sharding
-                if ind % depth != rank_within_stage:
-                    ind += 1
-                    continue
-                # store state by param names instead of actual parameters
-                param_name = parameter_to_name[key]
-                assert param_name in param_name_to_pstage, "param {} not found in rank {}".format(param_name,dist.get_rank())
-                pstage = param_name_to_pstage[param_name]
-                pstage_state_dicts[pstage][param_name] = optimizer.state[key]
-                ind += 1
-                
-            if tempdir is not None:
-                for i in pstages:
-                    temp_name =  os.path.join(tempdir,"opt-state-" + str(i))
-                    cp_name = os.path.join(cp_dir_name,"opt-state-" + str(i))
-                    if depth > 1:
-                        temp_name += "_" + str(rank_within_stage)
-                        cp_name += "_" + str(rank_within_stage)
-                    torch.save(pstage_state_dicts[i], temp_name)
-                    mv_futures.append(executor.submit(shutil.move, temp_name, cp_name))
-            else:
-                for i in pstages:
-                    cp_name = os.path.join(cp_dir_name,"opt-state-" + str(i))
-                    if depth > 1:
-                        cp_name += "_" + str(rank_within_stage)
-                    torch.save(pstage_state_dicts[i], cp_name)
-
-            # also store optimizer master params for mixed precision training
-            if self.fp16:
-
-                pstage_state_dicts = dict()
-                for i in pstages:
-                    pstage_state_dicts[i] = dict()
-
-                ind = 0
-                for p in amp.master_params(optimizer):
-                    if ind % depth != rank_within_stage:
-                        ind += 1
-                        continue
-                    param_name = parameter_to_name[p]
-                    # not a part of the worker's stage
-                    if param_name not in param_name_to_pstage:
-                        continue
-                    pstage = param_name_to_pstage[param_name]
-                    if pstage not in pstages:
-                        continue
-                    pstage_state_dicts[pstage][param_name] = p
-                    ind += 1
-                
-                if tempdir is not None:
-                    for i in pstages:
-                        temp_name =  os.path.join(tempdir,"opt-fp32-params-" + str(i))
-                        cp_name = os.path.join(cp_dir_name,"opt-fp32-params-" + str(i))
-                        if depth > 1:
-                            temp_name += "_" + str(rank_within_stage)
-                            cp_name += "_" + str(rank_within_stage)
-                        torch.save(pstage_state_dicts[i], temp_name)
-                        mv_futures.append(executor.submit(shutil.move, temp_name, cp_name))
-                else:
-                    for i in pstages:
-                        cp_name = os.path.join(cp_dir_name,"opt-fp32-params-" + str(i))
-                        if depth > 1:
-                            cp_name += "_" + str(rank_within_stage)
-                        torch.save(pstage_state_dicts[i], cp_name)
-
-        cp_time = time.time() - cp_time
-        print("Opt ckpt time", cp_time)
-        return mv_futures
-
+        ckpt_future = write_varuna_checkpoint(self, global_store, step, 
+                                tempdir=tempdir, shard=shard)
+        
+        return ckpt_future
     
+    def to(self, device):
+        self.model.to(device)
+
+    def load_checkpoint(self, global_store, iteration, check_complete = True):
+        cp_dir_name = os.path.join(global_store, "varuna_ckpt_{}".format(iteration))
+
+        if check_complete:
+            num_parameter_instances = len(self.param_name_to_pstage)
+            params_written = num_params_written(global_store, iteration)
+            if params_written < num_parameter_instances:
+                prev_ckpt = get_prev_checkpoint(global_store, iteration)
+                with open(get_local_ckpt_tracker(self.local_rank),"w") as f:
+                    f.write(str(prev_ckpt))
+                assert False, f"CKPT NOT COMPLETE!!, only {params_written}/{num_parameter_instances} params done"
+
+        total_num_pstages = self.partitioned_model.num_cutpoints + 1
+
+        model_state_dict = load_varuna_checkpoint(self.stage, self.partitions, 
+                                                total_num_pstages,  cp_dir_name)
+
+        self.partitioned_model.module.load_state_dict(model_state_dict)
+
+        load_varuna_optimizer(self.optimizer, self.stage, self.partitions, 
+                              total_num_pstages, self.parameter_names, 
+                              cp_dir_name, device=self.device)
+        # reload master params for mixed precision
+        if self.fp16:
+            for p in amp.master_params(self.optimizer):
+                name = self.parameter_names[p]
+                if name in model_state_dict:
+                    p.data.copy_(model_state_dict[name].data)
+                    if name == "lm_head_weight":
+                        print(f"{self.stage} loading {name}")
+                        print(p)
+        with open(get_local_ckpt_tracker(self.local_rank),"w") as f:
+            # print("writing", iteration)
+            f.write(str(iteration))
+
+        self.iteration = iteration
+
     def to(self, device):
         self.model.to(device)
     
@@ -929,46 +905,3 @@ class Pipeline:
                         extra_norm_sq += torch.norm(p.grad) ** 2
                         break
         return extra_norm_sq
-
-
-def load_varuna_optimizer(optimizer, my_stage, num_stages, total_num_pstages, parameter_names, \
-                        common_store, fp16=False, pstages_to_read = None):
-    if pstages_to_read is None:
-        stages_per_worker = total_num_pstages // num_stages
-        pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
-    # reload state
-    opt_state = {}
-    for i in pstages_to_read:
-        filename = os.path.join(common_store,f"opt-state-{i}")
-        if os.path.exists(filename):
-            state_ = torch.load(filename,map_location='cpu')
-            opt_state.update(state_)
-        else:
-            shards = [os.path.join(common_store,f) for f in os.listdir(common_store) \
-                        if f.startswith(f"opt-state-{i}_")]
-            for filename in shards:
-                state_ = torch.load(filename,map_location='cpu')
-                opt_state.update(state_)
-            
-    for p in amp.master_params(optimizer):
-        name = parameter_names[p]
-        if name in opt_state:
-            optimizer.state[p] = opt_state[name]
-    # reload master params
-    if fp16:
-        saved_master_params = dict()
-        for i in pstages_to_read:
-            filename = os.path.join(common_store, "opt-fp32-params-{}".format(i))
-            if os.path.exists(filename):
-                params_ = torch.load(filename,map_location="cpu")
-                saved_master_params.update(params_)
-            else:
-                shards = [os.path.join(common_store,f) for f in os.listdir(common_store) \
-                            if f.startswith(f"opt-fp32-params-{i}_")]
-                for filename in shards:
-                    params_ = torch.load(filename,map_location="cpu")
-                    saved_master_params.update(params_)
-        for p in amp.master_params(optimizer):
-            name = parameter_names[p]
-            if name in saved_master_params:
-                p.data.copy_(saved_master_params[name].data)

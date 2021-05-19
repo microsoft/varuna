@@ -312,33 +312,11 @@ class PartitionedModel(Module):
 
         self.check_unused_parameters(dummy_inputs)
 
-    """For each partition/stage, the first rank in that stage saves state_dict 
-    of the cutpoints used by that stage to a common store. So checkpoint is sharded 
-    along cutpoints (as many checkpoint files as cutpoints)"""
-    def checkpoint(self, checkpoint_dir = "model-checkpoint"):
-        # only 1 rank per stage for data ||
-        # if self.rank != self.stage_to_rank_map[self.stage][0]:
-        #     return
-        
-        # we only want to checkpoint leaf modules (For ex. bert.embedding.weight and not bert.embeddings)
-        leaf_modules = {}
-        non_leaf_modules = {}
+    def parameter_names_to_cuts(self):
 
-        # this assumes that a non-leaf module is added after all it's descendants to the order (which is true so far)
-        for m in self.ordered_modules:
-            if (m not in leaf_modules) and (m not in non_leaf_modules):
-                leaf_modules[m] = True
-                # mark all ancestors as non-leaf
-                path = m.split(".")
-                key = path[0]
-                for i in range(1,len(path)):
-                    non_leaf_modules[key] = True
-                    key = key + "." + path[i]
-
-        modules = list(leaf_modules.keys())
+        modules = list(self.ordered_modules.keys())
 
         stage_index = 0
-        state_dict = {}
         cp_count = 0
         param_name_to_pstage = dict()
         temp_param_names = []
@@ -348,35 +326,25 @@ class PartitionedModel(Module):
             if name == "" or module is None:
                 continue
             if isinstance(module, CutPoint):
-                if len(state_dict.keys()) > 0:
-                    # torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
-                    for p in temp_param_names:
-                        param_name_to_pstage[p] = stage_index
-                    temp_param_names = []
-                    cp_count += 1
-                if cp_count >= self.cuts_per_stage:
-                    break
+                for p in temp_param_names:
+                    param_name_to_pstage[p] = stage_index
+                temp_param_names = []
+                cp_count += 1
+                # if cp_count >= self.cuts_per_stage:
+                #     break
                 stage_index += 1
-                state_dict = {}
             else:
-                module_state_dict = module.state_dict()
-                module_state_dict_ = OrderedDict()
-                for key, val in module_state_dict.items():
-                    param_name = name + "." + key
-                    module_state_dict_[param_name] = val
+                for pname,_ in module.named_parameters(recurse=False):
+                    param_name = name + "." + pname
                     temp_param_names.append(param_name)
 
-                state_dict.update(module_state_dict_)
 
         # last cutpoint
-        if len(state_dict.keys()) > 0 and (cp_count < self.cuts_per_stage):
-            state_dict["lm_head_weight"] = self.module.lm_head_weight
-            # torch.save(state_dict, os.path.join(checkpoint_dir, "cp-pstage-{}".format(str(stage_index))))
-            for p in temp_param_names:
-                param_name_to_pstage[p] = stage_index
-            # param_name_to_pstage["lm_head_weight"] = stage_index
+        # if cp_count < self.cuts_per_stage:
+        for p in temp_param_names:
+            param_name_to_pstage[p] = stage_index
+        param_name_to_pstage["lm_head_weight"] = stage_index
             
-        # print("checkpointed!!")
         return param_name_to_pstage
 
     def check_unused_parameters(self, dummy_inputs):
@@ -569,23 +537,3 @@ class PassThroughModule(Module):
 
     def forward(self,*args,**kwargs):
         return None
-
-
-def load_varuna_checkpoint(my_stage, num_stages, total_num_pstages, common_store, \
-                        prefix="cp-pstage", pstages_to_read = None):
-    state_dict = {}
-    if pstages_to_read is None:
-        stages_per_worker = total_num_pstages // num_stages
-        pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
-    for i in pstages_to_read:
-        cp_file = os.path.join(common_store, "{}-{}".format(prefix,i))
-        if os.path.exists(cp_file):
-            state_dict_ = torch.load(cp_file,map_location="cpu")
-            state_dict.update(state_dict_)
-        else:
-            shards = [os.path.join(common_store,f) for f in os.listdir(common_store) \
-                        if f.startswith(f"{prefix}-{i}_")]
-            for cp_file in shards:
-                state_dict_ = torch.load(cp_file,map_location="cpu")
-                state_dict.update(state_dict_)
-    return state_dict
