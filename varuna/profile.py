@@ -12,7 +12,10 @@ import math
 from collections import OrderedDict 
 import collections
 
-from apex import amp
+try:
+    from apex import amp
+except:
+    print("No apex")
 
 def remove_outliers(times, error_margin = 0.3):
     times = sorted(times)

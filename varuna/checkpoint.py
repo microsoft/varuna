@@ -6,10 +6,12 @@ import torch.distributed as dist
 import shutil
 from .utils import VARUNA_TEMP_FOLDER
 
-from apex import amp
-from apex.amp import _amp_state
-import amp_C, apex_C
-
+try:
+    from apex import amp
+    from apex.amp import _amp_state
+    import amp_C, apex_C
+except:
+    pass
 opt_state_format = "opt-state-{}"
 params_format = "opt-fp32-params-{}"
 MARKERS = "markers"

@@ -6,10 +6,13 @@ from torch.multiprocessing import Process
 from queue import Queue
 from threading import Thread
 import math
-from apex import amp
-from apex.amp import _amp_state
-import amp_C, apex_C
-from apex.multi_tensor_apply import multi_tensor_applier
+try:
+    from apex import amp
+    from apex.amp import _amp_state
+    import amp_C, apex_C
+    from apex.multi_tensor_apply import multi_tensor_applier
+except:
+    print("No apex!")
 import concurrent.futures
 import shutil
 
