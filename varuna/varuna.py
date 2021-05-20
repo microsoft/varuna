@@ -7,7 +7,6 @@ from queue import Queue
 from threading import Thread
 import math
 from apex import amp
-import time
 from apex.amp import _amp_state
 import amp_C, apex_C
 from apex.multi_tensor_apply import multi_tensor_applier
@@ -77,6 +76,7 @@ class Varuna(Module):
         self.stage, rank_within_stage = utils.get_this_rank_config_varuna(stage_to_rank_map, self.rank)
         self.manager_ip, self.manager_port = utils.get_heartbeat_server_info()
         self.rank_within_stage = rank_within_stage
+
         if self.stage == -1:
             raise ValueError("Rank " + str(self.rank) + " not found in stage to rank map!")
         self.data_parallel = data_depth > 1
@@ -139,8 +139,7 @@ class Varuna(Module):
             "stage_to_rank_map": self.stage_to_rank_map,
             "local_rank": self.local_rank,
             "chunk_size": chunk_size,
-            "rank_within_stage": rank_within_stage,
-            "dummy_attention_mask": dummy_inputs["attention_mask"].cpu()
+            "rank_within_stage": rank_within_stage
         }
 
         chunks = math.ceil(self.batch_size / self.micro_batch_size)
@@ -261,15 +260,6 @@ class Varuna(Module):
         if batch_size is None:
             batch_size = self.batch_size
 
-        dummy_attention_mask = self.config["dummy_attention_mask"]
-        attention_mask = inputs["attention_mask"].cpu() if self.stage in [0,self.partitions-1] \
-                            else torch.ones_like(dummy_attention_mask)
-        if self.stage > 0 and self.stage < self.partitions - 1:
-            dist.recv(attention_mask, src = self.receive_rank)
-        if self.stage < self.partitions - 2:
-            dist.send(attention_mask, dst = self.send_rank)
-        attention_mask = attention_mask.to(self.device)
-
         def send(x, grads=False):
             dist.send(x.cpu(), self.send_rank)
         def recv(grads=False):
@@ -287,17 +277,14 @@ class Varuna(Module):
         with torch.no_grad():
             avg_output = None
             for mb in batches[:-1]:
-                mb["attention_mask"] = attention_mask
                 output = self.partitioned_model(mb, handle_comm=False)
                 avg_output = output if avg_output is None else avg_output + output
             mb = batches[-1]
-            mb["attention_mask"] = attention_mask
             def recv(grads=False):
                 x_shape = list(self.fwd_inp_shape)
                 if self.last_chunk_size > 0:
                     x_shape[0] = self.last_chunk_size
                 x = torch.zeros(x_shape, dtype=torch.float16 if self.fp16 else torch.float32)
-                # print("last receiving from rank", self.receive_rank, x_shape)
                 dist.recv(x, self.receive_rank)
                 return x.to(self.device)
             if self.partitioned_model.pre_cp is not None:
@@ -361,6 +348,11 @@ class Varuna(Module):
 
     def zero_grad(self):
         self.model.zero_grad()
+        if self.fp16:
+            for param in self.optimizer._amp_stash.all_fp32_from_fp16_params:
+                param.grad = None
+        for param in self.model.parameters():
+            param.grad = None
     
     """ Writes a varuna checkpoint with model parameters, optimizer state etc. 
         Each checkpoint is a directory, written under the given path.
@@ -413,19 +405,14 @@ class Varuna(Module):
                 name = self.parameter_names[p]
                 if name in model_state_dict:
                     p.data.copy_(model_state_dict[name].data)
-                    if name == "lm_head_weight":
-                        print(f"{self.stage} loading {name}")
-                        print(p)
+
         with open(get_local_ckpt_tracker(self.local_rank),"w") as f:
             # print("writing", iteration)
             f.write(str(iteration))
 
         self.iteration = iteration
 
-    def to(self, device):
-        self.model.to(device)
     
-
 class Pipeline:
     """ Pipeline parallelism for Varuna """
 
@@ -461,7 +448,7 @@ class Pipeline:
 
         self.recompute_queue = Queue()
 
-        self.back_start_times = Queue()
+        # self.back_start_times = Queue()
 
         # communication queues
         self.partitioned_model.set_queues(self.acts_send_queue, self.grads_send_queue,
@@ -471,15 +458,6 @@ class Pipeline:
         self.loss = None
         self.average_loss = 0
 
-        self.dummy_attention_mask = config["dummy_attention_mask"]
-        self.attention_mask = batches[0]["attention_mask"].cpu() if self.stage in [0,self.partitions-1] \
-                            else torch.ones_like(self.dummy_attention_mask)
-        if self.stage > 0 and self.stage < self.partitions - 1:
-            dist.recv(self.attention_mask, src = self.receive_rank)
-        if self.stage < self.partitions - 2:
-            dist.send(self.attention_mask, dst = self.send_rank)
-        self.attention_mask = self.attention_mask.to(self.device)
-        
         self.pre_fwd_events = []
         self.post_fwd_events = []
         self.avg_fwd_time = 0
@@ -490,7 +468,7 @@ class Pipeline:
         self.stage = config["stage"]
         self.data_depth = config["data_depth"]
 
-        self.process_group = config["dp_process_group"]
+        self.dp_group = config["dp_process_group"]
         self.pipeline_group = config["pipeline_process_group"]
         self.tied_group = config["tied_group"]
         self.rank_within_stage = config["rank_within_stage"]
@@ -642,38 +620,28 @@ class Pipeline:
 
     def worker(self, task, grad_mode, inputs_as_dict):
         """ Main body of worker loop """
+        # forward
         if task == 0:
             torch.set_grad_enabled(grad_mode)
-            task_time_start = time.time()
             pre_fwd = torch.cuda.Event(enable_timing=True)
             post_fwd = torch.cuda.Event(enable_timing=True)
             pre_fwd.record()
-            inputs_as_dict["attention_mask"] = self.attention_mask
             output = self.model(inputs_as_dict, save_ctx=not grad_mode, handle_comm=True)
             post_fwd.record()
             self.pre_fwd_events.append(pre_fwd)
             self.post_fwd_events.append(post_fwd)
-            if self.make_logfile:
-                torch.cuda.synchronize(self.device)
-                task_time = time.time() - task_time_start
-                self.logfile.write("{} {} {} {}\n".format(TASK[0], 0, str(task_time_start), str(task_time)))
 
             if grad_mode == True:
                 # save loss and input activations for the backward pass to use
                 self.loss = output[0] if isinstance(output,tuple) else output
 
+        # recompute
         elif task == 1:
             torch.set_grad_enabled(True)
-            task_time_start = time.time()
-            inputs_as_dict["attention_mask"] = self.attention_mask
             output = self.model(inputs_as_dict, recompute=True, handle_comm=True)
-            if self.make_logfile:
-                torch.cuda.synchronize(self.device)
-                task_time = time.time() - task_time_start
-                self.logfile.write("{} {} {} {}\n".format(TASK[1], 0, str(task_time_start), str(task_time)))
-
             self.loss = output[0] if isinstance(output,tuple) else output
         
+        # backward
         else:
             grads = torch.ones(self.loss.size(), dtype = torch.float32).to(self.device)
 
@@ -684,15 +652,9 @@ class Pipeline:
                 self.average_loss += (self.loss.item()/chunks)
 
             if self.fp16:
-                task_time_start = time.time()
                 with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=True, 
                             last_partition=(self.stage == self.partitions-1)) as scaled_loss:
                     scaled_loss.backward(grads)
-                if self.make_logfile:
-                    torch.cuda.synchronize(self.device)
-                    task_time = time.time() - task_time_start
-                    self.logfile.write("{} {} {} {}\n".format(TASK[2], 0, str(task_time_start), str(task_time)))
-
             else:
                 self.loss.backward(grads)
 
@@ -702,11 +664,10 @@ class Pipeline:
     def run(self):
         if log_verbose:
             print(f'{self.rank} {self.rank_within_stage} starting pipeline')        
-        self.spawn_receive_workers()
 
+        self.spawn_receive_workers()
         batchstart = time.time()
 
-        # dynamic schedule - run forward if gradients for backward are not ready yet
         schedule = [s for s in enumerate(self.schedule)]
         i=0
         count_fwd = 0
@@ -714,6 +675,7 @@ class Pipeline:
         while (i<len(schedule)):
             grad_mode = False
             index, task = schedule[i]
+            # dynamic schedule - run forward if gradients for backward are not ready yet
             if self.opportunistic and (task[0]==1 and count_fwd<len(self.batches) and self.grads_queue.empty()):
             # if (task[0]==1 and count_fwd<len(self.batches) and not self.acts_queue.empty()):
                 j=i
@@ -734,7 +696,7 @@ class Pipeline:
             self.worker(task[0], grad_mode, self.batches[task[1]])
 
             i+=1
-        
+
         torch.cuda.synchronize(self.device)
         if len(self.pre_fwd_events) > 0:
             avg_fwd_time = 0.0
@@ -745,7 +707,7 @@ class Pipeline:
             avg_fwd_time = avg_fwd_time / len(self.pre_fwd_events)
             self.avg_fwd_time = avg_fwd_time
 
-        dist.barrier()
+        dist.barrier()    
 
         if log_verbose:
             print(f'{self.stage} {self.rank_within_stage} going to share embedding grads')
@@ -764,7 +726,7 @@ class Pipeline:
 
         overflow = False
         global_grad_norm = -1
-        if self.fp16 or self.data_parallel:
+        if (self.partitions > 1) or self.data_parallel:
             self.status = "all_reduce"
             sync_start_time = time.time()
             if log_verbose:
@@ -773,21 +735,22 @@ class Pipeline:
             if self.make_logfile:
                 torch.cuda.synchronize(self.device)
                 sync_time =  time.time() - sync_start_time
-                self.logfile.write("all-reduce {} {} {}\n".format(0, sync_start_time, sync_time))
+                self.logfile.write("all-reduce {} {} {}".format(0, sync_start_time, sync_time))
         
         if log_verbose:
             print(f'{self.rank} {self.rank_within_stage} all-reduce done; should optimize if grads did not overflow')
+
+        self.close_comm_threads()
 
         batchtime = time.time()-batchstart
         if self.make_logfile:
             self.logfile.write("\n\nBATCH END {} {}\n\n".format(batchstart, batchtime))
             self.logfile.close()        
 
-        self.close_comm_threads()
-
         self.status = "done"
 
         return self.average_loss, overflow, global_grad_norm, self.avg_fwd_time
+
 
     def all_reduce_opt_grads(self):
         allred_init_start = time.time()
@@ -819,7 +782,7 @@ class Pipeline:
 
         if self.data_parallel:
             allred_time_start = time.time()
-            torch.distributed.all_reduce(flat_raw, group=self.process_group)
+            torch.distributed.all_reduce(flat_raw, group=self.dp_group)
             if self.make_logfile:
                 torch.cuda.synchronize(self.device)
                 x = flat_raw[0] + 0

@@ -127,14 +127,14 @@ def forward_step(data_iterator, model):
 def varuna_step(data_iterator, model):
     timers = get_timers()
 
-    if model.stage in [0, model.partitions-1]:
+    # if model.stage in [0, model.partitions-1]:
         # Get the batch.
-        timers('batch generator').start()
-        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-            data_iterator)
-        timers('batch generator').stop()
-    else:
-        tokens, position_ids, loss_mask, labels, attention_mask = [None for _ in range(5)]
+    timers('batch generator').start()
+    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
+        data_iterator)
+    timers('batch generator').stop()
+    # else:
+    #     tokens, position_ids, loss_mask, labels, attention_mask = [None for _ in range(5)]
     
     # Pipeline model.
     inputs = dict({
@@ -171,8 +171,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         train_valid_test_num_samples=train_val_test_num_samples,
         seq_length=args.seq_length,
         seed=args.seed,
-        skip_warmup=(not args.mmap_warmup),
-        skip_building=(args.varuna and args.stage not in [0, args.partitions-1]))
+        skip_warmup=(not args.mmap_warmup))
+        # skip_building=(args.varuna and args.stage not in [0, args.partitions-1]))
     print_rank_0("> finished creating GPT2 datasets ...")
 
     return train_ds, valid_ds, test_ds

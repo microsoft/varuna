@@ -373,12 +373,8 @@ def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler,
     if not overflow:
         optimizer.step(global_grad_norm=global_grad_norm)
     else:
-        for param in optimizer._amp_stash.all_fp32_from_fp16_params:
-            param.grad = None
+        model.zero_grad()
     timers('optimizer').stop()
-
-    for param in model.parameters():
-        param.grad = None
 
     # Update learning rate.
     skipped_iter = 0
@@ -699,16 +695,16 @@ def build_train_valid_test_data_iterators(
             train_val_test_num_samples)
 
         # Build dataloders.   
-        if not args.varuna or args.stage in [0, args.partitions-1]:
-            dry_run_input = train_ds[0]
-            train_dataloader = make_data_loader(train_ds)
-            valid_dataloader = make_data_loader(valid_ds)
-            test_dataloader = make_data_loader(test_ds)
-        else:
-            dry_run_input = torch.load("/home/rahul/gpt2-blob/turing-dry-run-input")
-            train_dataloader = [None, None, None, None]
-            valid_dataloader = [None, None, None, None]
-            test_dataloader = [None, None, None, None]
+        # if not args.varuna or args.stage in [0, args.partitions-1]:
+        dry_run_input = train_ds[0]
+        train_dataloader = make_data_loader(train_ds)
+        valid_dataloader = make_data_loader(valid_ds)
+        test_dataloader = make_data_loader(test_ds)
+        # else:
+        #     dry_run_input = torch.load("/home/rahul/gpt2-blob/turing-dry-run-input")
+        #     train_dataloader = [None, None, None, None]
+        #     valid_dataloader = [None, None, None, None]
+            # test_dataloader = [None, None, None, None]
 
         # Flags to know if we need to do training/validation/testing.
         do_train = train_dataloader is not None and args.train_iters > 0
