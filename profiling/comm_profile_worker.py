@@ -14,8 +14,8 @@ local_rank = int(sys.argv[3])
 print("Rank",rank)
 print("World size", world_size,flush=True)
 
-prev_size = torch.Size([1,1024,1920])
-next_size = torch.Size([1,1024,1920])
+prev_size = torch.Size([1,1024,3072])
+next_size = torch.Size([1,1024,3072])
 
 batch_size = 512
 microBSs = range(1,20)
@@ -81,7 +81,7 @@ def sender(send_rank, mBS, send_times):
         send_times.append(time.time() - start_time)
 
 
-out_file = "/home/rahul/gpt2-blob/single_gpu_perf/send_times_clstrd_new_{}".format(rank)
+out_file = "/home/varuna/gpt2-blob/perf_analysis_8.3b/send_times_clstrd_new_{}".format(rank)
 out_file = open(out_file,"w")
 out_file.write("mBS, acts send time, acts recv time, grads send time, grads recv time\n")
 

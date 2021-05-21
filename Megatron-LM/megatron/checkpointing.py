@@ -169,6 +169,8 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, \
                         os.system("rm -rf {} &".format(os.path.join(args.save,'iter_{:07d}'.format(it))))
                     except Exception as e:
                         print("Error while removing checkpoint {}: {}".format(it,str(e)))
+            rm_time = time.time() - rm_time
+            print("rm time", rm_time)
         print('  successfully saved {}'.format(checkpoint_name))
 
     torch.distributed.barrier()
@@ -319,3 +321,22 @@ def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
     print('  successfully loaded {}'.format(checkpoint_name))
 
     return iteration
+
+def future_on_futures(local_rank, iteration):
+    global mv_futures
+    done, notdone = concurrent.futures.wait(mv_futures)
+    print("{} futures done!".format(len(done)))
+    error = False
+    if len(notdone) > 0:
+        print("{} ckpts not moved\n".format(notdone))
+        error = True
+    for future in done:
+        try:
+            data = future.result()
+        except Exception as exc:
+            print('future generated an exception: %s' % ( exc))
+            error = True
+    if not error and local_rank == 0:
+        with open("/home/varuna/local_ckpt_tracker.txt","w") as f:
+            f.write(str(iteration))
+    mv_futures = None

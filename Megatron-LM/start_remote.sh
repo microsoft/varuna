@@ -17,7 +17,7 @@ echo "master_addr: $master_addr"
 
 cd /home/varuna/t-saathl/Varuna/Megatron-LM/
 mkdir -p ssh_logs
-mkdir -p accumulated_logs
+# mkdir -p accumulated_logs
 
 i=0
 while [ $i -lt ${#reachable_machines[@]} ]

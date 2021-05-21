@@ -1,9 +1,8 @@
 #include "simulate-varuna.h"
 
-#define DEBUG
+// #define DEBUG
 
 int MAX_NETWORK = 4;
-bool OPPORTUNISTIC = false;
 
 static inline Queue* QueueReady(Queue* q, int64 now) {
   if (!q->q.empty() && q->front().time <= now) return q;
@@ -58,11 +57,9 @@ Queue* Stage::PickNextComputeQueue(int64 now) {
   if(curr_task_ind >= schedule.size()) return NULL;
 
   schedule_task t = schedule[curr_task_ind];
-  // printf("%d next task is (%c, %d): ", stage_num_,t.task, t.index);
 
   // swap 
-  if(!pd_1f1b && !gpipe && t.task == '1' && 
-      !QueueReady(rc_,now) && (last_fwd_mb_<num_micro_-1)){
+  if(!gpipe && t.task == '1' && !QueueReady(rc_,now) && (last_fwd_mb_<num_micro_-1)){
     for(int i=curr_task_ind+1; i<schedule.size(); i++){
       if(schedule[i].task=='0'){
         schedule.insert(schedule.begin() + curr_task_ind, schedule[i]);
@@ -76,8 +73,7 @@ Queue* Stage::PickNextComputeQueue(int64 now) {
 
   if (t.task == '2' && (q = QueueReady(bwd_, now)) && 
       q->front().micro_batch == t.index && 
-      (pd_1f1b || stage_num_==depth_-1 || recomputed_mb_ == t.index)){
-        // printf("\n");
+      (stage_num_==depth_-1 || recomputed_mb_ == t.index)){
       curr_task_ind++;
       return q;
   }
@@ -88,17 +84,11 @@ Queue* Stage::PickNextComputeQueue(int64 now) {
         return q;
   }
   // Service fwd queue only if no recomputed activations are in flight.
-  if (t.task == '0'){
-    q = QueueReady(fwd_, now);
-    if((pd_1f1b || recomputed_mb_ < 0) && 
-      q && (q->front().micro_batch == t.index)){
+  if (t.task == '0' && (recomputed_mb_ < 0) && 
+      (q = QueueReady(fwd_, now)) && (q->front().micro_batch == t.index)){
       last_fwd_mb_++;
-      curr_task_ind++;
-      // printf("ready\n");   
+      curr_task_ind++;   
       return q;
-    }else{
-      // printf("notready %d %d\n", recomputed_mb_, q ? q->front().micro_batch : -1 );
-    }
   }
   return NULL;
 }
@@ -151,11 +141,10 @@ int Stage::ProcessEvent(Simulator* sim, Event e, int64 now) {
       break;
     case Event::FWD_DONE:
       // Figure out next compute work to schedule.
-      if(!pd_1f1b) gpu_busy_ = false;
+      gpu_busy_ = false;
       if (stage_num_ != depth_ - 1) {
         sendact_->push_back(QueueEntry(e.mb_num, now));
       } else if (!gpipe) {
-        gpu_busy_ = false;
         bwd_->insert(QueueEntry(e.mb_num, now)); 
       } else if(e.mb_num == num_micro_-1){
         rc_->push_back(QueueEntry(e.mb_num, now));
@@ -173,12 +162,10 @@ int Stage::ProcessEvent(Simulator* sim, Event e, int64 now) {
       break;
     case Event::BWD_DONE:
       // Figure out next compute work to schedule.
-      if(!pd_1f1b) gpu_busy_ = false;
+      gpu_busy_ = false;
       recomputed_mb_ = -1;
       if (stage_num_ > 0) {
         sendgrad_->push_back(QueueEntry(e.mb_num, now));
-      }else{
-        gpu_busy_ = false;
       }
       if (stage_num_ == depth_ - 1 && gpipe && e.mb_num > 0)
         rc_->push_back(QueueEntry(e.mb_num-1, now));
@@ -215,7 +202,6 @@ int Stage::ProcessEvent(Simulator* sim, Event e, int64 now) {
     case Event::SENDACT_DONE:
     case Event::SENDGRAD_DONE:
       network_busy_--;
-      gpu_busy_ = false;
       break;
     case Event::SENDGRAD_START:
       network_busy_++;
@@ -235,11 +221,6 @@ int Stage::ProcessEvent(Simulator* sim, Event e, int64 now) {
     case Event::RECV_GRAD:
       // recvgrad_->insert(QueueEntry(e.mb_num, now));
       // grads_left--;
-      if(pd_1f1b){
-        // recomputed_mb_ = e.mb_num;          
-        // printf("%d recvd grad %d",stage_num_, e.mb_num);
-        bwd_->insert(QueueEntry(e.mb_num, now));
-      }
       if(!gpipe){
         rc_->insert(QueueEntry(
           rc_->q.empty() ? last_rec_mb_ + 1: rc_->q.back().micro_batch+1, now));
@@ -327,7 +308,7 @@ void Simulator::Simulate() {
     printf("Event time: %lld  Stage: %d MB: - state: ALL_REDUCE\n",clock_now_micros_, i);
   }
   #endif
-  printf("End of simulation:  Mini-batch time in usec = %lld\n", clock_now_micros_ + allreduce_time_);
+  printf("End of simulation:  Mini-batch time = %lld usec\n", clock_now_micros_ + allreduce_time_);
   printf("Min send: %d, max send %d\n", MIN_SEND, MAX_SEND);
   printf("Min long send: %d, max long send %d\n", MIN_LONG_SEND, MAX_LONG_SEND);
   printf("Min fwd: %d, max fwd %d; min bwd %d, max bwd %d\n", MIN_FWD, MAX_FWD, MIN_BWD, MAX_BWD);

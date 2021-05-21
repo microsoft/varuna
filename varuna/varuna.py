@@ -470,7 +470,6 @@ class Pipeline:
         self.partitions = config["partitions"]
         self.stage = config["stage"]
         self.data_depth = config["data_depth"]
-
         self.dp_group = config["dp_process_group"]
         self.pipeline_group = config["pipeline_process_group"]
         self.tied_group = config["tied_group"]
@@ -527,6 +526,7 @@ class Pipeline:
         chunks = len(self.batches)
         dtype = torch.float16 if self.fp16 else torch.float32
         recv_handles = Queue()
+        recvd = 0
 
         for task,index in self.schedule:
             if task == 0:
@@ -534,6 +534,7 @@ class Pipeline:
                 if index == (chunks-1) and self.last_chunk_size > 0:
                     fwd_inp_shape = list(self.fwd_inp_shape)
                     fwd_inp_shape[0] = self.last_chunk_size
+                # print(f"{self.rank} recieving acts {fwd_inp_shape} from {self.receive_rank}\n",end="")
                 acts_tensor = torch.ones(fwd_inp_shape, dtype=dtype)
                 handle = dist.irecv(acts_tensor, src=self.receive_rank)
                 recv_handles.put((handle, acts_tensor))
@@ -558,6 +559,7 @@ class Pipeline:
                 if index == (chunks-1) and self.last_chunk_size > 0:
                     bwd_grad_shape = list(self.bwd_grad_shape)
                     bwd_grad_shape[0] = self.last_chunk_size
+                # print(f"{self.rank} recieving grads {bwd_grad_shape} from {self.send_rank}\n",end="")
                 grads_tensor = torch.ones(bwd_grad_shape, dtype=dtype)
                 handle = dist.irecv(grads_tensor, src=self.send_rank)
                 recv_handles.put((handle, grads_tensor))
@@ -585,6 +587,7 @@ class Pipeline:
             if send_handles.qsize()>4:
                 handle = send_handles.get()
                 handle.wait()
+                sent += 1
             count -= 1
         while not send_handles.empty():
             handle = send_handles.get()
@@ -697,7 +700,7 @@ class Pipeline:
             if log_verbose:
                 print(f'{self.stage} {self.rank_within_stage} task:{task[0]} {task[1]}/{len(self.batches)}\n', end="")
             self.worker(task[0], grad_mode, self.batches[task[1]])
-
+            
             i+=1
 
         torch.cuda.synchronize(self.device)
@@ -826,7 +829,6 @@ class Pipeline:
         local_grad_norm = multi_tensor_applier(amp_C.multi_tensor_l2norm,
                                              torch.cuda.IntTensor([0]),
                                              [master_grads], False)[0]
-
         local_grad_norm_sq = (local_grad_norm ** 2) - self.extra_grad_norm_sq()
 
         if self.partitions > 1:

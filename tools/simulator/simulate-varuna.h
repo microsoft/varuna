@@ -124,7 +124,6 @@ public:
   int ProcessEvent(Simulator* sim, Event event, int64 now);
   void ServiceQueues(Simulator* sim, int64 now);
   bool isDone(){
-    // printf("stage %d is at task %d. ",stage_num_,curr_task_ind);
     return curr_task_ind >= schedule.size();
   }
   void MoveQueues(){

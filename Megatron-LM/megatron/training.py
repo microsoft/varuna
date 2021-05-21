@@ -50,6 +50,8 @@ from varuna import Varuna, PartitionedModel
 from apex import amp
 from apex.amp import _amp_state
 
+import socket
+
 accumulated_loss = 0
 MODEL = None
 OPTIMIZER = None

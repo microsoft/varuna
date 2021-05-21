@@ -149,7 +149,7 @@ void GenSchedule::Generate(std::vector<schedule_task> sched[]) {
       all_queues_empty = false;
       queue_ids.push_back(identifier);
       queue->pop_front();
-      // printf("%d %c %d; ", i,identifier, mini);
+      // printf("%2d%c ", mini, identifier);
       if (identifier!='3') {
         schedule_task a = {mini-1, identifier};
         sched[i].push_back(a);
@@ -211,7 +211,6 @@ void GenSchedule::Generate(std::vector<schedule_task> sched[]) {
            break;
       }
     }
-    // printf("\n");
   }
   
   // for (int i=0; i<pipeline_depth_; ++i) {

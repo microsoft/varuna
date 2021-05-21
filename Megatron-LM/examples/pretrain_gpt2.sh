@@ -1,6 +1,8 @@
 #! /bin/bash
 #export PATH="/home/varuna/anaconda3/bin:$PATH"
-#which conda
+
+RANK=0
+WORLD_SIZE=2
 
 NNODES=$1
 NODE_RANK=$2
@@ -13,13 +15,12 @@ date
 ifconfig eth0 | awk '/inet / {gsub("addr:", "", $2); print $2}'
 user="rahul"
 
-DATA_PATH=/home/$user/gpt2-blob/turing/megatron
-CHECKPOINT_PATH=/home/$user/gpt2-blob/mega_2_5b_4.8e-3_clipgrads
+DATA_PATH=/home/varuna/gpt2-blob/turing/megatron
+CHECKPOINT_PATH=/home/varuna/gpt2-blob/mega_2_5b_4.8e-3_clipgrads
 
-export PATH="/home/$user/anaconda3/bin:$PATH"
 NCCL_DEBUG=INFO NCCL_SOCKET_IFNAME=eth0 NCCL_SOCKET_NTHREADS=4 NCCL_NSOCKS_PERTHREAD=4 \
-python run_varuna.py --batch_size 8192 --total_num_stages 50 \
-       --ngpus_per_server $GPUS_PER_SERVER --nservers $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR pretrain_gpt2.py \
+python3 run_varuna.py --nstages 9 --batch_size 8192 --chunk_size 4 --total_num_stages 54 \
+       --ngpus_per_server 4 --nservers $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR pretrain_gpt2.py \
        --num-layers 54 \
        --hidden-size 1920 \
        --num-attention-heads 20 \
@@ -42,20 +43,12 @@ python run_varuna.py --batch_size 8192 --total_num_stages 50 \
        --clip-grad 1.0 \
        --warmup .05 \
        --log-interval 1 \
-       --save-interval 900 \
+       --save-interval 15 \
        --max-num-ckpts 10 \
-       --min-ckpt-iter-to-remove 9100 \
        --load-iteration $ckpt \
        --eval-interval 100 \
        --eval-iters 10 \
        --loss-file varuna_2_5b_8192_lr_0.0048_clipgrads \
-       --fp16 --varuna 
-
-blobmounted=$(ls /home/$user/gpt2-blob/turing-dry-run-input)
-
-if [ $? != 0 ]
-then
-    sudo blobfuse /home/rahul/gpt2-blob --tmp-path=/mnt/ramkdisk/blobfusetmp --config-file=/home/rahul/fuse_connection2.cfg -o allow_other
-fi
+       --fp16 --varuna
 # num params = 20,753,384,400
 set +x

@@ -308,7 +308,7 @@ class TransformerLanguageModel(MegatronModule):
         # Embeddings.
         embedding_output = self.embedding(input_ids, position_ids,
                                           tokentype_ids=tokentype_ids)
-        # embedding_output = self.cutpoints[0](embedding_output)
+        embedding_output = self.cutpoints[0](embedding_output)
 
         # Transformer.
         transformer_output = self.transformer(embedding_output,

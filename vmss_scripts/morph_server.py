@@ -98,6 +98,7 @@ class Handler(socketserver.BaseRequestHandler):
             except Exception as e:
                 print("Caught Exception while starting", e)
             Handler.triggermorph.release()
+            print("Lock released by start:", is_restarting, is_morphing, is_preempting)
         
         if 'already running' in data:
             Handler.triggermorph.acquire()
@@ -135,6 +136,7 @@ class Handler(socketserver.BaseRequestHandler):
                 print("Caught exception while preempting:", e,flush=True)
                 is_preempting = False
             Handler.triggermorph.release()
+            print("Lock released by preempt:", is_restarting, is_morphing, is_preempting)
         
         elif 'checkpoint done' in data:
             Handler.triggermorph.acquire()

@@ -4,6 +4,7 @@ from datetime import datetime
 import sys
 import traceback
 
+cluster = sys.argv[1]
 resource_group = "Varuna"
 subscription = "f3ebbda2-3d0f-468d-8e23-31a0796dcac1"
 cluster = "single_gpu_spots"
@@ -31,6 +32,8 @@ def remove_dead(ip_list, slow_machines):
 
     remove_ids = []
     for ip in ip_list:
+        if ip not in id_map:
+            continue
         cmd = status_cmd.format(cluster, resource_group, subscription, id_map[ip])
         status = os.popen(cmd).read()
         if ("running" in status or "updating" in status) \
@@ -38,10 +41,11 @@ def remove_dead(ip_list, slow_machines):
             continue
         remove_ids.append(id_map[ip])
 
-    print("removing: ", remove_ids)
-    concat_ids = " ".join([ str(i) for i in remove_ids])
-    response = os.system( delete_cmd.format(resource_group, subscription, cluster, concat_ids) )
-    return response == 0
+    if len(remove_ids) > 0:
+        print("removing: ", remove_ids)
+        concat_ids = " ".join([ str(i) for i in remove_ids])
+        response = os.system( delete_cmd.format(resource_group, subscription, cluster, concat_ids) )
+        return response == 0
 
 def get_available_machines():
     # gets reachable machines

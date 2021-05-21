@@ -13,6 +13,10 @@ gantt_logs/
 args
 ssh_err*
 morph.*
+*.out
+*.err
+*.csv
+print_stats.py
 poll.*
 profiles/
 Megatron-LM/logs/*
@@ -27,6 +31,8 @@ varuna/versions
 *__pycache__/
 *.py[cod]
 *$py.class
+profiles/
+profiling/analyse*
 
 # C extensions
 *.so

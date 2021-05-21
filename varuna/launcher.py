@@ -17,6 +17,8 @@ processes = []
 def calculate_config(args):
     # world size in terms of number of processes
     gpus_available = args.ngpus_per_server * args.nservers
+    if args.nstages is None:
+        args.nstages, args.chunk_size = num_partitions(gpus_available, args.ngpus_per_server, args.batch_size)
     gpus_per_stage = (gpus_available // args.nstages) if args.gpus_per_stage == 0 else args.gpus_per_stage
     # args.gpus_per_stage = gpus_per_stage
     print(gpus_per_stage, "per stage")
@@ -24,15 +26,7 @@ def calculate_config(args):
     assert dist_world_size <= gpus_available, "Too many gpus_per_stage - {}!".format(gpus_per_stage)
 
     # some servers unused
-    if args.custom_placement:
-        servers_for_embeddings = math.ceil(gpus_per_stage / float(args.ngpus_per_server))
-        other_servers = math.ceil((dist_world_size - gpus_per_stage) / float(args.ngpus_per_server))
-        num_servers = other_servers + servers_for_embeddings
-        if num_servers > args.nservers:
-            raise RuntimeError("Not enough servers for cutom placement")
-        args.nservers = num_servers
-    else:
-        args.nservers = math.ceil(dist_world_size / float(args.ngpus_per_server))
+    args.nservers = math.ceil(dist_world_size / float(args.ngpus_per_server))
 
     print(args.nservers, "servers!")
     if args.node_rank >= args.nservers:
@@ -65,35 +59,9 @@ def calculate_config(args):
     per_gpu_batch_size = args.batch_size // gpus_per_stage
     total_batch_size = per_gpu_batch_size * gpus_per_stage     
 
-    if args.custom_placement:
-        last_unused_gpus = 0
-        if ((dist_world_size - gpus_per_stage) % args.ngpus_per_server) != 0:
-            last_unused_gpus = args.ngpus_per_server - ((dist_world_size - gpus_per_stage) % args.ngpus_per_server)
-
-        last_embedding_node_rank = math.ceil(gpus_per_stage / args.ngpus_per_server) - 1
-        # unused_gpus = (args.nservers - last_embedding_node_rank - 1) * args.ngpus_per_server
-        if args.node_rank == last_embedding_node_rank:
-            first_rank_in_server = args.node_rank * args.ngpus_per_server
-            ranks_in_server = range(first_rank_in_server, gpus_per_stage)
-        elif args.node_rank < last_embedding_node_rank:
-            first_rank_in_server = args.node_rank * args.ngpus_per_server
-            ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
-        elif args.node_rank < (args.nservers - 1):
-            first_rank_in_server = (args.node_rank * args.ngpus_per_server) - (args.ngpus_per_server - gpus_per_stage % args.ngpus_per_server)
-            ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
-        else:
-            first_rank_in_server = (args.node_rank * args.ngpus_per_server) - (args.ngpus_per_server - gpus_per_stage % args.ngpus_per_server)
-            ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server - last_unused_gpus)
-    
-    else:
-        last_unused_gpus = 0
-        if (dist_world_size % args.ngpus_per_server) != 0:
-            last_unused_gpus = args.ngpus_per_server - (dist_world_size % args.ngpus_per_server)
-        
-        first_rank_in_server = args.node_rank * args.ngpus_per_server
-        ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server)
-        if args.node_rank == args.nservers - 1:
-            ranks_in_server = range(first_rank_in_server, first_rank_in_server + args.ngpus_per_server - last_unused_gpus)
+    last_unused_gpus = 0
+    if (dist_world_size % args.ngpus_per_server) != 0:
+        last_unused_gpus = args.ngpus_per_server - (dist_world_size % args.ngpus_per_server)
     
     stage_to_rank_map_str = ""
     for stage in stage_to_rank_map:
@@ -189,6 +157,39 @@ def parse_args():
         
 
 if __name__ == "__main__":
+    args = parse_args()
+
+    if os.path.exists("parent_process"):
+        print("path exists")
+        with open("parent_process","r") as f:
+            pid = int(f.read())
+        print("PID: ",pid)
+        already_running = True
+        try:
+            os.kill(pid, 0)
+            print("process exists")
+        except OSError as e:
+            print("os error:",e)
+            already_running = False
+        if already_running:
+            print("Varuna is already running!")
+            if args.node_rank == 0:
+                try:
+                    with open('nservers', 'r') as f:
+                        nservers = int(f.read())
+                    with open('ngpus', 'r') as f:
+                        ngpus = int(f.read())
+                    world_size = ngpus * nservers
+                except:
+                    world_size = 1
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                        message = "already running job of size {}".format(world_size)
+                        sock.connect((manager_ip, manager_port))
+                        sock.sendall(bytes(message, 'ascii'))
+                except:
+                    print("Could not send already_running message")
+            exit()
 
     print("Parent process ID:",os.getpid())
 
@@ -232,6 +233,7 @@ if __name__ == "__main__":
             "please further tune the variable for optimal performance in "
             "your application as needed. \n"
             "*****************************************".format(current_env["OMP_NUM_THREADS"]))
+    # torch.set_num_threads(24)
 
     while True:
         processes = []
@@ -262,6 +264,8 @@ if __name__ == "__main__":
             local_rank = rank % args.ngpus_per_server
             rank = alias_ranks[rank]            
 
+            rank = alias_ranks[rank]            
+
             # each process's rank
             current_env["RANK"] = str(rank)
             current_env["LOCAL_RANK"] = str(local_rank)
@@ -273,7 +277,7 @@ if __name__ == "__main__":
             per_process_batch_size = total_batch_size // gpus_per_stage
 
             cmd.append("--rank={}".format(str(rank)))
-            cmd.append("--partitions={}".format(str(args.nstages)))
+            # cmd.append("--partitions={}".format(str(args.nstages)))
             cmd.append("--chunk_size={}".format(str(args.chunk_size)))
             cmd.append("--local_rank={}".format(str(local_rank)))
             cmd.append("--stage_to_rank_map={}".format(stage_to_rank_map_str))

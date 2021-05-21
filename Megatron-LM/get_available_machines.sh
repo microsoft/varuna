@@ -7,7 +7,7 @@ group=${6:-"Varuna"}
 user="rahul"
 
 machines=($(az vmss nic list --vmss-name $cluster --subscription $subscription --resource-group $group --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
-machines+=($(az vmss nic list --vmss-name single_gpu_spots --subscription $subscription --resource-group $group --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
+# machines+=($(az vmss nic list --vmss-name single_gpu_spots --subscription $subscription --resource-group $group --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
 scaling=$(ps aux | grep scale_cluster| grep -v grep| wc -l)
 if [[ $scaling != 0 ]] && [[ $ignore_scaling == 0 ]]
 then
