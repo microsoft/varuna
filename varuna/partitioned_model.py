@@ -100,10 +100,6 @@ class PartitionedModel(Module):
         self.local_rank = local_rank
         self.fp16 = fp16
         self.shared_weights = shared_weights
-
-        
-        self.grads_send_queue = self.acts_send_queue = None
-        self.acts_queue = self.grads_queue = None
         
         
         self.grads_send_queue = self.acts_send_queue = None
@@ -147,7 +143,7 @@ class PartitionedModel(Module):
         if self.local_rank == 0 and not (from_cache and os.path.exists("_tmp_ord_mod") and os.path.exists("_tmp_inp_shapes")):
             # store input shapes for each module (or atleast each cp)
             print("Initializing partitioned model!")
-  
+
             def get_hook(name):
                 def add_module_hook(module, inputs, _output):
                     self.ordered_modules[name] = module
@@ -192,6 +188,7 @@ class PartitionedModel(Module):
                 self.module(**dummy_inputs)
             sys.settrace(None)
             self.track_cp = None
+
             for name in self.ordered_modules:
                 m = self.ordered_modules[name]
                 if isinstance(m, CutPoint):
@@ -250,10 +247,6 @@ class PartitionedModel(Module):
             with open("_tmp_pstage_mapping", 'rb') as f:
                 self.param_name_to_pstage = pickle.load(f)
             self.num_cutpoints = len(self.input_shapes)
-        
-        # if self.local_rank == 0:
-        #     for name in self.param_name_to_pstage:
-        #         print(f"{name} {self.param_name_to_pstage[name]}\n", end = "")
     
         # if self.local_rank == 0:
         #     for name in self.param_name_to_pstage:
@@ -391,12 +384,11 @@ class PartitionedModel(Module):
         stage_index = 0
         cp_count = 0
         param_name_to_pstage = dict()
-        
-        print("NAME TO STAGE")
-        
-        for name in self.ordered_modules:
+        temp_param_names = []
+
+        for name in modules:
             module = self.ordered_modules[name]
-            if module is None:
+            if name == "" or module is None:
                 continue
             if isinstance(module, CutPoint):
                 for p in temp_param_names:

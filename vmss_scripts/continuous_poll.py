@@ -9,6 +9,7 @@ from random import randint
 counter = 0
 possibly_dead_nodes = []
 
+morph_path = "/home/varuna/t-saathl/Varuna/Megatron-LM/"
 available_machines_list = sys.argv[1]
 running_machines_list = sys.argv[2]
 
@@ -21,7 +22,7 @@ def client(ip, port, message):
         sock.sendall(bytes(message, 'ascii'))
 
 def poll_and_update():
-    # print(str(datetime.now()), flush=True)
+    print(str(datetime.now()), flush=True)
     current_machines = get_current_machines()
     current_num_machines = len(current_machines)
     print("Current:", current_machines,flush=True)
@@ -30,14 +31,13 @@ def poll_and_update():
     print("New", new_machines, flush=True)
 
     if sorted(new_machines) == sorted(current_machines):
-        # print("no morph", flush=True)
-        pass
+        print("no morph", flush=True)
     else:
         # machines_added = [m for m in new_machines if m not in current_machines]
         msg = f"morph {len(new_machines)}"
         client(server_ip, server_port, msg)
         # print(" ".join(new_machines))
-        # print(len(new_machines), flush=True)
+        print(len(new_machines), flush=True)
 
 def run_cmd_all(cmd, machines):
     for m in machines:
@@ -61,5 +61,5 @@ if __name__ == "__main__":
 
     # while True:
     poll_and_update()
-    # time.sleep(100)
+    # time.sleep(5*60)
 

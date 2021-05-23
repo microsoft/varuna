@@ -7,7 +7,7 @@ from megatron.model import GPT2Model
 from megatron.model import get_params_for_weight_decay_optimization
 from megatron.global_vars import set_global_variables
 from megatron import get_args
-from varuna import Profiling
+from varuna import Profiler
 from apex.optimizers import FusedLAMB as LAMB
 
 import torch
@@ -22,13 +22,9 @@ max_micro_BS = 50
 
 train_val_test_num_samples = [ 5 * max_micro_BS, 0, 0 ]
 
-init_method = 'tcp://127.0.0.1:6000'
-torch.distributed.init_process_group(world_size=1, backend='gloo', rank=0, init_method= init_method)
-
 model = GPT2Model(num_tokentypes=0, parallel_output=True)
-profiler = Profiling(model,0, args.fp16)
+profiler = Profiler(model, 0, args.fp16)
 
-#torch.cuda.set_device(0)
 # Build the datasets.
 train_ds, _test , _valid = build_train_valid_test_datasets(
                             data_prefix=args.data_path,
@@ -40,7 +36,7 @@ train_ds, _test , _valid = build_train_valid_test_datasets(
                             skip_warmup=(not args.mmap_warmup))
 
 
-def get_batch(size, cpu=False):
+def get_batch(size, device=None):
     dataloader = torch.utils.data.DataLoader(train_ds, batch_size=size)
     dry_run_input = next(iter(dataloader))
 
@@ -66,27 +62,27 @@ def get_batch(size, cpu=False):
         "labels": labels
     })
 
-    if not cpu:
+    if device is not None:
         for k in dry_run_input:
-            dry_run_input[k] = dry_run_input[k].cuda()
+            dry_run_input[k] = dry_run_input[k].to(device)
     
     return dry_run_input
 
-profiler.initialize(get_batch(1, cpu=True) , from_cache=False, stage_num=1)
-
-initial_mem = torch.cuda.memory_allocated()
-model.cuda()
-model_mem = torch.cuda.memory_allocated() - initial_mem
-print("Model memory", model_mem)
+profiler.initialize(get_batch(1), stages_to_profile=[0,1,args.num_layers-1], from_cache=False)
 
 # with open(profile_name,"w") as f:
 #     f.write(("Model memory: " + str(model_mem) + "\n"))
 
-param_groups = get_params_for_weight_decay_optimization(model)
-optimizer = LAMB(param_groups, lr=args.lr, weight_decay=args.weight_decay)
-if args.fp16:
-    # let loss scale be 1 to avoid gradient overflow
-    model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale=1, min_loss_scale=1)
+def get_optimizer(model):
+    param_groups = get_params_for_weight_decay_optimization(model)
+    optimizer = LAMB(param_groups, lr=args.lr, weight_decay=args.weight_decay)
+    if args.fp16:
+        if args.dynamic_loss_scale:
+            model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale="dynamic",min_loss_scale=args.min_scale)
+            amp._amp_state.loss_scalers[0]._loss_scale = 2**15
+        else:
+            model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale=args.loss_scale, min_loss_scale=args.min_scale)
+    return optimizer
 
-profile = profiler.profile(get_batch,[1]+ list(range(1,max_micro_BS)), optimizer,"profiles/gpt2-2_5bnew-stage0")
+profile = profiler.profile_all(get_batch, list(range(1,max_micro_BS)), get_optimizer)
  
