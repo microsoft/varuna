@@ -33,8 +33,6 @@ from varuna import get_this_rank_config_varuna
 
 from apex import amp
 
-mv_futures = None
-user="rahul"
 
 def check_checkpoint_args(checkpoint_args):
     """Ensure fixed arguments for a model are the same for the input
@@ -87,11 +85,9 @@ def get_checkpoint_tracker_filename(checkpoints_path):
     return os.path.join(checkpoints_path, 'latest_checkpointed_iteration.txt')
 
 
-def save_checkpoint(iteration, model, optimizer, lr_scheduler, \
-                    parameter_names=None, on_demand=False, bgd=True):
+def save_checkpoint(iteration, model, optimizer, lr_scheduler, on_demand=False, bgd=True):
     """Save a model checkpoint."""
     args = get_args()
-    global mv_futures
 
     # Only rank zero of the data parallel writes to the disk.
     if not args.varuna and isinstance(model, torchDDP):
@@ -212,7 +208,7 @@ def parse_last_ckpt_iteration():
     return iteration, release
 
 
-def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
+def load_checkpoint(model, optimizer, lr_scheduler):
     """Load a model checkpoint and return the iteration."""
     args = get_args()
 
@@ -222,9 +218,6 @@ def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
     iteration, release = parse_last_ckpt_iteration()
 
     if iteration == 0:
-        if args.local_rank == 0:
-            with open(f"/home/{user}/local_ckpt_tracker.txt","w") as f:
-                f.write("-1")
         return 0
         
     # Checkpoint.
@@ -308,12 +301,6 @@ def load_checkpoint(model, optimizer, lr_scheduler, parameter_names=None):
                          'attempting to load the optimizer state, '
                          'exiting ...'.format(checkpoint_name))
             sys.exit()
-
-    
-    if args.local_rank == 0:
-        with open(f"/home/{user}/local_ckpt_tracker.txt","w") as f:
-            print("writing", iteration)
-            f.write(str(iteration))
 
     torch.distributed.barrier()
     print('  successfully loaded {}'.format(checkpoint_name))

@@ -1,5 +1,5 @@
 print_unavailable=${1:-0}
-cluster=${2:-"single_gpu_spots_1"}
+cluster=${2:-"megatron"}
 only_one=${3:-0}
 ignore_scaling=${4:-0}
 subscription=${5:-"f3ebbda2-3d0f-468d-8e23-31a0796dcac1"}
@@ -7,7 +7,13 @@ group=${6:-"Varuna"}
 user="rahul"
 
 machines=($(az vmss nic list --vmss-name $cluster --subscription $subscription --resource-group $group --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
-# machines+=($(az vmss nic list --vmss-name single_gpu_spots --subscription $subscription --resource-group $group --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
+if [ $only_one -eq 0 ]
+then
+    machines+=($(az vmss nic list --vmss-name megatron_1 --subscription $subscription --resource-group $group --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
+    machines+=($(az vmss nic list --vmss-name megatron_2 --subscription $subscription --resource-group $group --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
+    #machines+=($(az vmss nic list --vmss-name megatron_3 --subscription $subscription --resource-group $group --query [].{ip:ipConfigurations[0].privateIpAddress} --output tsv) )
+fi
+
 scaling=$(ps aux | grep scale_cluster| grep -v grep| wc -l)
 if [[ $scaling != 0 ]] && [[ $ignore_scaling == 0 ]]
 then
@@ -17,9 +23,8 @@ fi
 slow_machines=($(cat /home/varuna/t-saathl/Varuna/Megatron-LM/slow_machines.out))
 reachable_machines=( )
 unreachable_machines=( )
-
+i=0
 reachable_count=0
-
 is_reachable=()
 is_slow=()
 i=0

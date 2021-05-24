@@ -18,6 +18,7 @@
 import argparse
 import os
 
+from varuna import get_varuna_config, get_this_rank_config_varuna
 
 def parse_args(extra_args_provider=None, defaults={},
                ignore_unknown_args=False):
@@ -61,7 +62,7 @@ def parse_args(extra_args_provider=None, defaults={},
     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
                      'max_position_embeddings']
     if args.varuna:
-        required_args += ['stage_to_rank_map', 'partitions', 'chunk_size']
+        required_args += ['stage_to_rank_map', 'chunk_size']
     for req_arg in required_args: 
         _check_arg_is_not_none(args, req_arg)
 
@@ -75,19 +76,8 @@ def parse_args(extra_args_provider=None, defaults={},
 
     if args.varuna:
         # parse stage_to_rank_map
-        assert len(args.stage_to_rank_map) > 0, "Need a valid stage to rank map for Varuna!"
-        stage_to_rank_map = args.stage_to_rank_map
-        stage_ranks = stage_to_rank_map.split(";", args.partitions)
-        args.stage = -1
-        stage_to_rank_map = {}
-        for i in range(args.partitions):
-            ranks = stage_ranks[i].split(",")
-            stage_to_rank_map[i] = [int(r) for r in ranks]
-            if args.rank in stage_to_rank_map[i]:
-                args.stage = i
-        args.data_depth = len(ranks)
-        # args.stage_to_rank_map = stage_to_rank_map
-        assert args.stage != -1, "Invalid stage to rank map!"
+        args.partitions, args.data_depth = get_varuna_config(args.stage_to_rank_map)        
+        args.stage, _ = get_this_rank_config_varuna(args.stage_to_rank_map)
 
     # Fp16 loss scaling.
     args.dynamic_loss_scale = False
@@ -162,8 +152,6 @@ def _add_varuna_args(parser):
                         help = "Prefix of file to log loss curve")
     group.add_argument("--stage_to_rank_map", type=str, default=None,
                         help = "stage to rank map of Varuna model")
-    group.add_argument("--partitions", type=int, default=None,
-                        help = "number of pipeline stages/partitions")
     group.add_argument("--chunk_size", type=int,default=None,
                         help = "number of microbatches for pipeline")
     return parser

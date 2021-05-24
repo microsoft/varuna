@@ -55,7 +55,6 @@ MODEL = None
 OPTIMIZER = None
 LR_SCHEDULER = None
 ITERATION = None
-PARAMETER_NAMES = None
 CKPT_AND_EXIT_SIGNAL=False
 
 def pretrain(train_valid_test_dataset_provider, model_provider,
@@ -84,7 +83,7 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
             to set already parse arguments.
     """
 
-    global MODEL, OPTIMIZER, LR_SCHEDULER, PARAMETER_NAMES
+    global MODEL, OPTIMIZER, LR_SCHEDULER
 
     setup_time = time.time()
     # Initalize and get arguments, timers, and Tensorboard writer.
@@ -132,13 +131,12 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
         
     # Model, optimizer, and learning rate.    
     timers('model and optimizer').start()
-    model, optimizer, lr_scheduler, parameter_names = setup_model_and_optimizer(model_provider, dry_run_input if args.varuna else None)
+    model, optimizer, lr_scheduler = setup_model_and_optimizer(model_provider, dry_run_input if args.varuna else None)
     timers('model and optimizer').stop()
 
     MODEL = model
     OPTIMIZER = optimizer
     LR_SCHEDULER = lr_scheduler
-    PARAMETER_NAMES = parameter_names
     
     # Print setup timing.
     print_rank_0('done with setups ...')
@@ -151,7 +149,7 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
         if args.do_train:
             iteration, _ = train(forward_step_func,
                                  model, optimizer, lr_scheduler,
-                                 train_data_iterator, valid_data_iterator, parameter_names, eval_step_varuna, setup_time)
+                                 train_data_iterator, valid_data_iterator, eval_step_varuna, setup_time)
 
     if args.do_valid:
         prefix = 'the end of training for val data'
@@ -160,7 +158,7 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
                                    iteration, False)
 
     if args.save and iteration != 0:
-        save_checkpoint(iteration, model, optimizer, lr_scheduler,parameter_names)
+        save_checkpoint(iteration, model, optimizer, lr_scheduler)
 
     if args.do_test:
         # Run on test data.
@@ -278,9 +276,7 @@ def setup_model_and_optimizer(model_provider_func, dry_run_input=None):
     else:
         args.iteration = 0
 
-    parameter_names = model.parameter_names
-    
-    return model, optimizer, lr_scheduler, parameter_names
+    return model, optimizer, lr_scheduler
 
 
 def backward_step(optimizer, model, loss, iteration):
@@ -347,16 +343,6 @@ def train_step(forward_step_func, data_iterator,
             skipped_iter = 1
 
     return loss_reduced, skipped_iter
-
-def log_memory_usage(task_name=None, task_no=0, reset_max=False):
-    torch.cuda.synchronize(torch.cuda.current_device())
-    if reset_max:
-        torch.cuda.reset_max_memory_cached()
-        torch.cuda.reset_max_memory_allocated()
-        return
-
-    mem = torch.cuda.memory_allocated()
-    max_mem = torch.cuda.max_memory_allocated()
 
 def train_step_varuna(varuna_step, data_iterator,model, optimizer, lr_scheduler, iteration):
     """Single training step varuna."""
@@ -463,7 +449,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
 
 
 def train(forward_step_func, model, optimizer, lr_scheduler,
-          train_data_iterator, valid_data_iterator, parameter_names, eval_step_varuna=None,setup_time=0):
+          train_data_iterator, valid_data_iterator, eval_step_varuna=None,setup_time=0):
     """Train the model function."""
     global ITERATION, CKPT_AND_EXIT_SIGNAL
 
@@ -534,7 +520,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
 
         if CKPT_AND_EXIT_SIGNAL:
             save_checkpoint(complete_steps, model, optimizer, \
-                lr_scheduler, parameter_names, on_demand=True, bgd=False)
+                lr_scheduler, on_demand=True, bgd=False)
             exit()
 
         # Logging.
@@ -557,7 +543,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         time_since_ckpt = time.time() - last_ckpt_time
         if args.save and (time_since_ckpt >= args.save_interval) and complete_steps > 0:
             ckpt_time = time.time()
-            save_checkpoint(complete_steps, model, optimizer, lr_scheduler, parameter_names)
+            save_checkpoint(complete_steps, model, optimizer, lr_scheduler)
             ckpt_time = time.time() - ckpt_time
             print(args.rank, "ckpt time", ckpt_time)
             last_ckpt_time = time.time()
@@ -573,8 +559,8 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         if CKPT_AND_EXIT_SIGNAL or \
              (args.exit_interval and complete_steps > 0 and complete_steps % args.exit_interval == 0):
             # torch.distributed.barrier()
-            # time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            # rank = torch.distributed.get_rank()
+            time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            rank = torch.distributed.get_rank()
             print_rank_0('rank: {} | time: {} | exiting the program at '
                          'iteration {}'.format(rank, time_str, complete_steps))
             sys.exit()
@@ -762,70 +748,17 @@ def build_train_valid_test_data_iterators(
 
 def on_demand_checkpoint():
     global CKPT_AND_EXIT_SIGNAL,MODEL, OPTIMIZER,\
-            LR_SCHEDULER, PARAMETER_NAMES, ITERATION
+            LR_SCHEDULER, ITERATION
     print("setting exit signal to true!")
     CKPT_AND_EXIT_SIGNAL = True
     varuna_status = MODEL.get_status()
     print("varuna status is", varuna_status)
     # if step not done yet and not in all-reduce, ckpt & exit, else wait
     if varuna_status in ["init","pipeline"]:
-        ckpt_vars = [MODEL, OPTIMIZER, LR_SCHEDULER, PARAMETER_NAMES, ITERATION]
+        ckpt_vars = [MODEL, OPTIMIZER, LR_SCHEDULER, ITERATION]
         assert not any([v is None for v in ckpt_vars]), "CKPT VARS NOT SET!"
         
         save_checkpoint(ITERATION, MODEL, OPTIMIZER, LR_SCHEDULER, \
-                PARAMETER_NAMES, on_demand=True, bgd=False)
+                on_demand=True, bgd=False)
         exit()
-
-
-def get_eval_numbers(train_valid_test_dataset_provider, model_provider,
-             eval_step_varuna):
-    # Initalize and get arguments, timers, and Tensorboard writer.
-    initialize_megatron(args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
-    args = get_args()
-
-    print("WS",args.world_size, torch.distributed.get_world_size())
-
-    shared_weights = [("language_model.embedding.word_embeddings.weight","lm_head_weight")]
-    model, _opt, _lrs, _pn = setup_model_and_optimizer(model_provider, None)
-    model = Varuna(model, args.stage_to_rank_map, {}, args.batch_size * args.data_depth, _opt, args.chunk_size, args.fp16, local_rank=args.local_rank, device=args.local_rank, shared_weights=shared_weights)            
-
-    ckpt_iters = sorted([int(f.split("_")[-1]) for f in os.listdir(args.load) if "model_ckpt_" in f])
-    ckpts = ["model_ckpt_{}".format(i) for i in ckpt_iters]
-    print(ckpts)
-    
-    eval_samples = len(ckpts) * args.batch_size * args.eval_iters
-    _tr, valid_ds, _te = train_valid_test_dataset_provider([0,eval_samples,0])
-
-    valid_dataloader = make_data_loader(valid_ds)
-    valid_data_iterator = iter(valid_dataloader)
-
-    
-    loss_file = None
-    if args.stage == args.partitions - 1:
-        loss_file = open("eval_loss_varuna_350m_32k.txt", "w")
-
-    for model_ckpt in ckpts:
-        iteration = int(model_ckpt.split("_")[-1])
-        print("Evaluating checkpoint", iteration)
-
-        model_state_dict = load_varuna_checkpoint(args.stage, args.partitions, args.num_layers, os.path.join(args.load,model_ckpt))
-        model.model.module.load_state_dict(model_state_dict, strict = False)
-        print("loaded checkpoint!")
-        opt_state_dict = torch.load(os.path.join(args.load,"opt_ckpt_{}/opt-fp32-params-{}".format(iteration, args.num_layers-1)), map_location="cpu")
-        lm_head_weight = opt_state_dict["lm_head_weight"].to(args.local_rank)
-        if args.stage == 0:
-            model.model.module.language_model.embedding.word_embeddings.weight.data.copy_(lm_head_weight.data)
-        if args.stage == args.partitions - 1:
-            model.model.module.lm_head_weight.data.copy_(lm_head_weight.data)
-        total_loss_dict = evaluate(eval_step_varuna, valid_data_iterator, model, verbose=True)
-        if args.stage == args.partitions - 1:
-            loss_file.write(str(iteration) + " ")
-            for key in total_loss_dict: 
-                loss = total_loss_dict[key].item()
-                ppl = math.exp(min(20, loss))
-                if loss_file is not None:
-                    loss_file.write("{}: {}, {};".format(key, loss, ppl))
-
-        if loss_file is not None:
-            loss_file.write("\n")
 
