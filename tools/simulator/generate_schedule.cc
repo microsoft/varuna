@@ -170,10 +170,8 @@ void GenSchedule::Generate(std::vector<schedule_task> sched[]) {
         // case 'f':
         case '0':
           if (!last_stage) {
-            // printf("%d 0 %d; ", i+1,mini);
             fwd_queues_[i+1]->push_back(mini);
           } else if(!gpipe){
-            // printf("%d 2 %d; ", i,mini);
             bi_queues_[i]->push_back(mini);
           }else if (mini == num_mini_){
             rc_queues_[i]->push_back(mini);

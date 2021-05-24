@@ -273,7 +273,7 @@ if __name__ == "__main__":
             per_process_batch_size = total_batch_size // gpus_per_stage
 
             cmd.append("--rank={}".format(str(rank)))
-            cmd.append("--partitions={}".format(str(args.nstages)))
+            # cmd.append("--partitions={}".format(str(args.nstages)))
             cmd.append("--chunk_size={}".format(str(args.chunk_size)))
             cmd.append("--local_rank={}".format(str(local_rank)))
             cmd.append("--stage_to_rank_map={}".format(stage_to_rank_map_str))

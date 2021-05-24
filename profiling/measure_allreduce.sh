@@ -1,11 +1,11 @@
-reachable_machines=($(cat $1))
+reachable_machines=($(cat /home/varuna/t-saathl/Varuna/Megatron-LM/available_machines.out))
 
 reachable_count=${#reachable_machines[@]}
 echo $reachable_count > nservers
 
-num_servers=$reachable_count
+num_servers=${1:-$reachable_count}
 
-replicas=1
+replicas=4
 world_size=$(($replicas*$num_servers))
 echo "world size $world_size"
 
@@ -20,6 +20,9 @@ while [ $i -lt $num_servers ]
 do
     map="$i ${reachable_machines[i]}"
     echo $map
+    # date > ssh_logs/my_ssh_err_$i
+    # date > ssh_logs/my_ssh_out_$i
+    # echo "$num_servers $i $master_addr" >> ssh_logs/my_ssh_err_$i
     r=0
     while [ $r -lt $replicas ]
     do

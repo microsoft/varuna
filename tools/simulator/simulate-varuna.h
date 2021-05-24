@@ -183,18 +183,7 @@ public:
 
     GenSchedule s(pipeline_depth_, num_mini_, gpipe, pd_1f1b );
     std::vector<schedule_task> schedule[pipeline_depth_];
-    // printf("generating sched\n");
     s.Generate(schedule);
-    // printf("Schedule:\n");
-    // for(int i = 0; i < pipeline_depth_; ++i) {
-    //   // printf("%lu: ",schedule[i].size());
-    //   for(int j=0; j < schedule[i].size(); j++){
-    //     schedule_task t = schedule[i][j];
-    //     printf("(%c, %d)  ",t.task, t.index );
-    //   }
-    //   printf("\n");
-    // }
-    // printf("--------------------\n\n");
     if(fwd != 0 && bwd !=0){
       fwd_time_.insert(fwd_time_.end(), pipeline_depth_, fwd);
       bwd_time_.insert(bwd_time_.end(),pipeline_depth_, bwd);

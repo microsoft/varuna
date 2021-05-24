@@ -7,11 +7,9 @@ ngpus
 nservers
 training_output
 train_reports
-ssh_out*
 parent_process
 gantt_logs/
 args
-ssh_err*
 morph.*
 *.out
 *.err
@@ -20,8 +18,9 @@ print_stats.py
 poll.*
 profiles/
 Megatron-LM/logs/*
+Megatron-LM/ssh_logs/*
 available_machines.out
-Megatron-LM/setup_remote.sh
+Megatron-LM/scripts
 
 varuna/genschedule
 varuna/apex/
