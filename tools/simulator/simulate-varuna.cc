@@ -308,7 +308,7 @@ void Simulator::Simulate() {
     printf("Event time: %lld  Stage: %d MB: - state: ALL_REDUCE\n",clock_now_micros_, i);
   }
   #endif
-  printf("End of simulation:  Mini-batch time = %lld usec\n", clock_now_micros_ + allreduce_time_);
+  printf("End of simulation:  Mini-batch time (usec) = %lld\n", clock_now_micros_ + allreduce_time_);
   printf("Min send: %d, max send %d\n", MIN_SEND, MAX_SEND);
   printf("Min long send: %d, max long send %d\n", MIN_LONG_SEND, MAX_LONG_SEND);
   printf("Min fwd: %d, max fwd %d; min bwd %d, max bwd %d\n", MIN_FWD, MAX_FWD, MIN_BWD, MAX_BWD);

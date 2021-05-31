@@ -61,7 +61,7 @@ def parse_args(extra_args_provider=None, defaults={},
     # Check required arguments.
     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
                      'max_position_embeddings']
-    if args.varuna:
+    if args.varuna and not args.profiling:
         required_args += ['stage_to_rank_map', 'chunk_size']
     for req_arg in required_args: 
         _check_arg_is_not_none(args, req_arg)
@@ -74,10 +74,10 @@ def parse_args(extra_args_provider=None, defaults={},
         print('using world size: {} and model-parallel size: {} '.format(
             args.world_size, args.model_parallel_size))
 
-    if args.varuna:
+    if args.varuna and not args.profiling:
         # parse stage_to_rank_map
         args.partitions, args.data_depth = get_varuna_config(args.stage_to_rank_map)        
-        args.stage, _ = get_this_rank_config_varuna(args.stage_to_rank_map)
+        args.stage, _ = get_this_rank_config_varuna(args.stage_to_rank_map, args.rank)
 
     # Fp16 loss scaling.
     args.dynamic_loss_scale = False
@@ -154,6 +154,8 @@ def _add_varuna_args(parser):
                         help = "stage to rank map of Varuna model")
     group.add_argument("--chunk_size", type=int,default=None,
                         help = "number of microbatches for pipeline")
+    group.add_argument("--profiling", action='store_true', default=False,
+                        help = "profiling varuna")
     return parser
 
 def _add_regularization_args(parser):
