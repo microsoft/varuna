@@ -9,7 +9,6 @@ from random import randint
 counter = 0
 possibly_dead_nodes = []
 
-morph_path = "/home/varuna/t-saathl/Varuna/Megatron-LM/"
 available_machines_list = sys.argv[1]
 running_machines_list = sys.argv[2]
 
@@ -36,14 +35,8 @@ def poll_and_update():
         # machines_added = [m for m in new_machines if m not in current_machines]
         msg = f"morph {len(new_machines)}"
         client(server_ip, server_port, msg)
-        # print(" ".join(new_machines))
         print(len(new_machines), flush=True)
 
-def run_cmd_all(cmd, machines):
-    for m in machines:
-        os.system("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-                    varuna@{} -i /home/varuna/.ssh/vdummy.pem \
-                    \"{}\"".format(m, cmd))
 
 def get_current_machines():
     f = open(running_machines_list,"r")

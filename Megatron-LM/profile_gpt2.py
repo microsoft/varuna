@@ -23,7 +23,7 @@ max_micro_BS = 50
 train_val_test_num_samples = [ 5 * max_micro_BS, 0, 0 ]
 
 model = GPT2Model(num_tokentypes=0, parallel_output=True)
-profiler = Profiler(model, 0, args.fp16)
+profiler = Profiler(model, args.fp16)
 
 # Build the datasets.
 train_ds, _test , _valid = build_train_valid_test_datasets(
@@ -68,21 +68,19 @@ def get_batch(size, device=None):
     
     return dry_run_input
 
-profiler.initialize(get_batch(1), stages_to_profile=[0,1,args.num_layers-1], from_cache=False)
+profiler.initialize(get_batch(1) , from_cache=False)
 
 # with open(profile_name,"w") as f:
 #     f.write(("Model memory: " + str(model_mem) + "\n"))
 
-def get_optimizer(model):
-    param_groups = get_params_for_weight_decay_optimization(model)
-    optimizer = LAMB(param_groups, lr=args.lr, weight_decay=args.weight_decay)
-    if args.fp16:
-        if args.dynamic_loss_scale:
-            model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale="dynamic",min_loss_scale=args.min_scale)
-            amp._amp_state.loss_scalers[0]._loss_scale = 2**15
-        else:
-            model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale=args.loss_scale, min_loss_scale=args.min_scale)
-    return optimizer
+param_groups = get_params_for_weight_decay_optimization(model)
+optimizer = LAMB(param_groups, lr=args.lr, weight_decay=args.weight_decay)
+if args.fp16:
+    if args.dynamic_loss_scale:
+        model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale="dynamic",min_loss_scale=args.min_scale)
+        amp._amp_state.loss_scalers[0]._loss_scale = 2**15
+    else:
+        model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale=args.loss_scale, min_loss_scale=args.min_scale)
 
-profile = profiler.profile_all(get_batch, list(range(1,max_micro_BS)), get_optimizer)
+profile = profiler.profile(get_batch,[1]+ list(range(1,max_micro_BS)), optimizer)
  

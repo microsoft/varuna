@@ -37,7 +37,7 @@ def handle_scheduled_events(data, ip, port):
         client(ip, port, "preempt {}".format(notbefore))
 
 def main():
-    ip, port = "10.0.0.4", 4200       # manager IP
+    ip, port = "10.0.3.4", 4200       # manager IP
     while True:
         data = get_scheduled_events()
         handle_scheduled_events(data, ip, port)
