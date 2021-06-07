@@ -2,11 +2,17 @@ from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Tuple, Union, c
 import torch
 from torch import Tensor, nn
 import torch.distributed as dist
-
-from apex import amp
-from apex.amp import _amp_state
-import amp_C, apex_C
-from apex.multi_tensor_apply import multi_tensor_applier
+from torch.multiprocessing import Process
+from queue import Queue
+from threading import Thread
+import math
+try:
+    from apex import amp
+    from apex.amp import _amp_state
+    import amp_C, apex_C
+    from apex.multi_tensor_apply import multi_tensor_applier
+except:
+    print("No apex!")
 import concurrent.futures
 
 from .partitioned_model import PartitionedModel
@@ -93,6 +99,7 @@ class Varuna(Module):
         self.partitions, self.data_depth = utils.get_varuna_config(stage_to_rank_map)
         self.stage, self.rank_within_stage = utils.get_this_rank_config_varuna(stage_to_rank_map, self.rank)
         self.manager_ip, self.manager_port = utils.get_heartbeat_server_info()
+        self.rank_within_stage = rank_within_stage
 
         if self.stage == -1:
             raise ValueError("Rank " + str(self.rank) + " not found in stage to rank map!")
@@ -165,6 +172,7 @@ class Varuna(Module):
         self.chunks = math.ceil(self.batch_size / self.micro_batch_size)
         self.schedule = utils.generate_schedule(self.chunks, self.stage, self.partitions)
         self.iteration = 0
+        self.current_step = 0
 
     def init_communication(self):
         rank_within_stage = self.rank_within_stage
@@ -225,7 +233,7 @@ class Varuna(Module):
             self.tied_group = tied_groups[current_replica]
 
     def configure_checkpointing(self, dummy_inputs):
-        self.param_name_to_pstage = self.partitioned_model.parameter_names_to_cuts(dummy_inputs)
+        self.param_name_to_pstage = self.partitioned_model.parameter_names_to_cuts()
         # make temp dir for local ckpt trackers
         if self.local_rank == 0 and not os.path.exists(utils.VARUNA_TEMP_FOLDER):
             os.makedirs(utils.VARUNA_TEMP_FOLDER)
@@ -259,11 +267,11 @@ class Varuna(Module):
         # Divide a mini-batch into micro-batches.
         batches = utils.scatter(inputs, int(self.batch_size),self.micro_batch_size)
         
-        self.config["make_logfile"] = bool(self.config["make_logfile"] and self.iteration < 10)
+        self.config["make_logfile"] = bool(self.config["make_logfile"] and self.current_step < 5)
         batch_time = time.time()
 
-        pipeline = Pipeline(batches, self.model, self.config, self.schedule, self.optimizer, verbose=log_verbose)
-        self.average_loss = pipeline.run()
+        self.pipeline = Pipeline(batches, self.model, self.config, self.schedule, self.optimizer, verbose=log_verbose)
+        self.average_loss, fwd_time = self.pipeline.run()
 
         if log_verbose:
             print(f'{self.stage} {self.rank_within_stage} going to share embedding grads')
@@ -286,11 +294,22 @@ class Varuna(Module):
 
         batch_time = time.time() - batch_time
         self.iteration += 1
-            
-        if self.rank == 0 and self.iteration%10==0:
-            utils.heartbeat(self.iteration, self.manager_ip, self.manager_port)
+        self.current_step += 1
         
-        return self.average_loss, overflow
+        if self.current_step <= 5:
+            message = "slowcheck {} {} {} {}".\
+                        format(self.current_step, self.stage, self.rank_within_stage,fwd_time)
+            utils.heartbeat(message, self.manager_ip, self.manager_port)
+            
+                    
+        if self.rank == 0 and self.iteration%5==0:
+            message = "progress {} {}".format(batch_time, self.iteration)
+            utils.heartbeat(message, self.manager_ip, self.manager_port)
+
+        return self.average_loss, overflow, global_grad_norm
+
+    def get_status(self):
+        return self.pipeline.status
 
     def get_loss_scale(self):
         if not self.fp16:
@@ -612,37 +631,8 @@ class Varuna(Module):
 
         model_state_dict = load_varuna_checkpoint(self.stage, self.partitions, 
                                                 total_num_pstages,  cp_dir_name)
-        # for i,w in enumerate(self.shared_weights):
-        #     recv_stage, send_stage = self.shared_weight_stages[i]
-        #     recv_name, send_name = w
-        #     if (recv_stage == send_stage) or (self.stage not in [recv_stage, send_stage]):
-        #         continue
-        #     pstage = None; pname = None
-        #     if self.stage == recv_stage and recv_name not in model_state_dict:
-        #         pstage = self.param_name_to_pstage[send_name]
-        #         name = send_name
-        #     if self.stage == send_stage and send_name not in model_state_dict:
-        #         # pstage = self.param_name_to_pstage[recv_name] #TODO: FIX THIS ASAP!!
-        #         pstage = 0
-        #         name = recv_name
-        #     if pstage is not None:
-        #         print("WARNING: single checkpoint found for shared params", recv_name, send_name)
-        #         state_dict_ = load_varuna_checkpoint(self.stage, self.partitions, total_num_pstages,  
-        #                                             cp_dir_name, pstages_to_read = [pstage])
-        #         assert name in state_dict_, f"{name} not found in any checkpoint!"
-        #         model_state_dict[send_name] = state_dict_[recv_name]
-        #         print(f"Renamed {recv_name} with {send_name}")
-        #         # self.partitioned_model.module.load_state_dict(state_dict, strict=False)
-        #         print("keys",self.partitioned_model.module.state_dict().keys())
-        #         # self.partitioned_model.module.lm_head_weight
-        #         # for p in self.parameter_names:
-        #         #     if self.parameter_names[p] == send_name:
-        #         #         p.data.copy_(state_dict[send_name].data)
-        #         print(f"state dict has {model_state_dict['lm_head_weight']}")
 
         self.partitioned_model.module.load_state_dict(model_state_dict)
-        # if self.stage == 3:
-        #     self.partitioned_model.module.lm_head_weight.data.copy_(model_state_dict[send_name].data)
 
         load_varuna_optimizer(self.optimizer, self.stage, self.partitions, 
                               total_num_pstages, self.parameter_names, 
@@ -652,13 +642,7 @@ class Varuna(Module):
             for p in amp.master_params(self.optimizer):
                 name = self.parameter_names[p]
                 if name in model_state_dict:
-                    # print(f"{self.stage} loading {name}\n",end="")
                     p.data.copy_(model_state_dict[name].data)
-            
-        # if self.stage == 0:
-        #     print(f"STAGE 0 {self.partitioned_model.module.language_model.embedding.word_embeddings.weight}")
-        # if self.stage == 3:
-        #     print(f'STAGE 3 {self.partitioned_model.module.lm_head_weight}')
 
         with open(get_local_ckpt_tracker(self.local_rank),"w") as f:
             # print("writing", iteration)

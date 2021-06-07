@@ -6,10 +6,12 @@ import torch.distributed as dist
 import shutil
 from .utils import VARUNA_TEMP_FOLDER
 
-from apex import amp
-from apex.amp import _amp_state
-import amp_C, apex_C
-
+try:
+    from apex import amp
+    from apex.amp import _amp_state
+    import amp_C, apex_C
+except:
+    pass
 opt_state_format = "opt-state-{}"
 params_format = "opt-fp32-params-{}"
 MARKERS = "markers"
@@ -213,13 +215,17 @@ def load_varuna_checkpoint(my_stage, num_stages, total_num_pstages, common_store
         pstages_to_read = range(stages_per_worker * my_stage, stages_per_worker * (my_stage + 1) )
     for i in pstages_to_read:
         cp_file = os.path.join(common_store, params_format.format(i))
-        # if not os.path.exists(cp_file):
-        #     print("WARNING: DID NOT FIND CKPT FILE",cp_file,"!!!!")
-        #     continue
-        # print(f"{my_stage} loading {cp_file}\n", end="")
-        state_dict_ = torch.load(cp_file, map_location=device)
-        state_dict.update(state_dict_)
+        if os.path.exists(cp_file):
+            state_dict_ = torch.load(cp_file,map_location=device)
+            state_dict.update(state_dict_)
+        else:
+            shards = [os.path.join(common_store,f) for f in os.listdir(common_store) \
+                        if f.startswith(params_format.format(i) + "_")]
+            for cp_file in shards:
+                state_dict_ = torch.load(cp_file,map_location=device)
+                state_dict.update(state_dict_)
     return state_dict
+
 
 
 def load_varuna_optimizer(optimizer, my_stage, num_stages, total_num_pstages, parameter_names, \
@@ -231,9 +237,16 @@ def load_varuna_optimizer(optimizer, my_stage, num_stages, total_num_pstages, pa
     opt_state = {}
     for i in pstages_to_read:
         f = os.path.join(common_store, opt_state_format.format(i))
-        # print(f"{my_stage} loading {f}\n", end="")
-        state_ = torch.load(f, map_location=device)
-        opt_state.update(state_)
+        if os.path.exists(f):
+            state_ = torch.load(f,map_location=device)
+            opt_state.update(state_)
+        else:
+            shards = [os.path.join(common_store,f) for f in os.listdir(common_store) \
+                        if f.startswith(opt_state_format.format(i) + "_")]
+            for filename in shards:
+                state_ = torch.load(filename,map_location=device)
+                opt_state.update(state_)
+                
     for p in amp.master_params(optimizer):
         name = parameter_names[p]
         if name in opt_state:

@@ -28,7 +28,9 @@ def scatter(input, batch_size, chunk_size):
         # TODO: what will happen for indivisibilities in uneven data parallelism !!
         # print(dist.get_rank(),k,v.size())
         # special case for GPT-2 attention mask
-        if v.size(0) == 1:
+        if v is None:
+            chunked_values = [None for _ in range(num_microbatches)]
+        elif v.size(0) == 1:
             chunked_values = [v for _ in range(num_microbatches)]
         else:
             chunked_values = v.split(chunk_size)
@@ -87,11 +89,10 @@ def clip_grad_norm(parameters, total_norm, max_norm):
             
     return clip_coef<1
 
-def heartbeat(step, ip, port):
+def heartbeat(message, ip, port):
     if (ip is not None) and (port is not None):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                message = "progress {}".format(step)
                 sock.connect((ip, port))
                 sock.sendall(bytes(message, 'ascii'))
         except:
