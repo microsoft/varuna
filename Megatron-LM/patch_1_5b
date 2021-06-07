@@ -1,0 +1,154 @@
+diff --git a/Megatron-LM/examples/pretrain_gpt2.sh b/Megatron-LM/examples/pretrain_gpt2.sh
+index adac9ff..fcc87b2 100755
+--- a/Megatron-LM/examples/pretrain_gpt2.sh
++++ b/Megatron-LM/examples/pretrain_gpt2.sh
+@@ -9,20 +9,23 @@ NODE_RANK=$2
+ MASTER_ADDR=$3
+ ckpt=$4
+ 
+-date
+ echo $NNODES $NODE_RANK $MASTER_ADDR $ckpt
++date
++ifconfig eth0 | grep inet
+ 
+-DATA_PATH=/home/varuna/bert-large-blob/openwebtext_text_document
+-CHECKPOINT_PATH=/home/varuna/bert-large-blob/varuna_gpt2_350m_32k_8x32_cont_morph/
++DATA_PATH=/home/varuna/gpt2-blob/openwebtext_full/openwebtext_text_document
++CHECKPOINT_PATH=/home/varuna/gpt2-blob/dummy_ckpt
+ 
+-python3 run_varuna.py --nstages 8 --batch_size 32768 --chunk_size 10 --total_num_stages 24 --ngpus_per_server 4 --nservers $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR  pretrain_gpt2.py \
+-       --num-layers 24 \
+-       --hidden-size 1024 \
++NCCL_DEBUG=INFO NCCL_SOCKET_IFNAME=eth0 NCCL_SOCKET_NTHREADS=4 NCCL_NSOCKS_PERTHREAD=4 \
++python3 run_varuna.py --nstages 10 --batch_size 1024 --chunk_size 4 --total_num_stages 50 \
++       --ngpus_per_server 4 --nservers $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR pretrain_gpt2.py \
++       --num-layers 48 \
++       --hidden-size 1600 \
+        --num-attention-heads 16 \
+        --seq-length 1024 \
+        --max-position-embeddings 1024 \
+-       --train-iters 7813 \
+-       --lr-decay-iters 5000 \
++       --train-iters 24750 \
++       --lr-decay-iters 24750 \
+        --save $CHECKPOINT_PATH \
+        --load $CHECKPOINT_PATH \
+        --data-path $DATA_PATH \
+@@ -31,19 +34,19 @@ python3 run_varuna.py --nstages 8 --batch_size 32768 --chunk_size 10 --total_num
+        --data-impl mmap \
+        --split 949,50,1 \
+        --distributed-backend gloo \
+-       --lr 0.0012 \
+-       --min-lr 1.0e-5 \
++       --lr 0.0024 \
++       --min-lr 1e-5 \
+        --lr-decay-style cosine \
+        --weight-decay 1e-2 \
+        --clip-grad 1.0 \
+-       --warmup .2 \
+-       --log-interval 10 \
++       --warmup .05 \
++       --log-interval 1 \
+        --save-interval 15 \
+        --max-num-ckpts 3 \
+-       --min-ckpt-iter-to-remove 3400 \
+-       --eval-interval 300 \
++       --load-iteration $ckpt \
++       --eval-interval 100 \
+        --eval-iters 10 \
+-       --loss-file varuna_gpt2_350m_32k_cont_morph_fresh \
+-       --fp16 --varuna \
+-       --load-iteration $ckpt
++       --loss-file test \
++       --fp16 --varuna
++# num params = 20,753,384,400
+ set +x
+diff --git a/Megatron-LM/megatron/model/gpt2_model.py b/Megatron-LM/megatron/model/gpt2_model.py
+index e52ec3d..91a6d48 100644
+--- a/Megatron-LM/megatron/model/gpt2_model.py
++++ b/Megatron-LM/megatron/model/gpt2_model.py
+@@ -26,6 +26,8 @@ from .language_model import get_language_model
+ from .utils import init_method_normal
+ from .utils import scaled_init_method_normal
+ 
++from varuna import CutPoint
++
+ 
+ def gpt2_attention_mask_func(attention_scores, ltor_mask):
+     attention_scores.masked_fill_(ltor_mask, -10000.0)
+@@ -50,7 +52,7 @@ class GPT2Model(MegatronModule):
+                                                          args.num_layers))
+ 
+         self.lm_head_weight = torch.nn.Parameter(self.language_model.embedding.word_embeddings.weight)
+-
++        self.last_cutpoint = CutPoint()
+ 
+     def forward(self, input_ids, position_ids, attention_mask, loss_mask, labels,
+                 tokentype_ids=None, layer_past=None, get_key_value=False,
+@@ -64,6 +66,8 @@ class GPT2Model(MegatronModule):
+                                         layer_past=layer_past,
+                                         get_key_value=get_key_value)
+ 
++        lm_output = self.last_cutpoint(lm_output)
++
+         if get_key_value:
+             lm_output, presents = lm_output
+ 
+diff --git a/Megatron-LM/megatron/model/language_model.py b/Megatron-LM/megatron/model/language_model.py
+index b4e7b03..f6e7918 100644
+--- a/Megatron-LM/megatron/model/language_model.py
++++ b/Megatron-LM/megatron/model/language_model.py
+@@ -25,6 +25,7 @@ from megatron.model.transformer import ParallelTransformer
+ from megatron.model.utils import openai_gelu
+ from megatron.model.utils import get_linear_layer
+ 
++from varuna import CutPoint
+ 
+ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
+                        bias=None):
+@@ -165,9 +166,6 @@ class Embedding(MegatronModule):
+         self.init_method(self.tokentype_embeddings.weight)
+ 
+     def forward(self, input_ids, position_ids, tokentype_ids=None):
+-
+-        # with open("amp-varuna-input-{}".format(torch.distributed.get_rank()),"a") as f:
+-        #     f.write(str(input_ids) + "\n")
+         # Embeddings.
+         words_embeddings = self.word_embeddings(input_ids)
+         position_embeddings = self.position_embeddings(position_ids)
+@@ -178,10 +176,6 @@ class Embedding(MegatronModule):
+         else:
+             assert self.tokentype_embeddings is None
+ 
+-        # with open("amp-varuna-embed-{}".format(torch.distributed.get_rank()),"a") as f:
+-        #     f.write(str(self.word_embeddings.weight) + "\n")
+-        #     f.write(str(words_embeddings) + "\n")
+-
+         # Dropout.
+         embeddings = self.embedding_dropout(embeddings)
+ 
+@@ -304,6 +298,8 @@ class TransformerLanguageModel(MegatronModule):
+             self.pooler = Pooler(self.hidden_size, self.init_method)
+             self._pooler_key = 'pooler'
+ 
++        self.pooler_cutpoint = CutPoint()
++
+     def forward(self, input_ids, position_ids, attention_mask,
+                 tokentype_ids=None, layer_past=None, get_key_value=False,
+                 pooling_sequence_index=0):
+@@ -311,12 +307,15 @@ class TransformerLanguageModel(MegatronModule):
+         # Embeddings.
+         embedding_output = self.embedding(input_ids, position_ids,
+                                           tokentype_ids=tokentype_ids)
++        #embedding_output = self.cutpoints[0](embedding_output)
+ 
+         # Transformer.
+         transformer_output = self.transformer(embedding_output,
+                                               attention_mask,
+                                               layer_past=layer_past,
+                                               get_key_value=get_key_value)
++                                              
++        transformer_output = self.pooler_cutpoint(transformer_output)
+ 
+         if self.add_pooler:
+             pooled_output = self.pooler(transformer_output,
