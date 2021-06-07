@@ -56,18 +56,23 @@ class Pipeline:
         self.loss = None
         self.average_loss = 0
 
+        self.pre_fwd_events = []
+        self.post_fwd_events = []
+        self.avg_fwd_time = 0
+
     def read_config(self, config):
 
         self.partitions = config["partitions"]
         self.stage = config["stage"]
         self.pipeline_group = config["pipeline_process_group"]
+        self.rank_within_stage = config["rank_within_stage"]
 
         self.device = config["device"]
         self.fp16 = config["fp16"]
 
         self.fwd_inp_shape = config["fwd_inp_shape"]
         self.bwd_grad_shape = config["bwd_grad_shape"]
-        self.stage_to_rank_map = config["stage_to_rank_map"]
+       self.stage_to_rank_map = config["stage_to_rank_map"]
         self.local_rank = config["local_rank"]
 
         self.make_logfile = config["make_logfile"]
@@ -109,7 +114,6 @@ class Pipeline:
         chunks = len(self.batches)
         dtype = torch.float16 if self.fp16 else torch.float32
         recv_handles = Queue()
-        recvd = 0
 
         for task,index in self.schedule:
             if task == 0:
@@ -117,19 +121,16 @@ class Pipeline:
                 if index == (chunks-1) and self.last_chunk_size > 0:
                     fwd_inp_shape = list(self.fwd_inp_shape)
                     fwd_inp_shape[0] = self.last_chunk_size
-                # print(f"{self.rank} recieving acts {fwd_inp_shape} from {self.receive_rank}\n",end="")
                 acts_tensor = torch.ones(fwd_inp_shape, dtype=dtype)
                 handle = dist.irecv(acts_tensor, src=self.receive_rank)
                 recv_handles.put((handle, acts_tensor))
                 if recv_handles.qsize()>4:
                     handle, tensor = recv_handles.get()
                     handle.wait()
-                    recvd += 1
                     self.acts_queue.put(tensor)
         while not recv_handles.empty():
             handle, tensor = recv_handles.get()
             handle.wait()
-            recvd += 1
             self.acts_queue.put(tensor)
         del acts_tensor
     
@@ -163,22 +164,18 @@ class Pipeline:
             if task == 0:
                 count += 1
         send_handles = Queue()
-        sent = 0
         
         while count > 0:
             output_acts = self.acts_send_queue.get()
-            # print(f"{self.rank} sending acts {output_acts.size()} to {self.send_rank}\n",end="")
             handle = dist.isend(output_acts, dst=self.send_rank)
             send_handles.put(handle)
             if send_handles.qsize()>4:
                 handle = send_handles.get()
                 handle.wait()
-                sent += 1
             count -= 1
         while not send_handles.empty():
             handle = send_handles.get()
             handle.wait()
-            sent += 1
 
     def grads_sender(self):
         count = 0
@@ -190,7 +187,6 @@ class Pipeline:
 
         while count > 0:
             input_grads = self.grads_send_queue.get()
-            # print(f"{self.rank} sending grads {input_grads.size()} to {self.receive_rank}\n",end="")
             handle = dist.isend(input_grads, dst=self.receive_rank)
             send_handles.put(handle)
             if send_handles.qsize()>4:
@@ -217,7 +213,13 @@ class Pipeline:
         # forward
         if task == 0:       
             torch.set_grad_enabled(grad_mode)
+            pre_fwd = torch.cuda.Event(enable_timing=True)
+            post_fwd = torch.cuda.Event(enable_timing=True)
+            pre_fwd.record()
             output = self.model(inputs_as_dict, save_ctx=not grad_mode, handle_comm=True)
+            post_fwd.record()
+            self.pre_fwd_events.append(pre_fwd)
+            self.post_fwd_events.append(post_fwd)
 
             if grad_mode == True:
                 # save loss and input activations for the backward pass to use
@@ -231,22 +233,27 @@ class Pipeline:
         
         # backward
         else:
+            grads = torch.ones(self.loss.size(), dtype = torch.float32).to(self.device)
+
             if self.stage == self.partitions - 1:
+                grads = None
                 chunks = len(self.batches)
                 # self.loss = self.loss/chunks
                 self.average_loss += (self.loss.item()/chunks)
 
-            grads = torch.ones(self.loss.size(), dtype = torch.float32).to(self.device)
             if self.fp16:
                 with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=True, 
-                            last_partition=self.stage == self.partitions-1) as scaled_loss:
+                            last_partition=(self.stage == self.partitions-1)) as scaled_loss:
                     scaled_loss.backward(grads)
             else:
                 self.loss.backward(grads)
 
+            del self.loss
             self.loss = None
         
     def run(self):
+        if self.verbose:
+            print(f'{self.rank} {self.rank_within_stage} starting pipeline')        
 
         self.spawn_receive_workers()
         batchstart = time.time()
@@ -274,12 +281,22 @@ class Pipeline:
                     grad_mode=True
             
             if self.verbose:
-                print(f'{self.stage} {self.rank} task:{task[0]} {task[1]}/{len(self.batches)}\n', end="")
+                print(f'{self.stage} {self.rank_within_stage} task:{task[0]} {task[1]}/{len(self.batches)}\n', end="")
             self.worker(task[0], grad_mode, self.batches[task[1]])
             
             i+=1
         
-        if self.pipeline_group is not None:
-            torch.distributed.barrier(group=self.pipeline_group)
+        torch.cuda.synchronize(self.device)
+        if len(self.pre_fwd_events) > 0:
+            avg_fwd_time = 0.0
+            for i in range(len(self.pre_fwd_events)):
+                start = self.pre_fwd_events[i]
+                end = self.post_fwd_events[i]
+                avg_fwd_time += start.elapsed_time(end)
+            avg_fwd_time = avg_fwd_time / len(self.pre_fwd_events)
+            self.avg_fwd_time = avg_fwd_time
+            
         self.close_comm_threads()
-        return self.average_loss
+        dist.barrier()
+        return self.average_loss, self.avg_fwd_time
+        

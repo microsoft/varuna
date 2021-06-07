@@ -452,46 +452,13 @@ class Varuna(Module):
                         break
                 dist.all_reduce(recv_weight.grad.data, group=self.tied_group)
 
-    def sync_across_workers(self, max_norm):
-
-        master_grads, overflow_buf = self.all_reduce_dp_grads()
-
-        overflow_buf = overflow_buf.to(torch.float32)
-        if overflow_buf.item():
-            print(f"{self.rank} Overflow !!")
-        overflow_buf, global_grad_norm, reduced_loss = self.all_reduce_pipeline_meta(master_grads, 
-                                                                    overflow_buf if self.fp16 else None)
-        self.average_loss = reduced_loss
-
-        if max_norm is not None:
-            clipped = utils.clip_grad_norm(amp.master_params(self.optimizer), global_grad_norm, max_norm)
-            if clipped:
-                global_grad_norm = max_norm
-
-        if self.fp16:
-            scaler = _amp_state.loss_scalers[0]
-            overflow_buf = torch.cuda.IntTensor([0 if overflow_buf.item()==0 else 1])
-            old_overflow_buf = scaler._overflow_buf
-            scaler._overflow_buf = overflow_buf
-            had_overflow = scaler.update_scale()
-            scaler._overflow_buf = old_overflow_buf
-
-        return had_overflow, global_grad_norm
-
-    def all_reduce_dp_grads(self):
+def all_reduce_dp_grads(self):
         allred_init_start = time.time()
         master_grads = [p.grad for p in amp.master_params(self.optimizer) if p.grad is not None]
         flat_grad_size = sum(p.numel() for p in master_grads)
         flat_raw = torch.empty( flat_grad_size, device=self.device, 
                                 dtype=torch.float16 if self.fp16 else torch.float32)
 
-        if self.rank == 0:
-            for p in self.parameter_names:
-                if p.grad is not None:
-                    cpu_sum = p.grad.float().sum()
-                    if cpu_sum == float('inf') or cpu_sum == -float('inf') or cpu_sum != cpu_sum:
-                        print(f"{self.parameter_names[p]} grad bad")
-        
         if self.fp16:        
             scaler = _amp_state.loss_scalers[0]
             loss_scale = scaler.loss_scale()
@@ -522,6 +489,33 @@ class Varuna(Module):
                 1./loss_scale)
 
         return master_grads, overflow_buf
+        
+    def sync_across_workers(self, max_norm):
+
+        master_grads, overflow_buf = self.all_reduce_dp_grads()
+
+        overflow_buf = overflow_buf.to(torch.float32)
+        if overflow_buf.item():
+            print(f"{self.rank} Overflow !!")
+        overflow_buf, global_grad_norm, reduced_loss = self.all_reduce_pipeline_meta(master_grads, 
+                                                                    overflow_buf if self.fp16 else None)
+        self.average_loss = reduced_loss
+
+        if max_norm is not None:
+            clipped = utils.clip_grad_norm(amp.master_params(self.optimizer), global_grad_norm, max_norm)
+            if clipped:
+                global_grad_norm = max_norm
+
+        if self.fp16:
+            scaler = _amp_state.loss_scalers[0]
+            overflow_buf = torch.cuda.IntTensor([0 if overflow_buf.item()==0 else 1])
+            old_overflow_buf = scaler._overflow_buf
+            scaler._overflow_buf = overflow_buf
+            had_overflow = scaler.update_scale()
+            scaler._overflow_buf = old_overflow_buf
+
+        return had_overflow, global_grad_norm
+
 
     """ reduces overflow, norm and loss across pipeline stages """
     def all_reduce_pipeline_meta(self, master_grads, overflow_buf=None):
