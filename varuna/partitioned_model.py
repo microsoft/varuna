@@ -48,7 +48,6 @@ class CutPoint(Module):
             else:
                 dtype = torch.float16 if self.fp16 else torch.float32
                 inputs = torch.tensor([-1.0], requires_grad = True, dtype=dtype).to(self.device)
-            # inputs.varuna_valid = False
             inputs = (inputs,)
 
         if isinstance(self.cp_func, torch.autograd.Function):
@@ -101,7 +100,7 @@ class PartitionedModel(Module):
         self.local_rank = local_rank
         self.fp16 = fp16
         self.shared_weights = shared_weights
-
+        
         
         self.grads_send_queue = self.acts_send_queue = None
         self.acts_queue = self.grads_queue = None
@@ -144,7 +143,7 @@ class PartitionedModel(Module):
         if self.local_rank == 0 and not (from_cache and os.path.exists("_tmp_ord_mod") and os.path.exists("_tmp_inp_shapes")):
             # store input shapes for each module (or atleast each cp)
             print("Initializing partitioned model!")
-  
+
             def get_hook(name):
                 def add_module_hook(module, inputs, _output):
                     self.ordered_modules[name] = module
@@ -189,7 +188,7 @@ class PartitionedModel(Module):
                 self.module(**dummy_inputs)
             sys.settrace(None)
             self.track_cp = None
-        
+
             for name in self.ordered_modules:
                 m = self.ordered_modules[name]
                 if isinstance(m, CutPoint):
@@ -248,7 +247,7 @@ class PartitionedModel(Module):
             with open("_tmp_pstage_mapping", 'rb') as f:
                 self.param_name_to_pstage = pickle.load(f)
             self.num_cutpoints = len(self.input_shapes)
-        
+    
         # if self.local_rank == 0:
         #     for name in self.param_name_to_pstage:
         #         print(f"{name} {self.param_name_to_pstage[name]}\n", end = "")
@@ -378,95 +377,43 @@ class PartitionedModel(Module):
 
         self.check_unused_parameters(dummy_inputs)
 
+    def parameter_names_to_cuts(self):
 
-    def parameter_names_to_cuts(self, dummy_inputs):
-        
-        return self.param_name_to_pstage
+        modules = list(self.ordered_modules.keys())
 
         stage_index = 0
+        cp_count = 0
         param_name_to_pstage = dict()
-        
-        print("NAME TO STAGE")
-        
-        for name in self.ordered_modules:
+        temp_param_names = []
+
+        for name in modules:
             module = self.ordered_modules[name]
-            if module is None:
+            if name == "" or module is None:
                 continue
             if isinstance(module, CutPoint):
+                for p in temp_param_names:
+                    param_name_to_pstage[p] = stage_index
+                temp_param_names = []
+                cp_count += 1
+                # if cp_count >= self.cuts_per_stage:
+                #     break
                 stage_index += 1
-            for n,p in module.named_parameters(recurse=False):
-                param_name = name + '.' + n
-                if param_name in param_name_to_pstage:
-                    print(f"Duplicate param!! {param_name} {param_name_to_pstage[param_name]} {stage_index}")
-                param_name_to_pstage[param_name] = stage_index
-                # print(f"{self.stage} {param_name} , {stage_index}")
+            else:
+                for pname,_ in module.named_parameters(recurse=False):
+                    param_name = name + "." + pname
+                    temp_param_names.append(param_name)
 
-        # for n,p in self.module.named_parameters():
-        #     assert n in param_name_to_pstage, f"{n} param not in stage {self.stage}"
 
-        param_access = dict()
-        for p in self.module.parameters():
-            param_access[p] = set()
-
-        self.track_cp = 0
-        def boundary_func():
-            self.track_cp += 1
-        for n in self.ordered_modules:
-            m = self.ordered_modules[n]
-            if isinstance(m, CutPoint):
-                m.boundary_func = boundary_func
-        
-        def trace_param_access(frame, event, arg):
-            if event != 'call':
-                return
-            co = frame.f_code
-            func_name = co.co_name
-            if func_name in ['write','__hash__']:
-                return
-            arg_info = inspect.getargvalues(frame)
-            arg_values = [arg_info.locals[n] for n in arg_info.args]
-            for arg in arg_values:
-                if isinstance(arg, torch.nn.Parameter):
-                    if arg in param_access:
-                        param_access[arg].add(self.track_cp)
-
-        for k in dummy_inputs:
-            if isinstance(dummy_inputs[k], torch.Tensor):
-                dummy_inputs[k] = dummy_inputs[k].to(self.device)
-
-        recv_fn = (lambda grads=False: torch.zeros(self.forward_input_shapes[0],  
-                                        dtype=torch.float32, device=self.device) )    
-        if self.pre_cp is not None:
-            self.pre_cp.recv_fn = recv_fn
-                
-        sys.settrace(trace_param_access)
-        with torch.no_grad():
-            try:
-                self.module(**dummy_inputs)
-            except Exception as e:
-                if self.ret_val is None:
-                    raise e
-        self.ret_val = None
-        sys.settrace(None)
-        self.track_cp = None
-        for n in self.ordered_modules:
-            m = self.ordered_modules[n]
-            if isinstance(m, CutPoint):
-                m.boundary_func = None
-
-        for n,p in self.module.named_parameters():
-            assert len(param_access[p]) < 2, f"Parameter {n} in multiple cuts: {param_access[p]}, mark as shared parameters?"
-            accesed_cps = list(param_access[p])
-            if len(accesed_cps) > 0:
-                if n not in param_name_to_pstage:
-                    param_name_to_pstage[n] = accesed_cps[0]
-                assert (param_name_to_pstage[n] == int(accesed_cps[0])), \
-                         f"Parameter {n} accesed in cut {accesed_cps[0]} but was created in cut {param_name_to_pstage[n]}!"
-                # print(f"{self.stage} {n} , {accesed_cps[0]}")      
+        # last cutpoint
+        # if cp_count < self.cuts_per_stage:
+        for p in temp_param_names:
+            param_name_to_pstage[p] = stage_index
+        param_name_to_pstage["lm_head_weight"] = stage_index
+            
         return param_name_to_pstage
 
     def check_unused_parameters(self, dummy_inputs):
-        
+
         start_pstage = self.cuts_per_stage * self.stage
         end_pstage = self.cuts_per_stage * (self.stage+1)
 
@@ -482,9 +429,9 @@ class PartitionedModel(Module):
                 for i in range(len(path) - 1):
                     parent = getattr(parent, path[i])
                 setattr(parent,path[-1], None)
-
+        
         self.model_pruned = True
-           
+
     def set_ret_val(self, val):
         self.ret_val = val
 

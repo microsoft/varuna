@@ -8,10 +8,12 @@ NNODES=$1
 NODE_RANK=$2
 MASTER_ADDR=$3
 ckpt=$4
+GPUS_PER_SERVER=1
 
 echo $NNODES $NODE_RANK $MASTER_ADDR $ckpt
 date
-ifconfig eth0 | grep inet
+ifconfig eth0 | awk '/inet / {gsub("addr:", "", $2); print $2}'
+user="rahul"
 
 DATA_PATH=/home/varuna/gpt2-blob/turing/megatron
 CHECKPOINT_PATH=/home/varuna/gpt2-blob/mega_2_5b_4.8e-3_clipgrads

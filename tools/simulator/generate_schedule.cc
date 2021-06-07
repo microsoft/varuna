@@ -18,6 +18,52 @@ void GenSchedule::InitQueues() {
   }
 }
 
+TaskQueue* GenSchedule::PickQueue_1f1b(int stage, char* identifier) {
+
+  // printf("1f1b pq %d", stage);
+  int warmup_fwds = pipeline_depth_ - stage - 1;
+
+  if (num_fwds_done[stage] < warmup_fwds){
+    // printf("stage %d in warmup\n",stage);
+    if (!fwd_queues_[stage]->empty()) {
+      // *identifier = 'f'; 
+      *identifier = '0';
+      num_fwds_done[stage]++;
+      return fwd_queues_[stage];
+    }
+    // printf("q empty\n");
+    return NULL;
+  }
+
+  if (num_bwds_done[stage] >= (num_mini_ - warmup_fwds) ){
+    // printf("stage %d in cooldown\n",stage);
+    if (!bi_queues_[stage]->empty()) {
+      // *identifier = 'b';
+      *identifier = '2'; 
+      num_bwds_done[stage]++;
+      return bi_queues_[stage];
+    }
+    return NULL;
+  }
+  
+  if (next_is_fwd_1f1b[stage] && !fwd_queues_[stage]->empty()) {
+    // printf("stage %d in 1f1b\n",stage);
+    // *identifier = 'f'; 
+    *identifier = '0';
+    next_is_fwd_1f1b[stage] = false;
+    num_fwds_done[stage]++;
+    return fwd_queues_[stage];
+  }
+  if (!next_is_fwd_1f1b[stage] && !bi_queues_[stage]->empty()) {
+    // *identifier = 'b';
+    *identifier = '2'; 
+    next_is_fwd_1f1b[stage] = true;
+    num_bwds_done[stage]++;
+    return bi_queues_[stage];
+  }
+  return NULL;
+}
+
 TaskQueue* GenSchedule::PickQueue_gpipe(int stage, char* identifier) {
   // Defines precedence order of servicing queues
   if (!fwd_queues_[stage]->empty()) {
@@ -70,6 +116,7 @@ TaskQueue* GenSchedule::PickQueue_varuna(int stage, char* identifier) {
 
 TaskQueue* GenSchedule::PickQueue(int stage, char* identifier) {
   if(gpipe) return PickQueue_gpipe(stage, identifier);
+  if(pd_1f1b) return PickQueue_1f1b(stage, identifier);
   return PickQueue_varuna(stage, identifier);
 }
 
@@ -136,8 +183,12 @@ void GenSchedule::Generate(std::vector<schedule_task> sched[]) {
           bw_queues_[i]->push_back(mini);
           if(gpipe && last_stage && mini > 1)
             rc_queues_[i]->push_back(mini-1);
-          if (!gpipe && !first_stage) {
+          else if (!gpipe && !first_stage && !pd_1f1b) {
             rc_queues_[i-1]->push_back(mini);
+          }
+          else if(pd_1f1b && !first_stage){
+            // printf("%d 2 %d; ", i-1,mini);
+            bi_queues_[i-1]->push_back(mini);
           }
           break;
 

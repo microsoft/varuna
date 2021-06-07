@@ -5,6 +5,7 @@ import time
 import sys
 from random import randint
 
+# cluster = sys.argv[1]
 counter = 0
 possibly_dead_nodes = []
 
@@ -20,20 +21,21 @@ def client(ip, port, message):
         sock.sendall(bytes(message, 'ascii'))
 
 def poll_and_update():
-    # print(str(datetime.now()), flush=True)
+    print(str(datetime.now()), flush=True)
     current_machines = get_current_machines()
-    # current_num_machines = len(current_machines)
-    # print("Current:", current_machines)
+    current_num_machines = len(current_machines)
+    print("Current:", current_machines,flush=True)
+
     new_machines = get_available_machines()
-    # print("New", new_machines)
+    print("New", new_machines, flush=True)
 
     if sorted(new_machines) == sorted(current_machines):
-        # print("no morph", flush=True)
-        pass
+        print("no morph", flush=True)
     else:
-        machines_added = [m for m in new_machines if m not in current_machines]
-        client(server_ip, server_port, "morph")
-        # print(len(new_machines), flush=True)
+        # machines_added = [m for m in new_machines if m not in current_machines]
+        msg = f"morph {len(new_machines)}"
+        client(server_ip, server_port, msg)
+        print(len(new_machines), flush=True)
 
 
 def get_current_machines():
@@ -52,5 +54,5 @@ if __name__ == "__main__":
 
     # while True:
     poll_and_update()
-    # time.sleep(100)
+    # time.sleep(5*60)
 

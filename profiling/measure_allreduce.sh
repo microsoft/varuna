@@ -29,7 +29,10 @@ do
         # rank=$((($r*$num_servers) + $i))
         rank=$(($i*$replicas + $r))
         echo $rank
-        ssh -o StrictHostKeyChecking=no -i /home/varuna/.ssh/vdummy.pem "varuna@${reachable_machines[i]}" "export PATH=\"/home/varuna/anaconda3/bin:\$PATH\"; echo sshed; cd /home/varuna/t-saathl/Varuna/profiling; CUDA_VISIBLE_DEVICES=0 GLOO_SOCKET_IFNAME=eth0 MASTER_ADDR=$master_addr MASTER_PORT=29500 python comm_profile_worker.py $rank $world_size $r" > ssh_logs/my_ssh_out_$rank 2>ssh_logs/my_ssh_err_$rank &
+        allred_cmd="export PATH=\"/home/rahul/anaconda3/bin:\$PATH\"; cd Varuna/profiling;"
+        allred_cmd="$allred_cmd CUDA_VISIBLE_DEVICES=0 GLOO_SOCKET_IFNAME=eth0 MASTER_ADDR=$master_addr MASTER_PORT=29500"
+        allred_cmd="$allred_cmd python comm_profile_worker.py $rank $world_size allred_out_$rank 2>allred_err_$rank &"
+        ssh -o StrictHostKeyChecking=no ${reachable_machines[i]} $allred_cmd
         r=$(($r+1))
     done
     i=$(($i+1))

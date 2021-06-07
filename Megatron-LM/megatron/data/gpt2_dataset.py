@@ -29,8 +29,16 @@ from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
 
 def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                     train_valid_test_num_samples,
-                                    seq_length, seed, skip_warmup):
+                                    seq_length, seed, skip_warmup,
+                                    skip_building=False):
     """Build train, valid, and test datasets."""
+
+    if skip_building:
+        torch.distributed.barrier()
+        torch.distributed.barrier()
+        torch.distributed.barrier()
+
+        return (None, None, None)
 
     # Indexed dataset.
     indexed_dataset = get_indexed_dataset_(data_prefix,
@@ -220,7 +228,7 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
         sample_idx_filename))
     sample_idx = np.load(sample_idx_filename, allow_pickle=True)
     print_rank_0(' > loading shuffle-idx mapping from {}'.format(
-        shuffle_idx_filename))
+        shuffle_idx_filename), flush=True)
     shuffle_idx = np.load(shuffle_idx_filename, allow_pickle=True)
     print_rank_0('    loaded indexed file in {:3.3f} seconds'.format(
         time.time() - start_time))
