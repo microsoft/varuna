@@ -171,12 +171,10 @@ class PartitionedModel(Module):
                         if arg in param_access:
                             param_access[arg].add(self.track_cp)
             
-            modules = self.module.named_modules()
             hooks = []
-
             def boundary_func():
                 self.track_cp += 1
-            for name, module in modules:
+            for name, module in self.module.named_modules():
                 if name == "":
                     continue
                 hooks.append( module.register_forward_hook(get_hook(name)))
@@ -203,7 +201,7 @@ class PartitionedModel(Module):
                         param_name_to_pstage[n] = accesed_cps[0]
                     assert (param_name_to_pstage[n] == int(accesed_cps[0])), \
                             f"Parameter {n} accesed in cut {accesed_cps[0]} but was created in cut {param_name_to_pstage[n]}!"
-            
+
             cp_index = 0
             modules = self.ordered_modules
             for name in modules:
@@ -253,7 +251,7 @@ class PartitionedModel(Module):
         #         print(f"{name} {self.param_name_to_pstage[name]}\n", end = "")
     
     def find_shared_weight_stages(self):
-
+        # TODO: this method is wrong, do trace thing
         all_shared_weights = []
         for w_pair in self.shared_weights:
             all_shared_weights += [w for w in w_pair]
@@ -408,6 +406,7 @@ class PartitionedModel(Module):
         # if cp_count < self.cuts_per_stage:
         for p in temp_param_names:
             param_name_to_pstage[p] = stage_index
+        # TODO: this is still hard-coded!!!
         param_name_to_pstage["lm_head_weight"] = stage_index
             
         return param_name_to_pstage
@@ -532,6 +531,9 @@ class PartitionedModel(Module):
         if handle_comm:
             self.set_send_fn(recompute)
             recv_acts = self.set_recv_fn(recompute)
+        else:
+            self.clear_recv_fn()
+
         try:
             calc_val = self.module(**inputs_as_dict)
             ret_val = self.ret_val if self.ret_val is not None else calc_val
@@ -551,9 +553,6 @@ class PartitionedModel(Module):
                 recv_acts = recv_acts.cpu()
             ctx = (rng_states, recv_acts)
             self.recompute_queue.put(ctx)
-
-        if handle_comm:
-            self.clear_recv_fn()
 
         return ret_val 
 
