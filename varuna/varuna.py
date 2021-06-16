@@ -101,9 +101,6 @@ class Varuna(Module):
         self.fp16 = fp16
         self.shared_weights = shared_weights
 
-        if self.data_parallel and not self.fp16:
-            raise RuntimeError("Data parallel for fp32 is currently broken")
-
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
         self.model = PartitionedModel(model, self.rank, self.local_rank, device, self.stage_to_rank_map, self.fp16, shared_weights)
         self.model.initialize( dummy_inputs, from_cache=True )
@@ -351,6 +348,7 @@ class Varuna(Module):
 
     def zero_grad(self):
         self.model.zero_grad()
+        self.optimizer.zero_grad()
         if self.fp16:
             for param in self.optimizer._amp_stash.all_fp32_from_fp16_params:
                 param.grad = None
@@ -397,6 +395,7 @@ class Varuna(Module):
         model_state_dict = load_varuna_checkpoint(self.stage, self.partitions, 
                                                 total_num_pstages,  cp_dir_name)
 
+        # TODO: this should be strict and should raise error in the lm_head_weight case
         self.partitioned_model.module.load_state_dict(model_state_dict)
 
         load_varuna_optimizer(self.optimizer, self.stage, self.partitions, 
@@ -651,8 +650,8 @@ class Pipeline:
             if self.stage == self.partitions - 1:
                 grads = None
                 chunks = len(self.batches)
-                # self.loss = self.loss/chunks
-                self.average_loss += (self.loss.item()/chunks)
+                self.loss = self.loss/chunks
+                self.average_loss += (self.loss.item())
 
             if self.fp16:
                 with amp.scale_loss(self.loss, self.optimizer, delay_overflow_check=True, 
@@ -710,6 +709,7 @@ class Pipeline:
             avg_fwd_time = avg_fwd_time / len(self.pre_fwd_events)
             self.avg_fwd_time = avg_fwd_time
 
+        self.close_comm_threads()
         dist.barrier()    
 
         if log_verbose:
@@ -729,21 +729,19 @@ class Pipeline:
 
         overflow = False
         global_grad_norm = -1
-        if (self.partitions > 1) or self.data_parallel:
-            self.status = "all_reduce"
-            sync_start_time = time.time()
-            if log_verbose:
-                print(f'{self.rank} {self.rank_within_stage} all-reduce')
-            overflow, global_grad_norm = self.all_reduce_opt_grads()
-            if self.make_logfile:
-                torch.cuda.synchronize(self.device)
-                sync_time =  time.time() - sync_start_time
-                self.logfile.write("all-reduce {} {} {}".format(0, sync_start_time, sync_time))
+        self.status = "all_reduce"
+        sync_start_time = time.time()
+        if log_verbose:
+            print(f'{self.rank} {self.rank_within_stage} all-reduce')
+        overflow, global_grad_norm = self.all_reduce_opt_grads()
+        if self.make_logfile:
+            torch.cuda.synchronize(self.device)
+            sync_time =  time.time() - sync_start_time
+            self.logfile.write("all-reduce {} {} {}".format(0, sync_start_time, sync_time))
         
         if log_verbose:
             print(f'{self.rank} {self.rank_within_stage} all-reduce done; should optimize if grads did not overflow')
 
-        self.close_comm_threads()
 
         batchtime = time.time()-batchstart
         if self.make_logfile:
@@ -756,8 +754,15 @@ class Pipeline:
 
 
     def all_reduce_opt_grads(self):
+        if self.fp16:
+            params = list(amp.master_params(self.optimizer))
+        else:
+            params = []
+            for group in self.optimizer.param_groups:
+                params.extend(group['params'])
+
         allred_init_start = time.time()
-        master_grads = [p.grad for p in amp.master_params(self.optimizer) if p.grad is not None]
+        master_grads = [p.grad for p in params if p.grad is not None]
         flat_grad_size = sum(p.numel() for p in master_grads)
         flat_raw = torch.empty(flat_grad_size, device=self.device, dtype=torch.float16 if self.fp16 else torch.float32)
         
@@ -773,7 +778,7 @@ class Pipeline:
         amp_C.multi_tensor_scale(65536,
             overflow_buf,
             [master_grads, allreduced_views],
-            loss_scale / (self.data_depth*chunks))
+            loss_scale / (self.data_depth))
         
         if self.make_logfile:
             torch.cuda.synchronize(self.device)
@@ -796,18 +801,18 @@ class Pipeline:
         if log_verbose:
             print(f'{self.rank} {self.rank_within_stage} gradient all-reduce done')
             
-        if self.fp16:
-            amp_C.multi_tensor_scale(65536,
-                overflow_buf,
-                [allreduced_views, master_grads],
-                1./loss_scale)
+        amp_C.multi_tensor_scale(65536,
+            overflow_buf,
+            [allreduced_views, master_grads],
+            1./loss_scale)
 
         overflow_buf = overflow_buf.to(torch.float32)
         overflow_buf, global_grad_norm = self.global_overflow_and_norm(master_grads, overflow_buf if self.fp16 else None)
         global_grad_norm_sq = global_grad_norm ** 2
-
-        clipped = utils.clip_grad_norm(amp.master_params(self.optimizer), global_grad_norm_sq, 1.0)
+        
+        clipped = utils.clip_grad_norm(params, global_grad_norm_sq, 1.0)
         if clipped:
+            # TODO: set to custom max norm
             global_grad_norm = global_grad_norm/global_grad_norm
 
         had_overflow = False
