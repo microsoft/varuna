@@ -1,0 +1,855 @@
+diff --git a/megatron/arguments.py b/megatron/arguments.py
+index c4555af..64d0cfd 100644
+--- a/megatron/arguments.py
++++ b/megatron/arguments.py
+@@ -40,7 +40,7 @@ def parse_args(extra_args_provider=None, defaults={},
+     parser = _add_data_args(parser)
+     parser = _add_autoresume_args(parser)
+     parser = _add_realm_args(parser)
+-
++    parser = _add_varuna_args(parser)
+     # Custom arguments.
+     if extra_args_provider is not None:
+         parser = extra_args_provider(parser)
+@@ -66,7 +66,7 @@ def parse_args(extra_args_provider=None, defaults={},
+ 
+     # Parameters dtype.
+     args.params_dtype = torch.float
+-    if args.fp16:
++    if args.fp16 and not args.varuna:
+         args.params_dtype = torch.half
+     if args.rank == 0:
+         print('using {} for parameters ...'.format(args.params_dtype),
+@@ -90,6 +90,8 @@ def parse_args(extra_args_provider=None, defaults={},
+     # Check required arguments.
+     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
+                      'max_position_embeddings']
++    if args.varuna:
++        required_args += ['stage_to_rank_map', 'chunk_size']
+     for req_arg in required_args: 
+         _check_arg_is_not_none(args, req_arg)
+ 
+@@ -250,7 +252,7 @@ def _add_training_args(parser):
+                         help='Enable bias and gelu fusion.')
+     group.add_argument('--bias-dropout-fusion', action='store_true',
+                        help='Enable bias and dropout fusion.')
+-
++    
+     return parser
+ 
+ 
+@@ -300,6 +302,20 @@ def _add_learning_rate_args(parser):
+ 
+     return parser
+ 
++def _add_varuna_args(parser):
++    group = parser.add_argument_group(title='varuna')
++
++    group.add_argument("--varuna", action='store_true', default=False,
++                        help = "Enable varuna pipeline training")
++    group.add_argument("--stage_to_rank_map", type=str, default=None,
++                        help = "stage to rank map of Varuna model")
++    group.add_argument("--chunk_size", type=int,default=None,
++                        help = "number of microbatches for pipeline")
++    group.add_argument("--rank", type=int, default=-1)
++    group.add_argument("--resume_step", type=int, default=None)
++    group.add_argument("--profiling", action='store_true', 
++                        help="whether to run profiling for Varuna")
++    return parser
+ 
+ def _add_checkpointing_args(parser):
+     group = parser.add_argument_group(title='checkpointing')
+diff --git a/megatron/checkpointing.py b/megatron/checkpointing.py
+index 1a8bd40..9ba8cee 100644
+--- a/megatron/checkpointing.py
++++ b/megatron/checkpointing.py
+@@ -17,7 +17,7 @@
+ 
+ import os
+ import random
+-import sys
++import sys, time
+ import numpy as np
+ 
+ import torch
+@@ -96,18 +96,19 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
+     # Only rank zero of the data parallel writes to the disk.
+     if isinstance(model, torchDDP):
+         model = model.module
+-    if mpu.get_data_parallel_rank() == 0:
++    if args.rank==0 or (not args.varuna and mpu.get_data_parallel_rank() == 0):
+ 
+         # Arguments, iteration, and model.
+         state_dict = {}
+         state_dict['args'] = args
+         state_dict['checkpoint_version'] = 2.0
+         state_dict['iteration'] = iteration
+-        state_dict['model'] = model.state_dict_for_save_checkpoint()
++        if not args.varuna:
++            state_dict['model'] = model.state_dict_for_save_checkpoint()
+ 
+         # Optimizer stuff.
+         if not args.no_save_optim:
+-            if optimizer is not None:
++            if optimizer is not None and not args.varuna:
+                 state_dict['optimizer'] = optimizer.state_dict()
+             if lr_scheduler is not None:
+                 state_dict['lr_scheduler'] = lr_scheduler.state_dict()
+@@ -129,10 +130,14 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
+         torch.save(state_dict, checkpoint_name)
+         print('  successfully saved {}'.format(checkpoint_name))
+ 
++    ckpt_future = None
++    if args.varuna:
++        ckpt_future = model.checkpoint(args.save, tempdir=None, step=iteration)
++
+     # Wait so everyone is done (necessary)
+     torch.distributed.barrier()
+     # And update the latest iteration
+-    if torch.distributed.get_rank() == 0:
++    if ckpt_future is not None and torch.distributed.get_rank() == 0:
+         tracker_filename = get_checkpoint_tracker_filename(args.save)
+         with open(tracker_filename, 'w') as f:
+             f.write(str(iteration))
+@@ -147,34 +152,39 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
+ 
+     if isinstance(model, torchDDP):
+         model = model.module
+-    # Read the tracker file and set the iteration.
+-    tracker_filename = get_checkpoint_tracker_filename(load_dir)
+-
+-    # If no tracker file, return iretation zero.
+-    if not os.path.isfile(tracker_filename):
+-        print_rank_0('WARNING: could not find the metadata file {} '.format(
+-            tracker_filename))
+-        print_rank_0('    will not load any checkpoints and will start from '
+-                     'random')
+-        return 0
+-
+-    # Otherwise, read the tracker file and either set the iteration or
+-    # mark it as a release checkpoint.
+-    iteration = 0
+-    release = False
+-    with open(tracker_filename, 'r') as f:
+-        metastring = f.read().strip()
+-        try:
+-            iteration = int(metastring)
+-        except ValueError:
+-            release = metastring == 'release'
+-            if not release:
+-                print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
+-                    tracker_filename))
+-                sys.exit()
+-
+-    assert iteration > 0 or release, 'error parsing metadata file {}'.format(
+-        tracker_filename)
++    
++    if args.varuna and args.resume_step is not None:
++        iteration = args.resume_step
++        release = False
++    else:
++        # Read the tracker file and set the iteration.
++        tracker_filename = get_checkpoint_tracker_filename(load_dir)
++
++        # If no tracker file, return iretation zero.
++        if not os.path.isfile(tracker_filename):
++            print_rank_0('WARNING: could not find the metadata file {} '.format(
++                tracker_filename))
++            print_rank_0('    will not load any checkpoints and will start from '
++                        'random')
++            return 0
++
++        # Otherwise, read the tracker file and either set the iteration or
++        # mark it as a release checkpoint.
++        iteration = 0
++        release = False
++        with open(tracker_filename, 'r') as f:
++            metastring = f.read().strip()
++            try:
++                iteration = int(metastring)
++            except ValueError:
++                release = metastring == 'release'
++                if not release:
++                    print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
++                        tracker_filename))
++                    sys.exit()
++
++        assert iteration > 0 or release, 'error parsing metadata file {}'.format(
++            tracker_filename)
+ 
+     # Checkpoint.
+     checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
+@@ -223,12 +233,15 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
+         print_rank_0('could not find arguments in the checkpoint ...')
+ 
+     # Model.
+-    model.load_state_dict(state_dict['model'])
++    if not args.varuna:
++        model.load_state_dict(state_dict['model'])
++    else:
++        model.load_checkpoint(args.load, iteration)
+ 
+     # Optimizer.
+     if not release and not args.finetune and not args.no_load_optim:
+         try:
+-            if optimizer is not None:
++            if optimizer is not None and not args.varuna:
+                 optimizer.load_state_dict(state_dict['optimizer'])
+             if lr_scheduler is not None:
+                 lr_scheduler.load_state_dict(state_dict['lr_scheduler'])
+diff --git a/megatron/model/gpt2_model.py b/megatron/model/gpt2_model.py
+index b0d275f..e4b7dba 100644
+--- a/megatron/model/gpt2_model.py
++++ b/megatron/model/gpt2_model.py
+@@ -50,9 +50,14 @@ class GPT2Model(MegatronModule):
+             scaled_init_method=scaled_init_method_normal(args.init_method_std,
+                                                          args.num_layers))
+ 
++        if args.varuna:
++            self.lm_head_weight = torch.nn.Parameter(self.language_model.embedding.word_embeddings.weight)
++        else:
++            self.lm_head_weight = self.language_model.embedding.word_embeddings.weight
++
+     def forward(self, input_ids, position_ids, attention_mask, labels=None,
+                 tokentype_ids=None, layer_past=None, get_key_value=False,
+-                forward_method_parallel_output=None):
++                forward_method_parallel_output=None, loss_mask=None):
+ 
+         # Language model.
+         lm_output = self.language_model(input_ids,
+@@ -71,7 +76,7 @@ class GPT2Model(MegatronModule):
+             parallel_output = forward_method_parallel_output
+         output = parallel_lm_logits(
+             lm_output,
+-            self.language_model.embedding.word_embeddings.weight,
++            self.lm_head_weight,
+             parallel_output)
+ 
+         if get_key_value:
+@@ -85,6 +90,11 @@ class GPT2Model(MegatronModule):
+                 loss = mpu.vocab_parallel_cross_entropy(output, labels)
+             else:
+                 loss = mpu.vocab_parallel_cross_entropy(output.float(), labels)
++            
++            if loss_mask is not None:
++                loss_mask = loss_mask.view(-1)
++                loss = torch.sum(loss.view(-1) * loss_mask) / loss_mask.sum()
++            
+             return loss
+ 
+ 
+@@ -99,7 +109,9 @@ class GPT2Model(MegatronModule):
+ 
+     def load_state_dict(self, state_dict, strict=True):
+         """Customized load."""
+-
++        if "lm_head_weight" in state_dict:
++            with torch.no_grad():
++                self.lm_head_weight.copy_(state_dict["lm_head_weight"])
+         if self._language_model_key in state_dict:
+             state_dict = state_dict[self._language_model_key]
+         self.language_model.load_state_dict(state_dict, strict=strict)
+diff --git a/megatron/model/transformer.py b/megatron/model/transformer.py
+index f2be536..2efe5f2 100644
+--- a/megatron/model/transformer.py
++++ b/megatron/model/transformer.py
+@@ -28,6 +28,8 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
+ from megatron.model.fused_bias_gelu import bias_gelu_impl
+ from megatron.model.utils import openai_gelu, erf_gelu
+ 
++from varuna import CutPoint 
++
+ # flags required to enable jit fusion kernels
+ torch._C._jit_set_profiling_mode(False)
+ torch._C._jit_set_profiling_executor(False)
+@@ -269,7 +271,7 @@ class ParallelSelfAttention(MegatronModule):
+             output_size[2], 
+             output_size[3],
+             dtype=query_layer.dtype, 
+-            device=torch.cuda.current_device())
++            device=query_layer.device)
+ 
+         # Raw attention scores. [b * np, sq, sk]
+         matmul_result = torch.baddbmm(matmul_result, 
+@@ -309,8 +311,8 @@ class ParallelSelfAttention(MegatronModule):
+ 
+         # This is actually dropping out entire tokens to attend to, which might
+         # seem a bit unusual, but is taken from the original Transformer paper.
+-        with mpu.get_cuda_rng_tracker().fork():
+-            attention_probs = self.attention_dropout(attention_probs)
++        # with mpu.get_cuda_rng_tracker().fork():
++        attention_probs = self.attention_dropout(attention_probs)
+ 
+ 
+         # =========================
+@@ -520,6 +522,7 @@ class ParallelTransformer(MegatronModule):
+                 output_layer_init_method, layer_number)
+         self.layers = torch.nn.ModuleList(
+             [build_layer(i + 1) for i in range(self.num_unique_layers)])
++        self.cutpoints = torch.nn.ModuleList([CutPoint() for i in range(self.num_layers-1)])
+ 
+         # Print layer ordering.
+         if self.num_layers != self.num_unique_layers:
+@@ -581,7 +584,8 @@ class ParallelTransformer(MegatronModule):
+                 'activation checkpointing'
+ 
+         # data format change to avoid explicit tranposes : [b s h] --> [s b h]
+-        hidden_states = hidden_states.transpose(0, 1).contiguous()
++        if hidden_states is not None and hidden_states.dim() >= 2:
++            hidden_states = hidden_states.transpose(0, 1).contiguous()
+ 
+         if self.checkpoint_activations:
+             hidden_states = self._checkpointed_forward(hidden_states,
+@@ -598,6 +602,8 @@ class ParallelTransformer(MegatronModule):
+                                       attention_mask,
+                                       layer_past=past,
+                                       get_key_value=get_key_value)
++                if index < (self.num_layers-1):
++                    hidden_states = self.cutpoints[index](hidden_states)
+                 if get_key_value:
+                     hidden_states, present = hidden_states
+                     presents.append(present)
+diff --git a/megatron/mpu/data.py b/megatron/mpu/data.py
+index 84b0af6..09e4f4a 100644
+--- a/megatron/mpu/data.py
++++ b/megatron/mpu/data.py
+@@ -73,7 +73,7 @@ def _build_key_size_numel_dictionaries(keys, data):
+     return key_size, key_numel, total_numel
+ 
+ 
+-def broadcast_data(keys, data, datatype):
++def broadcast_data(keys, data, datatype, device=None):
+     """Broadcast data from rank zero of each model parallel group to the
+     members of the same model parallel group.
+ 
+@@ -88,16 +88,18 @@ def broadcast_data(keys, data, datatype):
+     key_size, key_numel, total_numel = _build_key_size_numel_dictionaries(keys,
+                                                                           data)
+ 
++    if device is None:
++        device = torch.cuda.current_device() 
+     # Pack on rank zero.
+     if get_model_parallel_rank() == 0:
+         # Check that all keys have the same data type.
+         _check_data_types(keys, data, datatype)
+         # Flatten the data associated with the keys
+         flatten_data = torch.cat(
+-            [data[key].contiguous().view(-1) for key in keys], dim=0).cuda()
++            [data[key].contiguous().view(-1) for key in keys], dim=0).to(device)
+     else:
+         flatten_data = torch.empty(total_numel,
+-                                   device=torch.cuda.current_device(),
++                                   device=device,
+                                    dtype=datatype)
+ 
+     # Boradcast
+diff --git a/megatron/mpu/layers.py b/megatron/mpu/layers.py
+index da30292..f228384 100644
+--- a/megatron/mpu/layers.py
++++ b/megatron/mpu/layers.py
+@@ -55,8 +55,8 @@ def _initialize_affine_weight_gpu(weight, init_method,
+     weight.partition_dim = partition_dim
+     weight.partition_stride = stride
+     
+-    with get_cuda_rng_tracker().fork():
+-        init_method(weight)
++    # with get_cuda_rng_tracker().fork():
++    init_method(weight)
+ 
+ 
+ def _initialize_affine_weight_cpu(weight, output_size, input_size,
+diff --git a/megatron/training.py b/megatron/training.py
+index ca1bd26..d2150ca 100644
+--- a/megatron/training.py
++++ b/megatron/training.py
+@@ -17,7 +17,7 @@
+ 
+ from datetime import datetime
+ import math
+-import sys
++import sys, os
+ import torch
+ from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+ from apex.optimizers import FusedAdam as Adam
+@@ -40,9 +40,18 @@ from megatron.utils import check_adlr_autoresume_termination
+ from megatron.utils import make_data_loader
+ from megatron.utils import report_memory
+ 
++from varuna import Varuna, get_varuna_config, Profiler
++
++CKPT_AND_STOP = False
++
++def on_demand_checkpoint():
++    global CKPT_AND_STOP
++    CKPT_AND_STOP = True
+ 
+ def pretrain(train_valid_test_dataset_provider, model_provider,
+-             forward_step_func, extra_args_provider=None, args_defaults={}):
++             forward_step_func, get_batch=None, 
++             varuna_step_func=None, varuna_eval_func=None,
++             extra_args_provider=None, args_defaults={}):
+     """Main training program.
+ 
+     This function will run the followings in the order provided:
+@@ -74,32 +83,42 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
+     args = get_args()
+     timers = get_timers()
+ 
++    train_ds, valid_ds, test_ds = build_train_valid_test_datasets(train_valid_test_dataset_provider)
++    def get_batch_fn(size, device=None):
++        sample_iter = iter(torch.utils.data.DataLoader(train_ds, batch_size=size))
++        return get_batch(sample_iter, device=device) 
++
+     # Model, optimizer, and learning rate.
+     timers('model and optimizer').start()
+-    model, optimizer, lr_scheduler = setup_model_and_optimizer(model_provider)
++    model, optimizer, lr_scheduler = setup_model_and_optimizer(model_provider, get_batch_fn)
+     timers('model and optimizer').stop()
+ 
+-    # Data stuff.
++    # Data iterators.
+     timers('train/valid/test data iterators').start()
+     train_data_iterator, valid_data_iterator, test_data_iterator \
+         = build_train_valid_test_data_iterators(
+-            train_valid_test_dataset_provider)
++            train_ds, valid_ds, test_ds)
+     timers('train/valid/test data iterators').stop()
+ 
+     # Print setup timing.
+     print_rank_0('done with setups ...')
+     timers.log(['model and optimizer', 'train/valid/test data iterators'])
++    
++    if args.varuna and args.profiling:
++        profile = model.profile_all(list(range(1,25)))
++        return
++    
+     print_rank_0('training ...')
+ 
+     iteration = 0
+     if args.do_train and args.train_iters > 0:
+-        iteration = train(forward_step_func,
++        iteration = train(forward_step_func if not args.varuna else varuna_step_func,
+                           model, optimizer, lr_scheduler,
+-                          train_data_iterator, valid_data_iterator)
++                          train_data_iterator, valid_data_iterator, varuna_eval_func)
+ 
+     if args.do_valid:
+         prefix = 'the end of training for val data'
+-        evaluate_and_print_results(prefix, forward_step_func,
++        evaluate_and_print_results(prefix, forward_step_func if not args.varuna else varuna_eval_func,
+                                    valid_data_iterator, model,
+                                    iteration, False)
+ 
+@@ -109,17 +128,32 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
+     if args.do_test:
+         # Run on test data.
+         prefix = 'the end of training for test data'
+-        evaluate_and_print_results(prefix, forward_step_func,
++        evaluate_and_print_results(prefix, forward_step_func if not args.varuna else varuna_eval_func,
+                                    test_data_iterator, model,
+                                    0, True)
+ 
+ 
+-def get_model(model_provider_func):
++def get_model(model_provider_func, get_batch_fn=None):
+     """Build the model."""
+     args = get_args()
+ 
+     # Build model on cpu.
+     model = model_provider_func()
++    profiler = None
++    if args.varuna:
++        assert get_batch_fn is not None, "Must provide get_batch_fn to varuna"
++        shared_weights = [("language_model.embedding.word_embeddings.weight","lm_head_weight")]
++
++        if args.profiling:
++            profiler = Profiler(model, get_batch_fn, fp16=args.fp16, device = args.local_rank,
++                        from_cache=True, out_folder=args.save, add_to_existing=True)
++        else:
++            pipeline_parallel_size, data_parallel_size = get_varuna_config(args.stage_to_rank_map)
++            args.partitions = pipeline_parallel_size
++            global_batch_size = args.batch_size * data_parallel_size
++            model = Varuna( model, args.stage_to_rank_map, get_batch_fn, global_batch_size, 
++                            args.chunk_size, args.fp16, local_rank=args.local_rank, 
++                            device=args.local_rank, shared_weights=shared_weights)
+ 
+     # Print number of parameters.
+     if mpu.get_data_parallel_rank() == 0:
+@@ -127,26 +161,29 @@ def get_model(model_provider_func):
+             mpu.get_model_parallel_rank(),
+             sum([p.nelement() for p in model.parameters()])), flush=True)
+ 
+-    # GPU allocation.
+-    model.cuda(torch.cuda.current_device())
++    # Varuna handles fp16, parallelisation, moving to devices internally
++    if not args.varuna:
++        # GPU allocation.
++        model.cuda(torch.cuda.current_device())
+ 
+-    # Fp16 conversion.
+-    if args.fp16:
+-        model = FP16_Module(model)
+-
+-    # Wrap model for distributed training."""
+-    if args.DDP_impl == 'torch':
+-        i = torch.cuda.current_device()
+-        model = torchDDP(model, device_ids=[i], output_device=i,
+-                         process_group=mpu.get_data_parallel_group())
+-        return model
+-    if args.DDP_impl == 'local':
+-        model = LocalDDP(model)
+-        return model
++        # Fp16 conversion.
++        if args.fp16:
++            model = FP16_Module(model)
++
++        # Wrap model for distributed training."""
++        if args.DDP_impl == 'torch':
++            i = torch.cuda.current_device()
++            model = torchDDP(model, device_ids=[i], output_device=i,
++                            process_group=mpu.get_data_parallel_group())
++            return model
++        if args.DDP_impl == 'local':
++            model = LocalDDP(model)
++            return model
+ 
+-    raise NotImplementedError('Unknown DDP implementation specified: {}. '
+-                              'Exiting.'.format(args.DDP_impl))
++        raise NotImplementedError('Unknown DDP implementation specified: {}. '
++                                'Exiting.'.format(args.DDP_impl))
+ 
++    return model, profiler
+ 
+ def get_optimizer(model):
+     """Set up the optimizer."""
+@@ -167,8 +204,8 @@ def get_optimizer(model):
+     optimizer = Adam(param_groups, lr=args.lr, weight_decay=args.weight_decay,
+         betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
+ 
+-    # Wrap into fp16 optimizer.
+-    if args.fp16:
++    # Wrap into fp16 optimizer (if not handled by varuna).
++    if not args.varuna and args.fp16:
+         optimizer = FP16_Optimizer(optimizer,
+                                    static_loss_scale=args.loss_scale,
+                                    dynamic_loss_scale=args.dynamic_loss_scale,
+@@ -206,12 +243,16 @@ def get_learning_rate_scheduler(optimizer):
+     return lr_scheduler
+ 
+ 
+-def setup_model_and_optimizer(model_provider_func):
++def setup_model_and_optimizer(model_provider_func, get_batch_fn):
+     """Setup model and optimizer."""
+     args = get_args()
+ 
+-    model = get_model(model_provider_func)
++    model, profiler = get_model(model_provider_func, get_batch_fn)
+     optimizer = get_optimizer(model)
++    if args.varuna:
++        if args.profiling:
++            model = profiler
++        model.set_optimizer(optimizer, init_loss_scale=2**17, min_loss_scale=args.min_scale)
+     lr_scheduler = get_learning_rate_scheduler(optimizer)
+ 
+     if args.load is not None:
+@@ -220,7 +261,7 @@ def setup_model_and_optimizer(model_provider_func):
+         args.iteration = 0
+ 
+     # get model without FP16 and/or TorchDDP wrappers
+-    unwrapped_model = model
++    unwrapped_model = model.model if args.varuna else model
+     while hasattr(unwrapped_model, 'module'):
+         unwrapped_model = unwrapped_model.module
+ 
+@@ -269,34 +310,47 @@ def backward_step(optimizer, model, loss):
+     timers('backward-clip-grad').stop()
+ 
+ 
+-def train_step(forward_step_func, data_iterator,
+-               model, optimizer, lr_scheduler):
++def train_step(forward_or_varuna_step_func, data_iterator,
++               model, optimizer, lr_scheduler, iteration):
+     """Single training step."""
+     args = get_args()
+     timers = get_timers()
+ 
+-    # Forward model for one step.
+-    timers('forward').start()
+-    loss, loss_reduced = forward_step_func(data_iterator, model)
+-    timers('forward').stop()
+-
+-    # Calculate gradients, reduce across processes, and clip.
+-    timers('backward').start()
+-    backward_step(optimizer, model, loss)
+-    timers('backward').stop()
+-
++    if not args.varuna:
++        forward_step_func = forward_or_varuna_step_func
++        # Forward model for one step.
++        timers('forward').start()
++        loss, loss_reduced = forward_step_func(data_iterator, model)
++        timers('forward').stop()
++
++        # Calculate gradients, reduce across processes, and clip.
++        timers('backward').start()
++        backward_step(optimizer, model, loss)
++        timers('backward').stop()
++        overflow = False
++        global_norm = -1
++    else:
++        # timers('varuna')
++        varuna_step_func = forward_or_varuna_step_func
++        loss, loss_reduced, overflow, global_norm = \
++                varuna_step_func(data_iterator, model)
++  
+     # Update parameters.
+     timers('optimizer').start()
+-    optimizer.step()
++    if not overflow:  
++        optimizer.step()
++    model.zero_grad()
++    
++    overflow = optimizer.overflow if (args.fp16 and not args.varuna) else overflow
+     timers('optimizer').stop()
+ 
+     # Update learning rate.
+     skipped_iter = 0
+-    if not (args.fp16 and optimizer.overflow):
++    if not overflow:
+         lr_scheduler.step()
+     else:
+         skipped_iter = 1
+-
++        
+     return loss_reduced, skipped_iter
+ 
+ 
+@@ -391,8 +445,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
+     return report_memory_flag
+ 
+ 
+-def train(forward_step_func, model, optimizer, lr_scheduler,
+-          train_data_iterator, valid_data_iterator):
++def train(forward_or_varuna_step_func, model, optimizer, lr_scheduler,
++          train_data_iterator, valid_data_iterator, varuna_eval_func):
+     """Train the model function."""
+     args = get_args()
+     timers = get_timers()
+@@ -409,17 +463,21 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
+     timers('interval time').start()
+     report_memory_flag = True
+     while iteration < args.train_iters:
+-        loss_dict, skipped_iter = train_step(forward_step_func,
++        loss_dict, skipped_iter = train_step(forward_or_varuna_step_func,
+                                              train_data_iterator,
+                                              model,
+                                              optimizer,
+-                                             lr_scheduler)
++                                             lr_scheduler, iteration)
+         iteration += 1
+ 
++        if CKPT_AND_STOP:
++            save_checkpoint(iteration, model, optimizer, lr_scheduler)
++            exit()
++
+         # Logging.
+         loss_scale = None
+         if args.fp16:
+-            loss_scale = optimizer.loss_scale
++            loss_scale = optimizer.loss_scale if not args.varuna else model.get_loss_scale()
+         report_memory_flag = training_log(loss_dict, total_loss_dict,
+                                           optimizer.param_groups[0]['lr'],
+                                           iteration, loss_scale,
+@@ -437,10 +495,10 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
+             save_checkpoint(iteration, model, optimizer, lr_scheduler)
+ 
+         # Evaluation
+-        if args.eval_interval and iteration % args.eval_interval == 0 and \
++        if (not CKPT_AND_STOP) and args.eval_interval and iteration % args.eval_interval == 0 and \
+            args.do_valid:
+             prefix = 'iteration {}'.format(iteration)
+-            evaluate_and_print_results(prefix, forward_step_func,
++            evaluate_and_print_results(prefix, forward_step_func if not args.varuna else varuna_eval_func,
+                                        valid_data_iterator, model,
+                                        iteration, False)
+ 
+@@ -510,18 +568,18 @@ def evaluate_and_print_results(prefix, forward_step_func,
+     print_rank_0('-' * length)
+ 
+ 
+-def build_train_valid_test_data_iterators(
++def build_train_valid_test_datasets(
+         build_train_valid_test_datasets_provider):
+     """XXX"""
+     args = get_args()
+ 
+-    (train_dataloader, valid_dataloader, test_dataloader) = (None, None, None)
+-
+     print_rank_0('> building train, validation, and test datasets ...')
+     # Data loader only on rank 0 of each model parallel group.
+     if mpu.get_model_parallel_rank() == 0:
+         # Rank, size, and global batch size.
+         data_parallel_size = mpu.get_data_parallel_world_size()
++        if args.varuna:
++            pipeline_parallel_size, data_parallel_size = get_varuna_config(args.stage_to_rank_map)
+         global_batch_size = args.batch_size * data_parallel_size
+ 
+         # Number of train/valid/test samples.
+@@ -539,7 +597,16 @@ def build_train_valid_test_data_iterators(
+         # Build the datasets.
+         train_ds, valid_ds, test_ds = build_train_valid_test_datasets_provider(
+             train_val_test_num_samples)
++        return train_ds, valid_ds, test_ds
++    else:
++        return None, None, None
++
++def build_train_valid_test_data_iterators(train_ds, valid_ds, test_ds):
++    args = get_args()
+ 
++    (train_dataloader, valid_dataloader, test_dataloader) = (None, None, None)
++    
++    if mpu.get_model_parallel_rank() == 0:
+         # Build dataloders.
+         train_dataloader = make_data_loader(train_ds)
+         valid_dataloader = make_data_loader(valid_ds)
+diff --git a/megatron/utils.py b/megatron/utils.py
+index 24d832d..556770b 100644
+--- a/megatron/utils.py
++++ b/megatron/utils.py
+@@ -27,6 +27,7 @@ from megatron.checkpointing import save_checkpoint
+ from megatron.data.samplers import DistributedBatchSampler
+ from megatron.fp16 import FP16_Optimizer
+ 
++from varuna import get_varuna_config, get_this_rank_config_varuna
+ 
+ def reduce_losses(losses):
+     """Reduce a tensor of losses across all GPUs."""
+@@ -96,8 +97,13 @@ def make_data_loader(dataset):
+     args = get_args()
+ 
+     # Data parallel arguments.
+-    world_size = mpu.get_data_parallel_world_size()
+-    rank = mpu.get_data_parallel_rank()
++    if args.varuna:
++        pipeline_parallel_size, data_parallel_size = get_varuna_config(args.stage_to_rank_map)
++        pipeline_stage, data_parallel_rank = get_this_rank_config_varuna(args.stage_to_rank_map, args.rank)
++        world_size = data_parallel_size; rank = data_parallel_rank
++    else:
++        world_size = mpu.get_data_parallel_world_size()
++        rank = mpu.get_data_parallel_rank()
+     global_batch_size = args.batch_size * world_size
+     num_workers = args.num_workers
+ 
+diff --git a/pretrain_gpt2.py b/pretrain_gpt2.py
+index 372258f..0cf832d 100644
+--- a/pretrain_gpt2.py
++++ b/pretrain_gpt2.py
+@@ -24,10 +24,12 @@ from megatron import get_tokenizer
+ from megatron import mpu
+ from megatron.data.gpt2_dataset import build_train_valid_test_datasets
+ from megatron.model import GPT2Model
+-from megatron.training import pretrain
++from megatron.training import pretrain, on_demand_checkpoint
+ from megatron.utils import get_ltor_masks_and_position_ids
+ from megatron.utils import reduce_losses
+ 
++import signal
++
+ def model_provider():
+     """Build the model."""
+ 
+@@ -37,7 +39,7 @@ def model_provider():
+     return model
+ 
+ 
+-def get_batch(data_iterator):
++def get_batch(data_iterator, device=None):
+     """Generate a batch"""
+     args = get_args()
+     tokenizer = get_tokenizer()
+@@ -51,7 +53,7 @@ def get_batch(data_iterator):
+         data = next(data_iterator)
+     else:
+         data = None
+-    data_b = mpu.broadcast_data(keys, data, datatype)
++    data_b = mpu.broadcast_data(keys, data, datatype, device=device)
+ 
+     # Unpack.
+     tokens_ = data_b['text'].long()
+@@ -66,6 +68,17 @@ def get_batch(data_iterator):
+         args.reset_attention_mask,
+         args.eod_mask_loss)
+ 
++
++    if args.varuna:
++        inputs = dict({
++            "input_ids": tokens,
++            "position_ids": position_ids,
++            "attention_mask": attention_mask,
++            "loss_mask": loss_mask,
++            "labels": labels
++        })
++        return inputs
++    
+     return tokens, labels, loss_mask, attention_mask, position_ids
+ 
+ 
+@@ -89,6 +102,41 @@ def forward_step(data_iterator, model):
+ 
+     return loss, {'lm loss': reduced_loss[0]}
+ 
++def varuna_step(data_iterator, model):
++
++    args = get_args()
++    timers = get_timers()
++
++    # Get the batch.
++    timers('batch generator').start()
++    inputs = get_batch(data_iterator)
++    timers('batch generator').stop()
++
++    # if torch.distributed.get_rank() == 0:
++    #     print(inputs["input_ids"])
++    loss, overflow, global_norm = model.step(inputs)
++    loss = torch.Tensor([loss]).cuda()
++    # Reduce loss for logging.
++    # reduced_loss = reduce_losses([loss])
++
++    return loss, {'lm loss': loss}, overflow, global_norm
++
++def varuna_evaluate(data_iterator, model):
++    args = get_args()
++    timers = get_timers()
++
++    # Get the batch.
++    timers('batch generator').start()
++    inputs = get_batch(data_iterator)
++    timers('batch generator').stop()
++
++    loss = model.evaluate(inputs)
++    
++    # Reduce loss for logging.
++    loss = torch.Tensor([loss]).cuda()
++    reduced_loss = reduce_losses([loss])
++
++    return loss, {'lm loss': reduced_loss[0]}
+ 
+ def train_valid_test_datasets_provider(train_val_test_num_samples):
+     """Build train, valid, and test datasets."""
+@@ -111,5 +159,14 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
+ 
+ if __name__ == "__main__":
+ 
+-    pretrain(train_valid_test_datasets_provider, model_provider, forward_step,
+-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
++    
++    def handler(signum,_):
++        print(torch.distributed.get_rank(), 'signal handler called with signal', signum)
++        on_demand_checkpoint()
++        exit()
++
++    signal.signal(signal.SIGUSR1, handler)
++
++    pretrain(train_valid_test_datasets_provider, model_provider, forward_step, 
++            get_batch=get_batch, varuna_step_func=varuna_step, varuna_eval_func=varuna_evaluate,
++            args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
