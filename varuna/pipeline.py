@@ -172,7 +172,6 @@ class Pipeline:
             if task == 0:
                 count += 1
         send_handles = Queue()
-
         while count > 0:
             output_acts = self.acts_send_queue.get()
             handle = dist.isend(output_acts, dst=self.send_rank)
@@ -256,10 +255,13 @@ class Pipeline:
             else:
                 self.loss.backward(grads)
 
+            del self.loss
             self.loss = None
         
     def run(self):
-        
+        if self.verbose:
+            print(f'{self.rank} {self.rank_within_stage} starting pipeline')        
+
         self.spawn_receive_workers()
         batchstart = time.time()
 
@@ -290,7 +292,7 @@ class Pipeline:
             self.worker(task[0], grad_mode, self.batches[task[1]])
 
             i+=1
-
+        
         torch.cuda.synchronize(self.device)
         if len(self.pre_fwd_events) > 0:
             avg_fwd_time = 0.0
@@ -304,4 +306,6 @@ class Pipeline:
         if self.pipeline_group is not None:
             torch.distributed.barrier(group=self.pipeline_group)
         self.close_comm_threads()
-        return self.average_loss
+        dist.barrier()
+        return self.average_loss, self.avg_fwd_time
+        
