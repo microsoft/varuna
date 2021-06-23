@@ -51,10 +51,9 @@ class Varuna(Module):
     :param stage_to_rank_map: Placement of pipeline stages in the distribued job, encoded as a string. 
         Passed by ``varuna.launcher`` to each worker as an argument.
     :type stage_to_rank_map: dict
-    :param dummy_inputs: Sample inputs to the model as a dictionary. These are used to profile the             
-        model as ``model(**dummy_inputs)``. The batch size dimention in these inputs can be any ``n>=1``,
-        but is recommended to be small for speed.
-    :type dummy_inputs: dict
+    :param get_batch_fn: Function to get sample input batches of a given size, as dictionaries. 
+        These are used to profile the model structure as ``model(**get_batch_fn(k, device='cpu))``.
+    :type get_batch_fn: function(size: int, device: torch.device or None)
     :param batch_size: Global batch size for the distributed training job.
     :type batch_size: int
     :param chunk_size: The micro-batch size to be used for pipeline parallelism.
@@ -511,7 +510,7 @@ class Varuna(Module):
         amp_C.multi_tensor_scale(65536,
             overflow_buf,
             [master_grads, allreduced_views],
-            loss_scale / (self.data_depth * self.chunks))
+            loss_scale / (self.data_depth))
 
         if log_verbose:
             print(f'{self.rank} {self.rank_within_stage} starting gradient all-reduce')

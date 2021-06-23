@@ -15,7 +15,8 @@
     <script src="_static/language_data.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
-    <link rel="prev" title="Varuna documentation" href="index.html" />
+    <link rel="next" title="Profiling for Varuna" href="profiler.html" />
+    <link rel="prev" title="CutPoints" href="cutpoint.html" />
    
   <link rel="stylesheet" href="_static/custom.css" type="text/css" />
   
@@ -68,7 +69,7 @@ The optimizer needs to be registered with Varuna using a setter.</p>
 </div>
 <dl class="py class">
 <dt id="varuna.Varuna">
-<em class="property">class </em><code class="sig-prename descclassname">varuna.</code><code class="sig-name descname">Varuna</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">model</span></em>, <em class="sig-param"><span class="n">stage_to_rank_map</span></em>, <em class="sig-param"><span class="n">dummy_inputs</span></em>, <em class="sig-param"><span class="n">batch_size</span></em>, <em class="sig-param"><span class="n">chunk_size</span></em>, <em class="sig-param"><span class="n">fp16</span><span class="o">=</span><span class="default_value">False</span></em>, <em class="sig-param"><span class="n">local_rank</span><span class="o">=</span><span class="default_value">- 1</span></em>, <em class="sig-param"><span class="n">device</span><span class="o">=</span><span class="default_value">- 1</span></em>, <em class="sig-param"><span class="n">shared_weights</span><span class="o">=</span><span class="default_value">None</span></em>, <em class="sig-param"><span class="n">from_cache</span><span class="o">=</span><span class="default_value">True</span></em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna" title="Permalink to this definition">¶</a></dt>
+<em class="property">class </em><code class="sig-prename descclassname">varuna.</code><code class="sig-name descname">Varuna</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">model</span></em>, <em class="sig-param"><span class="n">stage_to_rank_map</span></em>, <em class="sig-param"><span class="n">get_batch_fn</span></em>, <em class="sig-param"><span class="n">batch_size</span></em>, <em class="sig-param"><span class="n">chunk_size</span></em>, <em class="sig-param"><span class="n">fp16</span><span class="o">=</span><span class="default_value">False</span></em>, <em class="sig-param"><span class="n">local_rank</span><span class="o">=</span><span class="default_value">- 1</span></em>, <em class="sig-param"><span class="n">device</span><span class="o">=</span><span class="default_value">- 1</span></em>, <em class="sig-param"><span class="n">shared_weights</span><span class="o">=</span><span class="default_value">None</span></em>, <em class="sig-param"><span class="n">from_cache</span><span class="o">=</span><span class="default_value">True</span></em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna" title="Permalink to this definition">¶</a></dt>
 <dd><p>Module to implement varuna training. The model must be wrapped in an instance 
 of <code class="docutils literal notranslate"><span class="pre">Varuna</span></code> before training. This should be done before optimizer creation and the 
 <code class="xref py py-attr docutils literal notranslate"><span class="pre">model</span></code> passed should be on CPU.</p>
@@ -78,22 +79,25 @@ The partitioned model is then moved to the allocated cuda device. The profiling
 information is cached and can be re-used on resuming, unless <code class="xref py py-attr docutils literal notranslate"><span class="pre">from_cache</span></code> is False.
 The <code class="docutils literal notranslate"><span class="pre">Varuna</span></code> module performs mixed precision training internally if enabled through the 
 <code class="xref py py-attr docutils literal notranslate"><span class="pre">fp16</span></code> arg, no external handling is required.</p>
-<dl>
-<dt>Args:</dt><dd><p>model (nn.Module): The model to initialize for training.</p>
-<p>stage_to_rank_map (str): Placement of pipeline stages in the distribued job, encoded as a string. 
-Passed by <code class="docutils literal notranslate"><span class="pre">varuna.launcher</span></code> to each worker as an argument.</p>
-<p>dummy_inputs (dict): Sample inputs to the model as a dictionary. These are used to profile the             model as <code class="docutils literal notranslate"><span class="pre">model(**dummy_inputs)</span></code>. The batch size dimention in these inputs can be any <code class="docutils literal notranslate"><span class="pre">n&gt;=1</span></code>,
-but is recommended to be small for speed.</p>
-<p>batch_size (int): Global batch size for the distributed training job.</p>
-<p>chunk_size (int): The micro-batch size to be used for pipeline parallelism.</p>
-<p>fp16 (bool): whether to enable mixed precision training.</p>
-<p>local_rank (int): The local rank as passed by <code class="docutils literal notranslate"><span class="pre">varuna.launcher</span></code>. If not given, 
-defaults to the global rank.</p>
-<p>device (int): index of the cuda device to use. Recommended to be the same as local_rank,
-which is the default if not specified.</p>
-<p>shared_weights (list or None): A list of tuples, where each each tuple is a pair of weight names (strings),
-such that the two weights are shared in the model (see weight sharing)</p>
-<p>from_cache (bool): Whether to use cached profiling information if available.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters</dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>model</strong> (<em>torch.nn.Module</em>) – The model to initialize for training.</p></li>
+<li><p><strong>stage_to_rank_map</strong> (<em>dict</em>) – Placement of pipeline stages in the distribued job, encoded as a string. 
+Passed by <code class="docutils literal notranslate"><span class="pre">varuna.launcher</span></code> to each worker as an argument.</p></li>
+<li><p><strong>get_batch_fn</strong> (<em>function</em><em>(</em><em>size: int</em><em>, </em><em>device: torch.device</em><em> or </em><em>None</em><em>)</em>) – Function to get sample input batches of a given size, as dictionaries. 
+These are used to profile the model structure as <code class="docutils literal notranslate"><span class="pre">model(**get_batch_fn(k,</span> <span class="pre">device='cpu))</span></code>.</p></li>
+<li><p><strong>batch_size</strong> (<em>int</em>) – Global batch size for the distributed training job.</p></li>
+<li><p><strong>chunk_size</strong> (<em>int</em>) – The micro-batch size to be used for pipeline parallelism.</p></li>
+<li><p><strong>fp16</strong> (<em>bool</em>) – whether to enable mixed precision training.</p></li>
+<li><p><strong>local_rank</strong> (<em>int</em>) – The local rank as passed by <code class="docutils literal notranslate"><span class="pre">varuna.launcher</span></code>. If not given, 
+defaults to the global rank.</p></li>
+<li><p><strong>device</strong> (<em>int</em>) – index of the cuda device to use. Recommended to be the same as local_rank,
+which is the default if not specified.</p></li>
+<li><p><strong>shared_weights</strong> (<em>list</em><em> or </em><em>None</em>) – A list of tuples, where each each tuple is a pair of weight names (strings),
+such that the two weights are shared in the model (see weight sharing)</p></li>
+<li><p><strong>from_cache</strong> (<em>bool</em>) – Whether to use cached profiling information if available.</p></li>
+</ul>
 </dd>
 </dl>
 <div class="admonition note">
@@ -108,12 +112,15 @@ should be called to connect the two.</p>
 <code class="sig-name descname">set_optimizer</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">optimizer</span></em>, <em class="sig-param"><span class="n">loss_scale</span><span class="o">=</span><span class="default_value">'dynamic'</span></em>, <em class="sig-param"><span class="n">init_loss_scale</span><span class="o">=</span><span class="default_value">1048576</span></em>, <em class="sig-param"><span class="n">min_loss_scale</span><span class="o">=</span><span class="default_value">1.0</span></em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna.set_optimizer" title="Permalink to this definition">¶</a></dt>
 <dd><p>Configure optimizer for training. if <code class="docutils literal notranslate"><span class="pre">fp16</span></code> is enabled, this function
 initializes the mixed precision state in apex.</p>
-<dl>
-<dt>Args:</dt><dd><p>optimizer (nn.Optimizer): the optimizer for training.</p>
-<p>loss_scale (float or “dynamic”, optional): A floating point number for a static loss scale 
-or the string “dynamic” for dynamic loss scaling.</p>
-<p>init_loss_scale (float, optional): Initial loss scale (for dynamic scaling)</p>
-<p>min_loss_scale (float, optional): minimum loss scale (for dynamic scaling)</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters</dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>optimizer</strong> (<em>torch.nn.Optimizer</em>) – the optimizer for training.</p></li>
+<li><p><strong>loss_scale</strong> (<em>float</em><em> or </em><em>&quot;dynamic&quot;</em><em>, </em><em>optional</em>) – A floating point number for a static loss scale 
+or the string “dynamic” for dynamic loss scaling.</p></li>
+<li><p><strong>init_loss_scale</strong> (<em>float</em><em>, </em><em>optional</em>) – Initial loss scale (for dynamic scaling)</p></li>
+<li><p><strong>min_loss_scale</strong> (<em>float</em><em>, </em><em>optional</em>) – minimum loss scale (for dynamic scaling)</p></li>
+</ul>
 </dd>
 </dl>
 </dd></dl>
@@ -124,15 +131,23 @@ or the string “dynamic” for dynamic loss scaling.</p>
 <dd><p>Perform a single training step. Executes forward and backward passes for 
 the global batch. This function must be called by all distributed workers in the training loop.
 After this function, the optimizer gradients are reduced accross data parallel replicas and
-overflow is checked for mixed precision training.</p>
-<p>Returns average loss and a boolean for overflow.</p>
-<dl>
-<dt>Args:</dt><dd><p>inputs (dict): The inputs to the model as a dictionary. These should be coordinated amongst workers -
+overflow is checked for mixed precision training. Returns average loss and a boolean for overflow.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters</dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>inputs</strong> (<em>dict</em>) – The inputs to the model as a dictionary. These should be coordinated amongst workers -
 the global batch is sharded across data parallel replicas, so each worker should have 
 <code class="docutils literal notranslate"><span class="pre">global_batch_size</span> <span class="pre">/</span> <span class="pre">data_parallel_depth</span></code> number of examples. And all pipeline stages of the same
-data parallel replica should recieve the same inputs.</p>
-<p>clip_grad_max_norm (float or None, optional): If given, the L2 gradient norm of the entire model
-is clipped to this upper bound.</p>
+data parallel replica should recieve the same inputs.</p></li>
+<li><p><strong>clip_grad_max_norm</strong> (<em>float</em><em> or </em><em>None</em><em>, </em><em>optional</em>) – If given, the L2 gradient norm of the entire model
+is clipped to this upper bound.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns</dt>
+<dd class="field-even"><p>A tuple of the form (average_loss, overflow)</p>
+</dd>
+<dt class="field-odd">Return type</dt>
+<dd class="field-odd"><p>tuple[float, bool]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -142,13 +157,16 @@ is clipped to this upper bound.</p>
 <code class="sig-name descname">checkpoint</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">global_store</span></em>, <em class="sig-param"><span class="n">step</span><span class="o">=</span><span class="default_value">None</span></em>, <em class="sig-param"><span class="n">tempdir</span><span class="o">=</span><span class="default_value">None</span></em>, <em class="sig-param"><span class="n">shard</span><span class="o">=</span><span class="default_value">False</span></em>, <em class="sig-param"><span class="n">on_demand</span><span class="o">=</span><span class="default_value">False</span></em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna.checkpoint" title="Permalink to this definition">¶</a></dt>
 <dd><p>Writes a varuna checkpoint with model parameters, optimizer state etc. 
 Each checkpoint is a directory, written under the given path.</p>
-<dl>
-<dt>Args:</dt><dd><p>global_store (str): path to a folder accessible by all nodes/ranks in the training job. 
-For example, path to a mounted blob storage. This is where the varuna checkpoint folder is written.</p>
-<p>step (int or None): iteration number for checkpoint. If None, it’ll be taken from varuna’s tracked progress.</p>
-<p>tempdir (str): path to a local directory to which to write checkpoints temporarily, and sync
-with the global store in the background. Lowers checkpoint write time in the critical path.</p>
-<p>shard (bool): whether to shard checkpoint writes over data parallel workers as well. Speeds up checkpoint</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters</dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>global_store</strong> (<em>dict</em>) – path to a folder accessible by all nodes/ranks in the training job. 
+For example, path to a mounted blob storage. This is where the varuna checkpoint folder is written.</p></li>
+<li><p><strong>step</strong> (<em>int</em><em> or </em><em>None</em><em>, </em><em>optional</em>) – iteration number for checkpoint. If None, it’ll be taken from varuna’s tracked progress.</p></li>
+<li><p><strong>tempdir</strong> (<em>str</em><em>, </em><em>optional</em>) – path to a local directory to which to write checkpoints temporarily, and sync
+with the global store in the background. Lowers checkpoint write time in the critical path.</p></li>
+<li><p><strong>shard</strong> (<em>bool</em><em>, </em><em>optional</em>) – whether to shard checkpoint writes over data parallel workers as well. Speeds up checkpoint</p></li>
+</ul>
 </dd>
 </dl>
 </dd></dl>
@@ -159,25 +177,39 @@ with the global store in the background. Lowers checkpoint write time in the cri
 <dd><p>Loads a varuna checkpoint from a shared directory. Each varuna checkpoint is a directory
 named as “varuna_ckpt_&lt;iteration&gt;”. So the path under which all such checkpoints were written
 should be specified.</p>
-<blockquote>
-<div><dl>
-<dt>Args:</dt><dd><p>global_store (str): path under which varuna checkpoints were written. 
-Should be accessible by all workers.</p>
-<p>iteration (int): Which iteration checkpoint to load.</p>
-<p>check_complete (bool, optional): Check that the checkpoint is complete before loading it.
-A checkpoint can be incomplete if the write was interrupted.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters</dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>global_store</strong> (<em>str</em>) – path under which varuna checkpoints were written. 
+Should be accessible by all workers.</p></li>
+<li><p><strong>iteration</strong> (<em>int</em>) – Which iteration checkpoint to load.</p></li>
+<li><p><strong>check_complete</strong> (<em>bool</em><em>, </em><em>optional</em>) – Check that the checkpoint is complete before loading it.
+A checkpoint can be incomplete if the write was interrupted.</p></li>
+</ul>
 </dd>
 </dl>
-</div></blockquote>
 </dd></dl>
 
 <dl class="py method">
 <dt id="varuna.Varuna.evaluate">
-<code class="sig-name descname">evaluate</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">inputs</span></em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna.evaluate" title="Permalink to this definition">¶</a></dt>
-<dd><p>Evaluate the model on the given inputs. Returns loss.</p>
-<dl class="simple">
-<dt>Args:</dt><dd><p>inputs (dict): Model inputs as dictionary. The number of examples
-for these inputs should be the same as the batch_size defined for training.</p>
+<code class="sig-name descname">evaluate</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">inputs</span></em>, <em class="sig-param"><span class="n">batch_size</span><span class="o">=</span><span class="default_value">None</span></em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna.evaluate" title="Permalink to this definition">¶</a></dt>
+<dd><p>Evaluate the model on the given inputs. This must be called on all workers
+because it uses pipeline &amp; data parallelism. Inputs should be for the respective data parallel replica
+and have <code class="docutils literal notranslate"><span class="pre">batch_size/data_parallel_depth</span></code> examples, similar to <a class="reference internal" href="#varuna.Varuna.step" title="varuna.Varuna.step"><code class="xref py py-func docutils literal notranslate"><span class="pre">step()</span></code></a>.
+Returns loss averaged over all workers.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters</dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>inputs</strong> (<em>dict</em>) – Model inputs as dictionary. The number of examples
+for these inputs should be the same as the batch_size defined for training.</p></li>
+<li><p><strong>batch_size</strong> (<em>int</em><em>, </em><em>optional</em>) – Batch size for evaluation, if not given it’s the same as training batch size.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns</dt>
+<dd class="field-even"><p>average loss</p>
+</dd>
+<dt class="field-odd">Return type</dt>
+<dd class="field-odd"><p>float</p>
 </dd>
 </dl>
 </dd></dl>
@@ -205,14 +237,17 @@ for these inputs should be the same as the batch_size defined for training.</p>
 <h3>Navigation</h3>
 <p class="caption"><span class="caption-text">Contents:</span></p>
 <ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="cutpoint.html">CutPoints</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">The Varuna class</a></li>
+<li class="toctree-l1"><a class="reference internal" href="profiler.html">Profiling for Varuna</a></li>
 </ul>
 
 <div class="relations">
 <h3>Related Topics</h3>
 <ul>
   <li><a href="index.html">Documentation overview</a><ul>
-      <li>Previous: <a href="index.html" title="previous chapter">Varuna documentation</a></li>
+      <li>Previous: <a href="cutpoint.html" title="previous chapter">CutPoints</a></li>
+      <li>Next: <a href="profiler.html" title="next chapter">Profiling for Varuna</a></li>
   </ul></li>
 </ul>
 </div>

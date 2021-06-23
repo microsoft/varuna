@@ -1,0 +1,161 @@
+
+<!DOCTYPE html>
+
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Profiling for Varuna &#8212; Varuna  documentation</title>
+    <link rel="stylesheet" href="_static/alabaster.css" type="text/css" />
+    <link rel="stylesheet" href="_static/pygments.css" type="text/css" />
+    <script id="documentation_options" data-url_root="./" src="_static/documentation_options.js"></script>
+    <script src="_static/jquery.js"></script>
+    <script src="_static/underscore.js"></script>
+    <script src="_static/doctools.js"></script>
+    <script src="_static/language_data.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="prev" title="The Varuna class" href="varuna.html" />
+   
+  <link rel="stylesheet" href="_static/custom.css" type="text/css" />
+  
+  
+  <meta name="viewport" content="width=device-width, initial-scale=0.9, maximum-scale=0.9" />
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <div class="section" id="profiling-for-varuna">
+<h1>Profiling for Varuna<a class="headerlink" href="#profiling-for-varuna" title="Permalink to this headline">¶</a></h1>
+<p>The Varuna <code class="xref py py-class docutils literal notranslate"><span class="pre">Profiler</span></code> provides an easy interface for users to profile
+the compute and communication operations of a model. This processes the model cutpoints in parallel
+and captures the time and memory consumption for each cutpoint. This profile can then be used to calculate
+various parameters for Varuna - ideal pipeline and data-parallel dimensions for a given number of GPUs and
+suitable microbatch sizes for different configs.</p>
+<dl class="py class">
+<dt id="varuna.Profiler">
+<em class="property">class </em><code class="sig-prename descclassname">varuna.</code><code class="sig-name descname">Profiler</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">model</span></em>, <em class="sig-param"><span class="n">get_batch</span></em>, <em class="sig-param"><span class="n">device</span><span class="o">=</span><span class="default_value">- 1</span></em>, <em class="sig-param"><span class="n">gpus_per_node</span><span class="o">=</span><span class="default_value">None</span></em>, <em class="sig-param"><span class="n">fp16</span><span class="o">=</span><span class="default_value">False</span></em>, <em class="sig-param"><span class="n">out_folder</span><span class="o">=</span><span class="default_value">'profiles'</span></em>, <em class="sig-param"><span class="n">pstages_to_profile</span><span class="o">=</span><span class="default_value">None</span></em>, <em class="sig-param"><span class="n">from_cache</span><span class="o">=</span><span class="default_value">True</span></em>, <em class="sig-param"><span class="n">add_to_existing</span><span class="o">=</span><span class="default_value">False</span></em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Profiler" title="Permalink to this definition">¶</a></dt>
+<dd><p>Module for varuna profiling. Similar to <code class="docutils literal notranslate"><span class="pre">Varuna</span></code> class, the model must be 
+wrapped in an instance of <code class="docutils literal notranslate"><span class="pre">Profiler</span></code> before optimizer creation and the 
+<code class="xref py py-attr docutils literal notranslate"><span class="pre">model</span></code> passed should be on CPU.</p>
+<p>Varuna profiling runs in a distributed process and the <code class="docutils literal notranslate"><span class="pre">Profiler</span></code> should
+be used by each worker. Each worker profiles compute for the different <a href="#id1"><span class="problematic" id="id2">``</span></a>CutPoint``s 
+in the model while simultaneously measuring communication links between workers.
+The profiler should be used in three steps:</p>
+<dl class="simple">
+<dt>def get_batch_fn(size, device):</dt><dd><p># function to get sample batches of given size for profiling
+return batch</p>
+</dd>
+<dt>profiler = Profiler(model, get_batch_fn, fp16=args.fp16, device = args.local_rank,</dt><dd><p>from_cache=True, out_folder=args.save)</p>
+</dd>
+</dl>
+<p>profile = profiler.profile_all(microbatch_sizes_to_profile)</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters</dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>model</strong> (<em>torch.nn.Module</em>) – The model to profile.</p></li>
+<li><p><strong>get_batch_fn</strong> (<em>function</em><em>(</em><em>size</em><em>, </em><em>device='cpu'</em><em>)</em>) – Function to get batch of a given size, used for different sizes by the profiler</p></li>
+<li><p><strong>device</strong> (<em>int</em>) – index of the cuda device to use. Recommended to be the same as local_rank,
+which is the default if not specified.</p></li>
+<li><p><strong>fp16</strong> (<em>bool</em>) – whether to enable mixed precision training.</p></li>
+<li><p><strong>from_cache</strong> (<em>bool</em>) – Whether to use cached information anout model structure, if available.</p></li>
+<li><p><strong>out_folder</strong> (<em>string</em><em> or </em><em>PathLike object</em>) – Path to folder for saving compute and communication profiles</p></li>
+<li><p><strong>pstages_to_profile</strong> – List of indices of cutpoints to profile, by default this contains all cutpoints</p></li>
+</ul>
+</dd>
+</dl>
+<p>:type list or None
+:param add_to_existing: Whether to continue profiling by adding to cutpoint profiles already saved in out_folder
+:type add_To_existing: bool</p>
+<dl class="py method">
+<dt id="varuna.Profiler.set_optimizer">
+<code class="sig-name descname">set_optimizer</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">optimizer</span></em>, <em class="sig-param"><span class="n">amp_opt_level</span><span class="o">=</span><span class="default_value">'O2'</span></em>, <em class="sig-param"><span class="n">loss_scale</span><span class="o">=</span><span class="default_value">'dynamic'</span></em>, <em class="sig-param"><span class="n">init_loss_scale</span><span class="o">=</span><span class="default_value">1048576</span></em>, <em class="sig-param"><span class="n">min_loss_scale</span><span class="o">=</span><span class="default_value">None</span></em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Profiler.set_optimizer" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt id="varuna.Profiler.profile_all">
+<code class="sig-name descname">profile_all</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">microbatch_sizes</span></em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Profiler.profile_all" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+</div>
+
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="main navigation">
+        <div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="index.html">Varuna</a></h1>
+
+
+
+
+
+
+
+
+<h3>Navigation</h3>
+<p class="caption"><span class="caption-text">Contents:</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="cutpoint.html">CutPoints</a></li>
+<li class="toctree-l1"><a class="reference internal" href="varuna.html">The Varuna class</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Profiling for Varuna</a></li>
+</ul>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="index.html">Documentation overview</a><ul>
+      <li>Previous: <a href="varuna.html" title="previous chapter">The Varuna class</a></li>
+  </ul></li>
+</ul>
+</div>
+<div id="searchbox" style="display: none" role="search">
+  <h3 id="searchlabel">Quick search</h3>
+    <div class="searchformwrapper">
+    <form class="search" action="search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" />
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</div>
+<script>$('#searchbox').show(0);</script>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &copy;2021, Nitika Saran.
+      
+      |
+      Powered by <a href="http://sphinx-doc.org/">Sphinx 3.1.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="_sources/profiler.rst.txt"
+          rel="nofollow">Page source</a>
+    </div>
+
+    
+
+    
+  </body>
+</html>
