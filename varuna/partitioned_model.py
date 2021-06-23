@@ -94,7 +94,7 @@ def dry_run(model, get_batch, from_cache):
     # executes the forward pass of the module on dummy inputs. 
     # Sets the order in which modules are used and the total number of cutpoints declared.
 
-    dummy_inputs = get_batch(1)
+    dummy_inputs = get_batch(1, device='cpu')
     ordered_modules = OrderedDict()
     input_shapes = {}
     num_cutpoints = 0
@@ -122,7 +122,7 @@ def dry_run(model, get_batch, from_cache):
     model(**dummy_inputs)
     input_shapes_1 = input_shapes
     input_shapes = dict()
-    dummy_inputs_2 = get_batch(2)
+    dummy_inputs_2 = get_batch(2, 'cpu')
     model(**dummy_inputs_2)
     input_shapes_2 = input_shapes
     input_shapes = input_shapes_1
@@ -235,7 +235,7 @@ class PartitionedModel(Module):
                 self.num_cutpoints = read_dry_run_out(self.module)
             
         if self.local_rank == 0 and not (from_cache and os.path.exists("_tmp_pstage_mapping")):
-            dummy_inputs = get_batch(1)
+            dummy_inputs = get_batch(1, "cpu")
             # TODO: do we really need these many dry runs?
             self.trace_and_store_param_access(dummy_inputs)
             dist.barrier()

@@ -113,7 +113,6 @@ def generate_schedule(chunks, stage, partitions):
     for step in steps:
         task = step.split(',')
         schedule.append((int(task[0]), int(task[1])))
-    print("schedule",schedule)
     return schedule
 
 def parse_stage_to_rank_map(stage_to_rank_map_str):

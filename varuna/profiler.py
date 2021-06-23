@@ -88,8 +88,9 @@ def sender(send_rank, send_shape, send_times, dtype):
 class Profiler:
 
     def __init__(self, model, get_batch, device=-1, gpus_per_node=None, 
-                fp16 = False, out_folder="profiles", stages_to_profile=None, 
+                fp16 = False, out_folder="profiles", pstages_to_profile=None, 
                 from_cache=True, add_to_existing=False):
+        stages_to_profile = pstages_to_profile
         self.model = model
         self.ret_val = None
         self.fp16 = fp16
@@ -111,6 +112,7 @@ class Profiler:
         self.comm_profile = {}
         self.initialize(get_batch, stages_to_profile, from_cache, add_to_existing)
         self.get_batch_fn = get_batch
+        self.optimizer = None
 
     # TODO: this func is v long
     def initialize(self, get_batch, stages_to_profile=None, from_cache=True, add_to_existing=False):
@@ -309,6 +311,23 @@ class Profiler:
 
         self.model_pruned = True
     
+    def set_optimizer(self, optimizer, amp_opt_level="O2", loss_scale = "dynamic",
+                            init_loss_scale = 2**20, min_loss_scale=None):
+        self.optimizer = optimizer
+        basemodel = self.model
+
+        if self.fp16:
+            assert  loss_scale == 'dynamic' or type(loss) == float, \
+                    "Loss scale must either be a floating point or the string 'dynamic'"
+            
+            basemodel, optimizer = amp.initialize(  basemodel, self.optimizer, opt_level=amp_opt_level, 
+                                                    loss_scale=loss_scale, min_loss_scale=min_loss_scale )
+            if loss_scale == 'dynamic':
+                amp._amp_state.loss_scalers[0]._loss_scale = init_loss_scale
+            
+            self.model = basemodel
+            self.optimizer = optimizer
+
     def get_all_reduce_sizes(self):
         
         factors = []
@@ -356,7 +375,7 @@ class Profiler:
         # executes the forward pass of the module on dummy inputs. 
         # Sets the order in which modules are used and the total number of cutpoints declared.
 
-        dummy_inputs = get_batch(1)
+        dummy_inputs = get_batch(1, device='cpu')
         self.dummy_inputs = dummy_inputs
         
         if self.local_rank == 0 and not (from_cache and \
@@ -412,7 +431,9 @@ class Profiler:
         if self.fp16:
             self.model = self.model.to(torch.float32)
 
-    def profile_all(self,  microbatch_sizes, optimizer):
+    def profile_all(self,  microbatch_sizes):
+        assert self.optimizer is not None, "Must call set_optimizer() before profiling!"
+        optimizer = self.optimizer
 
         out_folder = self.out_folder
         for i in range(self.num_rounds):     
