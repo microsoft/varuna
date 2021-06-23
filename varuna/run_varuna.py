@@ -55,6 +55,15 @@ def get_launch_cmd_format(args):
     launch_cmd = " ".join(launch_cmd)
     return launch_cmd
 
+def get_env_vars(file):
+    if not os.path.exists(file):
+        return ""
+    f =  open(file,"r")
+    envstr = ""
+    for line in f:
+        envstr += line.strip("\n")
+        return envstr
+
 def parse_args():
     """
     Helper function parsing the command line options
@@ -73,6 +82,8 @@ def parse_args():
                                   "If not given, it defaults to the IP of the machine from which varuna is triggered.")
     parser.add_argument("--no_morphing", action="store_true",
                         help = "disable varuna's support for job morphing on a changing resource set.")
+    parser.add_argument("--env_file", type=str, default="varuna.env",
+                        help = "file with environment variables for varuna command")
 
     # launch worker args
     parser.add_argument("--nstages", type=int, default=None,
@@ -153,8 +164,9 @@ if __name__ == "__main__":
         cmd = ["ssh"]
         cmd.append(machine)
         cmd.append(f"echo \"{launch_cmd}\" > launch_varuna.sh; ")
-        cmd.append("export PATH=\"/home/varuna/anaconda3/bin:$PATH\";" )
-        cmd.append(f"{HEARTBEAT_IP_ENV_VAR}={args.manager_ip} {MORPH_PORT_ENV_VAR}={MORPH_PORT} {HEARTBEAT_PORT_ENV_VAR}={HEARTBEAT_PORT}")
+        cmd.append(f"{HEARTBEAT_IP_ENV_VAR}={args.manager_ip}") 
+        cmd.append(f"{MORPH_PORT_ENV_VAR}={MORPH_PORT} {HEARTBEAT_PORT_ENV_VAR}={HEARTBEAT_PORT}")
+        cmd.append(get_env_vars(args.env_file))
         cmd.append("bash launch_varuna.sh")
         print(" ".join(cmd ))
         out_file = open(f"ssh_logs/ssh_out_{i}", "w")
@@ -162,10 +174,3 @@ if __name__ == "__main__":
         process = subprocess.Popen(cmd, env=current_env, 
                                     stdout=out_file,
                                     stderr=err_file)
-
-
-
-
-
-
-

@@ -102,6 +102,8 @@ public:
     // Initialize queues
     char *gpipe_env = getenv("GPIPE");
     gpipe = gpipe_env==NULL ? 0 : (bool) atoi(gpipe_env);
+    char *pd_1f1b_env = getenv("PD_1F1B");
+    pd_1f1b = pd_1f1b_env==NULL ? 0 : (bool) atoi(pd_1f1b_env);
     fwd_ = new Queue('f');
     bwd_ = new Queue('b');
     rc_ = new Queue('r');
@@ -155,7 +157,7 @@ private:
   // std::vector<bool> acts_recvd, grads_recvd;
   int acts_left = 0;
   int grads_left = 0;
-  bool gpipe;
+  bool gpipe, pd_1f1b;
 };
 
 typedef class Stage Stage;
@@ -172,16 +174,21 @@ public:
 
     char *gpipe_env = getenv("GPIPE");
     gpipe = gpipe_env==NULL ? 0 : (bool) atoi(gpipe_env);
-    scattered = (bool) atoi(getenv("SCATTERED"));
-    GenSchedule s(pipeline_depth_, num_mini_, gpipe );
+    char *pd_1f1b_env = getenv("PD_1F1B");
+    pd_1f1b = pd_1f1b_env==NULL ? 0 : (bool) atoi(pd_1f1b_env);
+    char *scattered_env = getenv("SCATTERED");
+    scattered = scattered_env==NULL ? 0 : (bool) atoi(scattered_env);
+    char *gpus_per_vm_env = getenv("GPUS_PER_VM");
+    GPUS_PER_VM = gpus_per_vm_env==NULL ? 4 : atoi(gpus_per_vm_env);
+
+    GenSchedule s(pipeline_depth_, num_mini_, gpipe, pd_1f1b );
     std::vector<schedule_task> schedule[pipeline_depth_];
     s.Generate(schedule);
-
     if(fwd != 0 && bwd !=0){
       fwd_time_.insert(fwd_time_.end(), pipeline_depth_, fwd);
       bwd_time_.insert(bwd_time_.end(),pipeline_depth_, bwd);
       if(last_fwd != 0 || last_bwd != 0){
-        printf("last stages compute %d %d", last_fwd, last_bwd);
+        // printf("last stages compute %d %d", last_fwd, last_bwd);
         fwd_time_[pipeline_depth_-1] = last_fwd;
         bwd_time_[pipeline_depth_-1] = last_bwd;
       }
@@ -189,7 +196,6 @@ public:
       read_compute_times();
     }
     sendact_long_time_ = (send_long==0) ? sendact_time_ : send_long;
-    GPUS_PER_VM = 4;
     
     stages_ = (Stage**)malloc(sizeof(Stage*) * pipeline_depth_);
     for (int i = 0; i < pipeline_depth_; ++i) {
@@ -197,7 +203,7 @@ public:
     }
     clock_now_micros_ = 0;
 
-    DumpState();
+    // DumpState();
   }
   void Simulate();
   void DumpState();
@@ -315,6 +321,6 @@ private:
   int MAX_BWD = 0, MIN_BWD = 10000000; 
   int MAX_FWD_LONG = 0, MIN_FWD_LONG = 10000000; 
   int MAX_BWD_LONG = 0, MIN_BWD_LONG = 10000000; 
-  bool gpipe, scattered;
+  bool gpipe, scattered, pd_1f1b;
   int data_depth;
 };
