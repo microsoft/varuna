@@ -10,6 +10,7 @@ from megatron import get_args
 from varuna import Profiler
 from apex.optimizers import FusedLAMB as LAMB
 
+import os
 import torch
 
 from apex import amp
@@ -18,12 +19,20 @@ from apex.amp import _amp_state
 set_global_variables(args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
 args = get_args()
 
-max_micro_BS = 50
+max_micro_BS = 25
 
 train_val_test_num_samples = [ 5 * max_micro_BS, 0, 0 ]
 
+init_method = 'tcp://'
+master_ip = os.getenv('MASTER_ADDR', 'localhost')
+master_port = os.getenv('MASTER_PORT', '6000')
+init_method += master_ip + ':' + master_port
+print("initializing", args.rank, args.world_size, init_method, flush=True)
+torch.distributed.init_process_group(backend="gloo", world_size=args.world_size, 
+                    rank=args.rank, init_method=init_method)
+
 model = GPT2Model(num_tokentypes=0, parallel_output=True)
-profiler = Profiler(model, args.fp16)
+profiler = Profiler(model, 0, fp16=args.fp16)
 
 # Build the datasets.
 train_ds, _test , _valid = build_train_valid_test_datasets(
@@ -68,19 +77,32 @@ def get_batch(size, device=None):
     
     return dry_run_input
 
-profiler.initialize(get_batch(1) , from_cache=False)
+profiler.initialize(get_batch(1), stages_to_profile=[0,1,args.num_layers-1], from_cache=True)
 
 # with open(profile_name,"w") as f:
 #     f.write(("Model memory: " + str(model_mem) + "\n"))
 
-param_groups = get_params_for_weight_decay_optimization(model)
-optimizer = LAMB(param_groups, lr=args.lr, weight_decay=args.weight_decay)
-if args.fp16:
-    if args.dynamic_loss_scale:
-        model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale="dynamic",min_loss_scale=args.min_scale)
-        amp._amp_state.loss_scalers[0]._loss_scale = 2**15
+optimizer = None
+from apex.fp16_utils import convert_network
+def get_optimizer(model):
+    global optimizer
+    param_groups = get_params_for_weight_decay_optimization(model)
+    if optimizer is None:
+        optimizer = LAMB(param_groups, lr=args.lr, weight_decay=args.weight_decay)
+        if args.fp16:
+            if args.dynamic_loss_scale:
+                model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale="dynamic",min_loss_scale=args.min_scale)
+                amp._amp_state.loss_scalers[0]._loss_scale = 2**15
+            else:
+                model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale=args.loss_scale, min_loss_scale=args.min_scale)
     else:
-        model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale=args.loss_scale, min_loss_scale=args.min_scale)
+        optimizer.param_groups = []
+        if args.fp16:
+            optimizer._lazy_init_maybe_master_weights()
+        convert_network(model, torch.float16)
+        for g in param_groups:
+            optimizer.add_param_group(g)
+        
+    return optimizer
 
-profile = profiler.profile(get_batch,[1]+ list(range(1,max_micro_BS)), optimizer)
- 
+profile = profiler.profile_all(get_batch, list(range(1,max_micro_BS)), get_optimizer, out_folder=args.save)

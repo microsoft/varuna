@@ -11,7 +11,7 @@ DATA_PATH=/home/$user/gpt2-blob/turing/megatron
 CHECKPOINT_PATH=/home/$user/gpt2-blob/dummy
 
 python -m varuna.run_varuna --nstages 4 --chunk_size 2 --batch_size 256 \
-       --code_dir /home/rahul/Varuna/Megatron-LM \
+       --code_dir /home/$user/Varuna/Megatron-LM \
        --gpus_per_node $GPUS_PER_SERVER --no_morphing pretrain_gpt2.py \
        --num-layers 24 \
        --hidden-size 1024 \

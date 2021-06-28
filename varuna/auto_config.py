@@ -4,29 +4,25 @@ import os
 import torch
 import pickle
 
-micro_batch = dict({27:	12,
-                    18:	10,
-                    9:	2,
-                    6:	2})
-
 class AutoConfig:
 
-    def __init__(self, num_gpus, gpus_per_vm, batch_size, num_pstages ,
-                profile_folder, gpu_memory_capacity=None, verbose=True):
+    def __init__(self, num_gpus, gpus_per_vm, batch_size,
+                profile_folder, gpu_memory_capacity=None, verbose=True, 
+                autofill_missing_compute=False):
 
         self.num_gpus = num_gpus
         self.batch_size = batch_size
         self.gpus_per_vm = gpus_per_vm
-        self.num_pstages = num_pstages
         if gpu_memory_capacity is None:
             gpu_memory_capacity = torch.cuda.get_device_properties(0).total_memory
         self.gpu_memory_capacity = gpu_memory_capacity
-        self.read_profile(profile_folder)
-        self.comm_size = 1024 * 1920
+        
+        self.read_model_structure()
+        self.read_profile(profile_folder, autofill_missing_compute)
 
-        num_stages_candidates = [ i for i in range(1, num_pstages) if num_pstages % i == 0]
-        num_stages_candidates = [6, 9, 18, 27]
+        num_stages_candidates = [ i for i in range(1, self.num_pstages) if self.num_pstages % i == 0]
         self.batch_times = dict()
+        self.micro_batch = dict()
 
         for pp_size in num_stages_candidates:
             if num_gpus < pp_size:
@@ -35,16 +31,23 @@ class AutoConfig:
             if verbose:
                 print("Stages", pp_size)
             # get highest micro batch for each num_stage_cand
-            mbs = micro_batch[pp_size]
-            mbs_ = self.get_microbatch_size(pp_size)
-            print(f"Predicted microbatch size for {pp_size}: {mbs_}")
+            mbs = self.get_microbatch_size(pp_size)
+            print(f"Predicted microbatch size for {pp_size}: {mbs}")
+            self.micro_batch[pp_size] = mbs
             dp_size = num_gpus // pp_size
+            cuts_per_stage = self.num_pstages // pp_size
             num_microbatches = math.ceil((batch_size // dp_size ) / mbs)
 
             self.calc_and_write_compute_times(pp_size, mbs)
             # TODO: comm profile for last cp in stage for each stage
             # TODO: comm profile missing send/long-send
-            comm_size = self.comm_size * mbs
+            if pp_size > 1:
+                comm_size = mbs
+                for d in self.input_shapes[cuts_per_stage]:
+                    comm_size *= d
+            else:
+                comm_size = 0
+            print("comm size", comm_size)
             send_time = self.comm_profile[comm_size]["send"]
             long_send_time = self.comm_profile[comm_size]["long_send"]
             if send_time == -1:
@@ -63,6 +66,7 @@ class AutoConfig:
             self.batch_times[pp_size] = batch_time
 
         print(self.batch_times)
+        print(self.micro_batch)
  
     def calc_and_write_compute_times(self, pp_size, mbs):
         pstages_per_stage = self.num_pstages // pp_size
@@ -77,6 +81,7 @@ class AutoConfig:
                 fwd_time += self.compute_profile[pstage][mbs]["fwd"]
                 bwd_time += self.compute_profile[pstage][mbs]["bwd"]
 
+            # TODO: COPY OR NO COPY !!!
             # # acts copy
             # if stage < (pp_size-1):
             #     copy = self.compute_profile[pstages_per_stage*(stage+1) - 1][mbs]["copy"]
@@ -93,7 +98,7 @@ class AutoConfig:
             bwd_times.append(bwd_time)
 
             out.write(f"{fwd_time} {bwd_time}\n")
-            print(f"{fwd_time} {bwd_time}")
+            # print(f"{fwd_time} {bwd_time}")
 
         out.close()
 
@@ -114,24 +119,31 @@ class AutoConfig:
         batch_time = batch_time / 1000000
         return batch_time
 
-       
+
     def get_min(self):
         min_time = 1000000000000
         best_pp = -1; best_mbs = -1
         for pp_size in self.batch_times:
             if min_time > self.batch_times[pp_size]:
                 best_pp = pp_size
-                best_mbs = micro_batch[pp_size]
+                best_mbs = self.micro_batch[pp_size]
                 min_time = self.batch_times[pp_size]
         return best_pp, best_mbs, min_time
 
-    def read_profile(self, profile_folfder):
+    def read_profile(self, profile_folfder, autofill_missing_compute=False):
         
         self.compute_profile = []
         self.comm_profile = []
         for i in range(self.num_pstages):
-            with open(os.path.join(profile_folfder, f"compute-profile-{i}"), "rb") as f:
-                compute_profile = pickle.load(f)            
+            profile_path = os.path.join(profile_folfder, f"compute-profile-{i}")
+            if os.path.exists(profile_path):
+                with open(profile_path, "rb") as f:
+                    compute_profile = pickle.load(f)
+            else:
+                assert autofill_missing_compute and i>0, \
+                "Missing compute profiles! Profile should have compute for at least one cutpoint." + \
+                "Enable flag autofill_missing_compute if some others are missing."
+                compute_profile = self.compute_profile[0]         
             self.compute_profile.append(compute_profile)
 
         with open(os.path.join(profile_folfder, f"comm-profile"), "rb") as f:
@@ -139,6 +151,18 @@ class AutoConfig:
 
         with open(os.path.join(profile_folfder, "allred-profile"), "rb") as f:
             self.all_reduce_profile = pickle.load(f)
+
+    def read_model_structure(self):
+        with open("_tmp_inp_shapes",'rb') as f:
+            input_shapes = pickle.load(f)
+        input_shapes_keys = list(input_shapes.keys())
+        self.input_shapes = [input_shapes[k][0] for k in input_shapes_keys]
+        with open("_tmp_shape_changes",'rb') as f:
+            shape_indices_to_change = pickle.load(f)
+        self.shape_indices_to_change = [shape_indices_to_change[k][0] for k in input_shapes_keys]
+        self.num_pstages = len(self.input_shapes) + 1
+        if verbose:
+            print(self.num_pstages,"cutpoints")
 
     def get_alr_time(self, dp_size, pp_size):
         if dp_size < 2:

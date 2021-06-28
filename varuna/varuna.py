@@ -39,19 +39,21 @@ def share_weight_grads(model, tied_group):
     rank_within_stage = model.stage_to_rank_map[model.stage].index(model.rank)
     for i,w in enumerate(model.shared_weights):
         recv_stage, send_stage = model.shared_weight_stages[i]
+        recv_wt_name, send_wt_name = w
+        recv_weight, send_weight = None, None
+        for p in parameter_names:
+            if parameter_names[p] == send_wt_name:
+                send_weight = p
+            if parameter_names[p] == recv_wt_name:
+                recv_weight = p
         if recv_stage == send_stage:
+            if recv_weight.data_ptr() != send_weight.data_ptr():
+                recv_weight.grad.add_(send_weight.grad)
+                send_weight.grad.data.copy_(recv_weight.grad.data)
             continue
-        if model.stage == send_stage:
-            for p in parameter_names:
-                if parameter_names[p] == w[1]:
-                    send_weight = p
-                    break
+        elif model.stage == send_stage:
             dist.all_reduce(send_weight.grad.data, group=tied_group)
         elif model.stage == recv_stage:
-            for p in parameter_names:
-                if parameter_names[p] == w[0]:
-                    recv_weight = p
-                    break
             dist.all_reduce(recv_weight.grad.data, group=tied_group)
 
     
@@ -63,7 +65,7 @@ class Varuna(Module):
     def __init__(self,
                 model,
                 stage_to_rank_map,
-                dummy_inputs,
+                get_batch_fn,
                 batch_size,
                 chunk_size,
                 fp16 = False, 
@@ -86,11 +88,11 @@ class Varuna(Module):
 
         model_in_cpu = not next(model.parameters()).is_cuda
         assert model_in_cpu, "Model should be on CPU before passing to varuna!"
-        assert isinstance(dummy_inputs, dict), "Sample inputs should be a dictionary!"
-        for key in dummy_inputs:
-            val = dummy_inputs[key]
-            if isinstance(val, torch.Tensor) and val.is_cuda:
-                dummy_inputs[key] = val.cpu()
+        # assert isinstance(dummy_inputs, dict), "Sample inputs should be a dictionary!"
+        # for key in dummy_inputs:
+        #     val = dummy_inputs[key]
+        #     if isinstance(val, torch.Tensor) and val.is_cuda:
+        #         dummy_inputs[key] = val.cpu()
 
         if device == -1:
             device = self.local_rank
@@ -103,7 +105,7 @@ class Varuna(Module):
 
         # partition model based on "CutPoint"s using a dry run with dummy inputs (dict)
         self.model = PartitionedModel(model, self.rank, self.local_rank, device, self.stage_to_rank_map, self.fp16, shared_weights)
-        self.model.initialize( dummy_inputs, from_cache=True )
+        self.model.initialize( get_batch_fn, from_cache=True )
         self.partitioned_model = self.model
         self.shared_weight_stages = self.model.shared_weight_stages if self.shared_weights is not None else None
 
@@ -117,14 +119,16 @@ class Varuna(Module):
 
         self.model.to(self.device)        
         self.init_distributed()
-        self.configure_checkpointing(dummy_inputs)
+        self.configure_checkpointing()
 
         self.config = {
             "stage": self.stage,
             "partitions": self.partitions,
             "fp16": self.fp16,
             "fwd_inp_shape": self.fwd_inp_shape,
+            "fwd_inp_shape_changes": self.fwd_inp_shape_changes,
             "bwd_grad_shape": self.bwd_grad_shape,
+            "bwd_grad_shape_changes": self.bwd_grad_shape_changes,
             "receive_rank": self.receive_rank,
             "send_rank": self.send_rank,
             "device": self.device,
@@ -159,13 +163,19 @@ class Varuna(Module):
             self.receive_rank = self.stage_to_rank_map[self.stage - 1][rank_within_stage]
 
         # set expected shapes of inputs and gradients for each partition
+        # TODO: are we planning to support multiple acts in cutpoints?
         self.fwd_inp_shape = self.bwd_grad_shape = None
+        self.fwd_inp_shape_changes = self.bwd_grad_shape_changes = None
         if self.stage > 0:
             self.fwd_inp_shape = self.model.forward_input_shapes[0]
-            self.fwd_inp_shape[0] = self.micro_batch_size
+            self.fwd_inp_shape_changes = self.model.fwd_inp_shape_changes[0]
+            for i in self.fwd_inp_shape_changes:
+                self.fwd_inp_shape[i] =  self.micro_batch_size
         if self.stage < (self.partitions-1):
             self.bwd_grad_shape = self.model.backward_grad_shapes[0]
-            self.bwd_grad_shape[0] = self.micro_batch_size
+            self.bwd_grad_shape_changes = self.model.bwd_grad_shape_changes[0]
+            for i in self.bwd_grad_shape_changes:
+                self.bwd_grad_shape[i] = self.micro_batch_size
 
     def init_distributed(self):
         # create same process groups on all ranks
@@ -205,7 +215,7 @@ class Varuna(Module):
             self.pipeline_group = pipeline_groups[current_replica]
             self.tied_group = tied_groups[current_replica]
 
-    def configure_checkpointing(self, dummy_inputs):
+    def configure_checkpointing(self):
         self.param_name_to_pstage = self.partitioned_model.parameter_names_to_cuts()
         # make temp dir for local ckpt trackers
         if self.local_rank == 0 and not os.path.exists(utils.VARUNA_TEMP_FOLDER):
@@ -283,7 +293,8 @@ class Varuna(Module):
             def recv(grads=False):
                 x_shape = list(self.fwd_inp_shape)
                 if self.last_chunk_size > 0:
-                    x_shape[0] = self.last_chunk_size
+                    for i in self.fwd_inp_shape_changes:
+                        x_shape[i] = self.last_chunk_size
                 x = torch.zeros(x_shape, dtype=torch.float16 if self.fp16 else torch.float32)
                 dist.recv(x, self.receive_rank)
                 return x.to(self.device)
@@ -479,7 +490,9 @@ class Pipeline:
         self.fp16 = config["fp16"]
 
         self.fwd_inp_shape = config["fwd_inp_shape"]
+        self.fwd_inp_shape_changes = config["fwd_inp_shape_changes"]
         self.bwd_grad_shape = config["bwd_grad_shape"]
+        self.bwd_grad_shape_changes = config["bwd_grad_shape_changes"]
         self.parameter_names = config["parameter_names"]
 
         self.shared_weights = config["shared_weights"]
@@ -532,7 +545,8 @@ class Pipeline:
                 fwd_inp_shape = self.fwd_inp_shape
                 if index == (chunks-1) and self.last_chunk_size > 0:
                     fwd_inp_shape = list(self.fwd_inp_shape)
-                    fwd_inp_shape[0] = self.last_chunk_size
+                    for d in self.fwd_inp_shape_changes:
+                        fwd_inp_shape[d] = self.last_chunk_size
                 acts_tensor = torch.ones(fwd_inp_shape, dtype=dtype)
                 handle = dist.irecv(acts_tensor, src=self.receive_rank)
                 recv_handles.put((handle, acts_tensor))
@@ -556,7 +570,8 @@ class Pipeline:
                 bwd_grad_shape = self.bwd_grad_shape
                 if index == (chunks-1) and self.last_chunk_size > 0:
                     bwd_grad_shape = list(self.bwd_grad_shape)
-                    bwd_grad_shape[0] = self.last_chunk_size
+                    for d in self.bwd_grad_shape_changes:
+                        bwd_grad_shape[d] = self.last_chunk_size
                 grads_tensor = torch.ones(bwd_grad_shape, dtype=dtype)
                 handle = dist.irecv(grads_tensor, src=self.send_rank)
                 recv_handles.put((handle, grads_tensor))
@@ -599,7 +614,8 @@ class Pipeline:
 
         while count > 0:
             input_grads = self.grads_send_queue.get()
-            handle = dist.isend(input_grads, dst=self.receive_rank)
+            # TODO: why is this contiguous needed ???
+            handle = dist.isend(input_grads.contiguous(), dst=self.receive_rank)
             send_handles.put(handle)
             if send_handles.qsize()>4:
                 handle = send_handles.get()

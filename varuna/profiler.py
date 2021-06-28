@@ -2,16 +2,21 @@ import torch
 import torch.distributed as dist
 from torch.nn import Module
 
-from .partitioned_model import CutPoint
+from .partitioned_model import CutPoint, dry_run, read_dry_run_out
 
 import os
 import time
 import pickle
+import math
 
 from collections import OrderedDict 
 import collections
 
-from apex import amp
+try:
+    from apex import amp
+except:
+    print("No apex")
+    
 import numpy as np
 import random, math
 
@@ -19,20 +24,32 @@ from queue import Queue
 from threading import Thread
 
 num_compute_passes = 5
+num_comm_passes = 30
 
-def receiver(recv_rank, recv_shape, recv_times):
-    print("Start reciever from", recv_rank)
-    chunks = 30
-    dtype = torch.float16
-    # recv_shape = list(prev_size) if recv_rank == prev_rank else list(next_size)
-    # recv_shape[0] = mBS
-    # recv_shape = torch.Size(recv_shape)
+DEBUG = False
+
+def remove_outliers(times, error_margin = 0.15):
+    times = sorted(times)
+    dp = len(times)
+    mid_i = dp // 2
+    median_time = times[mid_i]
+    filtered_times = []
+    if dp % 2 == 0:
+        median_time = (median_time + times[mid_i-1]) / 2
+    for t in times:
+        error = abs((t-median_time)/median_time)
+        if error < error_margin:
+            filtered_times.append(t)
+    return filtered_times
+
+# TODO: put these in common util/comm file
+def receiver(recv_rank, recv_shape, recv_times, dtype):
+    chunks = num_comm_passes
     recv_handles = Queue()
 
-    for _ in range(chunks):
+    for i in range(chunks):
         acts_tensor = torch.ones(recv_shape, dtype=dtype)
         start_time = time.time()
-        # print("recv from", recv_rank, flush=True)
         handle = dist.irecv(acts_tensor, src=recv_rank)
         recv_handles.put((handle, start_time))
         if recv_handles.qsize() > 4:
@@ -44,114 +61,126 @@ def receiver(recv_rank, recv_shape, recv_times):
         handle, start_time = recv_handles.get()
         handle.wait()
         recv_times.append(time.time() - start_time)
+
+    del acts_tensor
     
-def sender(send_rank, send_shape, send_times):
-    print("Start sender to",send_rank)
-    chunks = 30
-    dtype = torch.float16
-    # send_shape = list(prev_size) if send_rank == prev_rank else list(next_size)
-    # send_shape[0] = mBS
-    # send_shape = torch.Size(send_shape)
+def sender(send_rank, send_shape, send_times, dtype):
+    chunks = num_comm_passes
     send_handles = Queue()
 
-    for _ in range(chunks):
+    for i in range(chunks):
         output_acts = torch.ones(send_shape, dtype=dtype)
         start_time = time.time()
-        # print("send to", send_rank, flush=True)
         handle = dist.isend(output_acts, dst=send_rank)
         send_handles.put((handle, start_time))
         if send_handles.qsize() > 4:
             handle, start_time = send_handles.get()
             handle.wait()
             send_times.append(time.time() - start_time)
-        # count -= 1
     
     while not send_handles.empty():
         handle, start_time = send_handles.get()
         handle.wait()
         send_times.append(time.time() - start_time)
 
+    del output_acts
+
 class Profiler:
 
-    def __init__(self, model, fp16 = False):
+    def __init__(self, model, get_batch, device=-1, gpus_per_node=None, 
+                fp16 = False, out_folder="profiles", pstages_to_profile=None, 
+                from_cache=True, add_to_existing=False):
+        stages_to_profile = pstages_to_profile
         self.model = model
         self.ret_val = None
         self.fp16 = fp16
-
-        dist.init_process_group(backend="gloo")
-
         self.rank = dist.get_rank()
-        self.local_rank = int(os.getenv("LOCAL_RANK", self.rank))
-        self.device = torch.device('cuda')
+        self.local_rank = int(os.getenv("LOCAL_RANK", 0))
+        self.out_folder = out_folder
 
-    def initialize(self, dummy_inputs, from_cache=True):
-        self.dry_run(dummy_inputs, from_cache)
-        if self.rank < (self.num_cutpoints+1):
-            self.stage = self.rank
-            print("STAGE", self.stage)
-            self.trim_model(self.stage, self.stage+1)
-            # self.check_unused_parameters(dummy_inputs)
-        else:
-            self.stage = None
-        self.model.to(self.device)
+        if device == -1:
+            device = self.local_rank
+        self.device = device
+        torch.cuda.set_device(device)
 
-    def dry_run(self, dummy_inputs, from_cache):
-        # executes the forward pass of the module on dummy inputs. 
-        # Sets the order in which modules are used and the total number of cutpoints declared.
+        if gpus_per_node is None:
+            gpus_per_node = torch.cuda.device_count()
+        self.gpus_per_node = gpus_per_node
+        self.world_size = dist.get_world_size()
+        self.pre_cp = None
+        self.warmed_up = False
+        self.comm_profile = {}
+        self.initialize(get_batch, stages_to_profile, from_cache, add_to_existing)
+        self.get_batch_fn = get_batch
+        self.optimizer = None
 
-        self.ordered_modules = OrderedDict()
-        self.input_shapes = {}
-        self.num_cutpoints = 0
+    # TODO: this func is v long
+    def initialize(self, get_batch, stages_to_profile=None, from_cache=True, add_to_existing=False):
+        self.dry_run(get_batch, from_cache)
+        if stages_to_profile is None:
+            profiles_done = []
+            if add_to_existing:
+                profiles_done = sorted([int(f.split("-")[-1]) for f in os.listdir(self.out_folder) \
+                            if f.startswith("compute-profile-")])
+                comm_profile_path = os.path.join(self.out_folder, f"comm-profile")
+                alr_profile_path = os.path.join(self.out_folder, f"allred-profile")
+                if os.path.exists(comm_profile_path):
+                    with open(comm_profile_path, "rb") as f:
+                        comm_profile = pickle.load(f)
+                    for key in comm_profile:
+                        val = comm_profile[key]
+                        # TODO: this should also have weight for the single val?
+                        self.comm_profile[key] = {"send": [val["send"]], 
+                                        "long_send": [val["long_send"]]}
+                if os.path.exists(alr_profile_path):
+                    with open(comm_profile_path, "rb") as f:
+                        self.all_reduce_profile = pickle.load(f)
+            stages_to_profile = [s for s in range(self.num_cutpoints+1) if s not in profiles_done]
+        if self.world_size < len(stages_to_profile):
+            print(f"WARNING: Not enough resources to profile all cutpoints, profiling only first {self.world_size}")
+        # num_stages_to_profile = min(self.world_size, self.num_cutpoints+1)
+        stages_to_profile = stages_to_profile[:self.world_size]
+        print(f"Stages to profile: {stages_to_profile}")
+        
+        my_stages_to_profile = \
+            list(range(self.rank, len(stages_to_profile), self.world_size))
+        my_stages_to_profile = [stages_to_profile[i] for i in my_stages_to_profile]
+        self.prev_stages_to_profile = [-1 for _ in my_stages_to_profile]
+        if self.rank > 0:
+            i_ = 0
+            for i in range(self.rank-1, len(stages_to_profile), self.world_size):
+                if i_ >= len(my_stages_to_profile):
+                    break
+                self.prev_stages_to_profile[i_] = stages_to_profile[i]
+                i_ += 1
+        self.next_stages_to_profile = [-1 for _ in my_stages_to_profile]
+        if self.rank < self.world_size - 1:
+            i_ = 0
+            for i in range(self.rank+1, len(stages_to_profile), self.world_size):
+                if i_ >= len(my_stages_to_profile):
+                    break
+                self.next_stages_to_profile[i_] = stages_to_profile[i]
+                i_ += 1
 
-        if self.local_rank == 0 and (not (from_cache and os.path.exists("_tmp_ord_mod") and os.path.exists("_tmp_inp_shapes"))):
+        self.num_rounds = math.ceil(len(stages_to_profile) / self.world_size)
+        assert self.num_rounds == 1 or DEBUG      # should only be one round unless debugging
+        if DEBUG:
+            print("total rounds", self.num_rounds)
+            print("stages", my_stages_to_profile)
+            print("prev stages", self.prev_stages_to_profile)
+            print("next stages", self.next_stages_to_profile, flush=True)
 
-            def get_hook(name):
-                def add_module_hook(module, inputs, _output):
-                    self.ordered_modules[name] = module
-                    if isinstance(module, CutPoint):
-                        # if len(inputs) > 1: error
-                        self.input_shapes[name] = [list(inputs[0].size())]
-                return add_module_hook
+        self.stages_to_profile = my_stages_to_profile
 
-            modules = self.model.named_modules()
-            hooks = []
+        if DEBUG:
+            self.orig_modules = dict()
+            for name in self.ordered_modules:
+                self.orig_modules[name] = self.ordered_modules[name]
 
-            for name, module in modules:
-                if name == "":
-                    continue
-                hooks.append( module.register_forward_hook(get_hook(name)))
-                if isinstance(module, CutPoint):
-                    self.num_cutpoints += 1
-            
-            self.model(**dummy_inputs)
-
-            for h in hooks:
-                h.remove()
-
-            with open("_tmp_ord_mod",'wb') as f:
-                pickle.dump(list(self.ordered_modules.keys()),f)
-            with open("_tmp_inp_shapes",'wb') as f:
-                pickle.dump(self.input_shapes,f)
-            dist.barrier()
-
-        else:
-            dist.barrier()
-
-            with open("_tmp_ord_mod",'rb') as f:
-                ordered_modules = pickle.load(f)
-
-            for n in ordered_modules:
-                path = n.split(".")
-                modules = self.model._modules
-                for i in range(len(path) - 1):
-                    modules = modules[path[i]]._modules
-                self.ordered_modules[n] = modules[path[-1]]
-
-            with open("_tmp_inp_shapes",'rb') as f:
-                self.input_shapes = pickle.load(f)
-            self.num_cutpoints = len(self.input_shapes)
-    
-# """ Trims out the kth stage (starting from 1) from model. """
+        self.alr_factors, self.alr_sizes = self.get_all_reduce_sizes()
+        self.prep_stage(0)
+        
+    # TODO: unify this class and PartitionedModel  
     def trim_model(self, start=0, end=1):
 
         def attach_meta(cutpoint, index):
@@ -167,8 +196,10 @@ class Profiler:
 
         self.fwd_inp_shape = None
         self.bwd_grad_shape = None
+        self.bwd_grad_shape_changes = None
 
         self.pre_cp = None
+        self.post_cp = None
 
         used_modules = []
         is_used = {}
@@ -189,8 +220,11 @@ class Profiler:
                 if index == end:
                     attach_meta(module, start+1)
                     self.bwd_grad_shape = self.input_shapes[name][0]
+                    self.bwd_grad_shape_changes = self.shape_indices_to_change[name][0]
+                    self.post_cp = module
                 if index == start:
                     self.fwd_inp_shape = self.input_shapes[name][0]
+                    self.fwd_inp_shape_changes = self.shape_indices_to_change[name][0]
                     used_modules.append(name)
                     is_used[name] = True
                     attach_meta(module, start)
@@ -216,9 +250,9 @@ class Profiler:
                 modules[path[-1]] = None
                 modules[path[-1]] = PassThroughModule()
                 self.ordered_modules[m] = None
-            else:
-                print(m)
-    
+            # else:
+            #     print(m)
+        
     def check_unused_parameters(self, dummy_inputs):
         # set eval mode and clear grads
         prev_training = self.model.training
@@ -232,6 +266,7 @@ class Profiler:
                 m.set_pruning(True)
 
         # device = dummy_inputs[list(dummy_inputs.keys())[0]].device
+        # dtype = list(self.model.parameters())[0].dtype
         # forward
         if self.pre_cp is not None:
             self.pre_cp.recv_fn = lambda grads=False: \
@@ -252,6 +287,7 @@ class Profiler:
 
         self.ret_val = None
         to_remove = []
+        self.orig_params = dict()
         for n,p in self.model.named_parameters():
             if p.grad is None:
                 to_remove.append(n)
@@ -259,6 +295,7 @@ class Profiler:
                 parent = self.model
                 for i in range(len(path) - 1):
                     parent = getattr(parent, path[i])
+                self.orig_params[n] = p
                 setattr(parent,path[-1], None)
         
         # reset grads and train mode
@@ -274,6 +311,183 @@ class Profiler:
 
         self.model_pruned = True
     
+    def set_optimizer(self, optimizer, amp_opt_level="O2", loss_scale = "dynamic",
+                            init_loss_scale = 2**20, min_loss_scale=None):
+        self.optimizer = optimizer
+        basemodel = self.model
+
+        if self.fp16:
+            assert  loss_scale == 'dynamic' or type(loss) == float, \
+                    "Loss scale must either be a floating point or the string 'dynamic'"
+            
+            basemodel, optimizer = amp.initialize(  basemodel, self.optimizer, opt_level=amp_opt_level, 
+                                                    loss_scale=loss_scale, min_loss_scale=min_loss_scale )
+            if loss_scale == 'dynamic':
+                amp._amp_state.loss_scalers[0]._loss_scale = init_loss_scale
+            
+            self.model = basemodel
+            self.optimizer = optimizer
+
+    def get_all_reduce_sizes(self):
+        
+        factors = []
+        num_pstages = self.num_cutpoints + 1
+        for i in range(1,num_pstages + 1):
+            if num_pstages % i == 0:
+                factors += [i]
+        # factors = set(factors)
+
+        modules = self.ordered_modules
+        index = 1
+        pstage_to_param_count = dict()
+        pstage_to_param_count[0] = 0
+
+        for name in modules:
+            if name == "":
+                continue
+            module = modules[name]
+
+            pstage_param_count = 0
+            for p in module.parameters(recurse = False):
+                pstage_param_count += p.numel()
+            pstage_to_param_count[index-1] += pstage_param_count
+            
+            # only need to set up two cutpoints at most
+            if isinstance(module, CutPoint): 
+                pstage_to_param_count[index] = 0  
+                index += 1
+
+        factors = sorted(factors)[::-1]
+        param_sizes = []
+        for f in factors:
+            param_size = 0
+            num_pstages_per_stage = num_pstages // f
+            for i in range(num_pstages_per_stage):
+                param_size += pstage_to_param_count[i]
+            param_sizes.append(param_size)
+
+        print("factors", factors)
+        print("all reduce sizes", param_sizes)
+
+        return factors, param_sizes
+         
+    def dry_run(self, get_batch, from_cache):
+        # executes the forward pass of the module on dummy inputs. 
+        # Sets the order in which modules are used and the total number of cutpoints declared.
+
+        dummy_inputs = get_batch(1, device='cpu')
+        self.dummy_inputs = dummy_inputs
+        
+        if self.local_rank == 0 and not (from_cache and \
+            all([os.path.exists(f) for f in ["_tmp_ord_mod","_tmp_inp_shapes"]])):
+
+            self.ordered_modules, self.input_shapes, self.shape_indices_to_change, \
+                self.num_cutpoints = dry_run(self.model, get_batch, from_cache)
+            dist.barrier()
+        else:
+            dist.barrier()
+            self.ordered_modules, self.input_shapes, self.shape_indices_to_change, \
+                self.num_cutpoints = read_dry_run_out(self.model)
+
+    def prep_stage(self, i):
+        if i < len(self.stages_to_profile):
+            self.stage = self.stages_to_profile[i]
+            self.prev_stage = self.prev_stages_to_profile[i]
+            self.next_stage = self.next_stages_to_profile[i]
+            print("STAGE", self.stage)
+            self.trim_model(self.stage, self.stage + 1)
+            self.check_unused_parameters(self.dummy_inputs)
+            self.model.to(self.device)
+
+    def restore_orig_model(self):
+        keys = list(self.ordered_modules.keys())[::-1]
+
+        for name in keys:
+            if self.ordered_modules[name] is None:
+                path = name.split(".")
+                modules = self.model._modules
+                for i in range(len(path) - 1):
+                    modules = modules[path[i]]._modules
+                modules[path[-1]] = None
+                modules[path[-1]] = self.orig_modules[name]
+            self.ordered_modules[name] = self.orig_modules[name]
+            if isinstance(self.ordered_modules[name], CutPoint):
+                cutpoint = self.ordered_modules[name]
+                cutpoint.cp_index = -1
+                cutpoint.set_ret_val_func = None
+                cutpoint.stage = -1
+                cutpoint.device = None
+                cutpoint.send_fn = None
+                cutpoint.cp_func = None
+
+        for n in self.orig_params:
+            p = self.orig_params[n]
+            path = n.split(".")
+            parent = self.model
+            for i in range(len(path) - 1):
+                parent = getattr(parent, path[i])
+            setattr(parent,path[-1], p)
+        self.model = self.model.to('cpu')
+        if self.fp16:
+            self.model = self.model.to(torch.float32)
+
+    def profile_all(self,  microbatch_sizes):
+        assert self.optimizer is not None, "Must call set_optimizer() before profiling!"
+        optimizer = self.optimizer
+
+        out_folder = self.out_folder
+        for i in range(self.num_rounds):     
+            self.profile(microbatch_sizes, optimizer)
+            if self.stage is not None:
+                with open(os.path.join(out_folder, f"compute-profile-{self.stage}"), "wb") as f:
+                    pickle.dump(self.compute_profile, f)
+
+            if not DEBUG:
+                break
+            # this is only for development / debugging
+            if self.stage is not None:
+                optimizer.state = collections.defaultdict(dict) # Reset state
+                self.restore_orig_model()
+            self.prep_stage(i + 1)
+           
+        print("pre-alr mem",torch.cuda.memory_allocated(self.device))
+        self.profile_all_reduce(self.alr_factors, self.alr_sizes)
+        if self.rank == 0:
+            with open(os.path.join(out_folder, "allred-profile"), "wb") as f:
+                pickle.dump(self.all_reduce_profile, f)
+
+        self.gather_profile(out_folder)
+
+    def gather_profile(self, out_folder):
+        # gather comm profile
+        obj_list = [None for _ in range(dist.get_world_size())] if self.rank == 0 else None
+        dist.gather_object(self.comm_profile, object_gather_list = obj_list, dst=0)
+        if self.rank == 0:
+            aggregate_comm_profile = dict()
+            for comm_profile in obj_list:
+                for comm_shape in comm_profile:
+                    if comm_shape not in aggregate_comm_profile:
+                        aggregate_comm_profile[comm_shape] = {"send": [], "long_send": []}
+                    
+                    full_profile = aggregate_comm_profile[comm_shape]
+                    this_profile = comm_profile[comm_shape]
+                    full_profile["send"].extend(this_profile["send"])
+                    full_profile["long_send"].extend(this_profile["long_send"])
+
+            for comm_shape in aggregate_comm_profile:
+                for key in ["send","long_send"]:
+                    comm_times = aggregate_comm_profile[comm_shape][key]
+                    if len(comm_times) > 0:
+                        avg_time = sum(comm_times)/len(comm_times)
+                        aggregate_comm_profile[comm_shape][key] = avg_time * 1000000
+                        print(f"{comm_shape} {key}: {avg_time}")
+                    else:
+                        print(f"WARNING: No comm times for size {comm_shape} {key}!")
+                        aggregate_comm_profile[comm_shape][key] = -1
+
+            with open(os.path.join(out_folder, "comm-profile"), "wb") as f:
+                pickle.dump(aggregate_comm_profile, f)
+       
     def set_ret_val(self, val):
         self.ret_val = val
 
@@ -282,22 +496,20 @@ class Profiler:
             return self.bwd_grad
         return self.fwd_inp
 
-    def warmup(self, get_batch_fn, microbatch_sizes, optimizer):
-        optimizer._amp_lazy_init()
+    def warmup(self, microbatch_sizes, optimizer):
         
         if self.pre_cp is not None:
             self.pre_cp.recv_fn = self.recv
 
         count = 0
-        while count < 100:
-            batch_size = random.choice(microbatch_sizes)
+        while count < 20:
+            batch_size = 1
             warmup_time = time.time()
             try:
-                inputs = get_batch_fn(batch_size, self.device)
+                inputs = self.get_batch_fn(batch_size, self.device)
                 #input_mem = torch.cuda.memory_allocated() - input_mem
                 if self.fwd_inp_shape is not None:
                     fwd_inp_shape = list(self.fwd_inp_shape)
-                    fwd_inp_shape[0] = batch_size
                     self.fwd_inp = torch.ones(fwd_inp_shape, dtype = torch.float16 if self.fp16 else torch.float32).to(self.device)
                 torch.set_grad_enabled(True)
                 try:
@@ -312,6 +524,7 @@ class Profiler:
                 
                 if isinstance(fwd_out, tuple):
                     fwd_out = fwd_out[0]
+                fwd_out.cpu()
                 grads = 0.00001 * torch.ones(list(fwd_out.size()), device = self.device)
                 if self.bwd_grad_shape is not None:
                     self.bwd_grad = torch.ones(self.bwd_grad_shape, dtype = torch.float16 if self.fp16 else torch.float32).to(self.device)
@@ -322,10 +535,13 @@ class Profiler:
                         scaled_out.backward(grads)
                 else:
                     fwd_out.backward(grads)
+                del grads, fwd_out
 
             except RuntimeError as e:
+                grads = None; fwd_out = None
                 if 'out of memory' in str(e):
                     print("Out of memorryyyy", batch_size)
+                    break
                 else:
                     raise e
             
@@ -335,15 +551,18 @@ class Profiler:
                 param.grad = None
 
             #fwd_act_size = fwd_out.element_size() * fwd_out.nelement()
-            #del grads, fwd_out
             self.model.zero_grad()
             optimizer.zero_grad()
             self.ret_val = None
             self.fwd_inp = None; self.bwd_grad = None
 
             warmup_time = time.time() - warmup_time
-            print("warming up", warmup_time)
             count += 1
+
+        if self.pre_cp is not None:
+            self.pre_cp.recv_fn = None
+
+        optimizer.state = collections.defaultdict(dict) # Reset state
 
     def spawn_comm_workers(self, mBS):
         self.acts_recv_times = []; self.grads_recv_times = []
@@ -353,26 +572,47 @@ class Profiler:
 
         prev_rank = self.rank - 1 if self.rank > 0 else None
         next_rank = self.rank + 1 if self.rank < dist.get_world_size() - 1 else None
-        comm_shape = list(self.input_shapes[ list(self.input_shapes.keys())[0] ] )
-        comm_shape[0] = mBS
+        dtype = torch.float16 if self.fp16 else torch.float32
 
-        if prev_rank is not None:
-            acts_receive_thread = Thread(target=receiver, args=(prev_rank, comm_shape, self.acts_recv_times))
-            acts_receive_thread.daemon=True
-            acts_receive_thread.start()
+        if prev_rank is not None and (self.prev_stage not in [-1,self.num_cutpoints]):
+            prev_cp_name = list(self.input_shapes.keys())[self.prev_stage]
+            comm_shape = list(self.input_shapes[prev_cp_name][0])
+            indices_to_change = self.shape_indices_to_change[prev_cp_name][0]
+            # TODO: just multiple flat size by mbs? or not?
+            for i in indices_to_change:
+                comm_shape[i] = mBS
+            comm_size = 1
+            for d in comm_shape:
+                comm_size *= d
+            if comm_size not in self.comm_profile:
+                self.comm_profile[comm_size] = {"send": [], "long_send": []}
+            self.prev_rank_comm_shape = comm_size
+            self.acts_receive_thread = Thread(target=receiver, args=(prev_rank, comm_shape, self.acts_recv_times, dtype))
+            self.acts_receive_thread.daemon=True
+            self.acts_receive_thread.start()
 
-            grads_send_thread = Thread(target=sender, args=(prev_rank, comm_shape, self.grads_send_times))
-            grads_send_thread.daemon=True
-            grads_send_thread.start()
+            self.grads_send_thread = Thread(target=sender, args=(prev_rank, comm_shape, self.grads_send_times, dtype))
+            self.grads_send_thread.daemon=True
+            self.grads_send_thread.start()
 
-        if next_rank is not None:
-            grads_receive_thread = Thread(target=receiver, args=(next_rank, comm_shape, self.grads_recv_times))
-            grads_receive_thread.daemon=True
-            grads_receive_thread.start()
+        if self.stage is not None and self.next_stage != -1:
+            comm_shape = list(self.bwd_grad_shape)
+            indices_to_change = self.bwd_grad_shape_changes
+            for i in indices_to_change:
+                comm_shape[i] = mBS
+            comm_size = 1
+            for d in comm_shape:
+                comm_size *= d
+            if comm_size not in self.comm_profile:
+                self.comm_profile[comm_size] = {"send": [], "long_send": []}
+            self.next_rank_comm_shape = comm_size
+            self.grads_receive_thread = Thread(target=receiver, args=(next_rank, comm_shape, self.grads_recv_times, dtype))
+            self.grads_receive_thread.daemon=True
+            self.grads_receive_thread.start()
 
-            acts_send_thread = Thread(target=sender, args=(next_rank, comm_shape, self.acts_send_times))
-            acts_send_thread.daemon=True
-            acts_send_thread.start()
+            self.acts_send_thread = Thread(target=sender, args=(next_rank, comm_shape, self.acts_send_times, dtype))
+            self.acts_send_thread.daemon=True
+            self.acts_send_thread.start()
 
     def end_comm_workers(self, mBS):
         if self.acts_receive_thread is not None:
@@ -384,67 +624,129 @@ class Profiler:
         if self.grads_send_thread is not None:
             self.grads_send_thread.join()
 
-        acts_recv_times = self.acts_recv_times[5:]
-        acts_send_times = self.acts_send_times[5:]
-        grads_recv_times = self.grads_recv_times[5:]
-        grads_send_times = self.grads_send_times[5:]
 
-        act_send_time = act_recv_time = 0
-        grad_send_time = grad_recv_time = 0
-
+        gpus_per_node = self.gpus_per_node
         if len(self.acts_send_times) > 0:
-            act_send_time =  sum(acts_send_times)/len(acts_send_times)
-        # if len(acts_recv_times) > 0:
-        #     act_recv_time =  sum(acts_recv_times)/len(acts_recv_times)
-        if len(self.grads_send_times) > 0:
-            grad_send_time =  sum(grads_send_times)/len(grads_send_times)
-        # if len(grads_recv_times) > 0:
-        #     grad_recv_time =  sum(grads_recv_times)/len(grads_recv_times)
-
-        gpus_per_node = 4
-        if act_send_time > 0:
+            comm_size = self.next_rank_comm_shape
             long_send = (self.rank//gpus_per_node) != ((self.rank + 1)//gpus_per_node)
-            self.comm_profile[mBS] = {"send": -1 if long_send else act_send_time,
-                                   "long_send": act_send_time if long_send else -1}
-        if grad_send_time > 0:
+            send_times = self.comm_profile[comm_size]["long_send"] if long_send else \
+                        self.comm_profile[comm_size]["send"]
+            send_times.extend(self.acts_send_times)
+
+        if len(self.grads_send_times) > 0:
+            comm_size = self.prev_rank_comm_shape
             long_send = (self.rank//gpus_per_node) != ((self.rank - 1)//gpus_per_node)
-            self.comm_profile[mBS] = {"send": -1 if long_send else grad_send_time,
-                                   "long_send": grad_send_time if long_send else -1}
+            send_times = self.comm_profile[comm_size]["long_send"] if long_send else \
+                        self.comm_profile[comm_size]["send"]
+            send_times.extend(self.grads_send_times)
 
+    def profile_all_reduce(self, factors, alr_sizes):
+        num_passes = 3
+        self.all_reduce_profile = dict()
+
+        # init with alr time for ring 1
+        for f in factors:
+            if f not in self.all_reduce_profile:
+                self.all_reduce_profile[f] = [0.0]
+
+        for ring_size in range(2,self.world_size+1):
+            # TODO: all-reduce groups in clustered mode for gpus_per_vm > 1 and acc to dp_size possibilities
+            #       and ring sizes only powers of 2
+            ranks = list(range(ring_size))
+            group = torch.distributed.new_group(ranks=ranks, backend='nccl')
+            if self.rank < ring_size:
+                oom = torch.cuda.IntTensor([0])
+                for factor, alr_size in zip(factors, alr_sizes):
+                    if self.rank == 0:
+                        print(f"alr {factor} {alr_size} {ring_size}")
+                    try:
+                        allred_tensor = torch.ones(alr_size, dtype=torch.float16 if self.fp16 else torch.float32, 
+                                device=self.device)
+                        avg_time = 0.0
+                        for _ in range(num_passes):
+                            allred_time = time.time()
+                            dist.all_reduce(allred_tensor, group=group)
+                            torch.cuda.synchronize()
+                            allred_time = time.time() - allred_time
+                            allred_tensor /= ring_size
+                            avg_time += allred_time
+                        avg_time /= num_passes
+
+                        avg_time = torch.tensor([avg_time * 1000], device=self.device) / ring_size
+                        dist.all_reduce(avg_time, group = group)
+                        avg_time = avg_time.item() * 1000
+                        if ring_size - 1 < len(self.all_reduce_profile[factor]):
+                            avg_time = (self.all_reduce_profile[factor][ring_size - 1] + avg_time) / 2
+                            self.all_reduce_profile[factor][ring_size - 1]  = avg_time
+                        else:
+                            self.all_reduce_profile[factor].append(avg_time)            
+
+                    except RuntimeError as e:
+                        allred_tensor = None
+                        if 'out of memory' in str(e):
+                            print("Out of memorryyyy")
+                            oom = torch.cuda.IntTensor([1])
+                        else:
+                            raise e
+                    dist.all_reduce(oom, group=group)
+                    if oom.item():
+                        break
+ 
+        print("All reduce times")
+        for f in factors:
+            print(f, self.all_reduce_profile[f])
+
+    def profile(self, microbatch_sizes, optimizer):
+
+        if self.stage is not None and not self.warmed_up:
+            self.warmup(microbatch_sizes, optimizer)
+            self.warmed_up = True
         
-    def profile(self, get_batch_fn,  microbatch_sizes, optimizer):
-
-        if self.stage is None:
-            self.warmup(get_batch_fn, microbatch_sizes, optimizer)
         dist.barrier()
+
         self.compute_profile = {}
-        self.comm_profile = {}
         if self.pre_cp is not None:
             self.pre_cp.recv_fn = self.recv
 
+        oom = torch.cuda.IntTensor([0])
         for batch_size in microbatch_sizes:
             self.model.train()
             self.spawn_comm_workers(batch_size)
             if self.stage is not None:
+                # print("pre-mbs mem",torch.cuda.memory_allocated(self.device))
                 try:
-                    fwd_time, bwd_time = self.profile_mbs(batch_size, get_batch_fn, optimizer)
-                    self.compute_profile[batch_size] = {"fwd": fwd_time, "bwd": bwd_time}
+                    fwd_time, bwd_time, copy_time, mem_usage, fwd_act_size = \
+                        self.profile_mbs(batch_size, optimizer)
+                    fwd_time *= 1000000; bwd_time *= 1000000; copy_time *= 1000000
+                    self.compute_profile[batch_size] = {"fwd": fwd_time, "bwd": bwd_time, \
+                                    "copy": copy_time,"max_memory": mem_usage, "acts_size": fwd_act_size }
+                    print(batch_size, fwd_time, bwd_time, copy_time, mem_usage, fwd_act_size)
                 except RuntimeError as e:
                     if 'out of memory' in str(e):
                         print("Out of memorryyyy")
-                        break
+                        oom = torch.cuda.IntTensor([1])
                     else:
                         raise e
             self.end_comm_workers(batch_size)
-            dist.barrier()
+            dist.all_reduce(oom)
+            if oom.item():
+                break
 
     def profile_fwd(self, inputs, batch_size):
         if self.fwd_inp_shape is not None:
             fwd_inp_shape = list(self.fwd_inp_shape)
-            fwd_inp_shape[0] = batch_size
+            for i in self.fwd_inp_shape_changes:
+                fwd_inp_shape[i] = batch_size
             self.fwd_inp = torch.ones(fwd_inp_shape, dtype = torch.float16 if self.fp16 else torch.float32).to(self.device)
 
-        start = time.time()
+        fwd_start = torch.cuda.Event(enable_timing=True)
+        fwd_end = torch.cuda.Event(enable_timing=True)
+        if self.post_cp is not None:
+            self.post_cp.barrier_event = fwd_end
+        if self.pre_cp is not None:
+            self.pre_cp.barrier_event = fwd_start
+        else:
+            fwd_start.record()
         try:
             calc_val = self.model(**inputs)
             fwd_out = self.ret_val if self.ret_val is not None else calc_val
@@ -455,45 +757,50 @@ class Profiler:
                 raise e
             fwd_out = self.ret_val
         self.ret_val = None
-        # _tosend = fwd_out.cpu()
-        torch.cuda.synchronize(self.device)
-        fwd_time = time.time() - start
-        return fwd_out, fwd_time
+        if self.post_cp is None:
+            fwd_end.record()
+        else:
+            self.post_cp.barrier_event = None
+        if self.pre_cp is not None:
+            self.pre_cp.barrier_event = None
+        return fwd_out, fwd_start, fwd_end
 
     def profile_bwd(self, fwd_out, batch_size, optimizer):
-        bwd_time = time.time()
         if isinstance(fwd_out, tuple):
             fwd_out = fwd_out[0]
         grads = 0.00001 * torch.ones(list(fwd_out.size()), device = self.device)
         if self.bwd_grad_shape is not None:
             self.bwd_grad = torch.ones(self.bwd_grad_shape, dtype = torch.float16 if self.fp16 else torch.float32).to(self.device)
     
-        # print("grads before",optimizer.param_groups[0]["params"][0].grad)
+        bwd_start = torch.cuda.Event(enable_timing=True)
+        bwd_start.record()
         if self.fp16:
             with amp.scale_loss(fwd_out, optimizer, last_partition=True) as scaled_out:
                 scaled_out.backward(grads)
         else:
             fwd_out.backward(grads)
-        # _tosend = grads.cpu()
-        torch.cuda.synchronize(self.device)
-        bwd_time = time.time() - bwd_time
-        return bwd_time
+        bwd_end = torch.cuda.Event(enable_timing=True)
+        bwd_end.record()
+        del grads
+        return fwd_out, bwd_start, bwd_end
 
-    def profile_mbs(self, batch_size, get_batch_fn, optimizer):
+    def profile_mbs(self, batch_size, optimizer):
         fwd_times = []
         bwd_times = []
+        copy_times = []
         avg_mem_usage = 0
+
         for i in range(num_compute_passes): 
             torch.cuda.reset_max_memory_allocated(self.device)
 
             # get_batch_fn should load inputs into device and return dict
             input_mem = torch.cuda.memory_allocated(self.device)
-            inputs = get_batch_fn(batch_size, device=self.device)
+            inputs = self.get_batch_fn(batch_size, device=self.device)
             input_mem = torch.cuda.memory_allocated(self.device) - input_mem
 
-            fwd_out, fwd_time = self.profile_fwd(inputs, batch_size)
+            fwd_out, fwd_start, fwd_end = self.profile_fwd(inputs, batch_size)
 
-            bwd_time = self.profile_bwd(fwd_out, batch_size, optimizer)                    
+            fwd_out, bwd_start, bwd_end = self.profile_bwd(fwd_out, batch_size, optimizer) 
 
             optimizer.step()
             for param in optimizer._amp_stash.all_fp32_from_fp16_params:
@@ -502,30 +809,50 @@ class Profiler:
                 param.grad = None
                     
             fwd_act_size = fwd_out.element_size() * fwd_out.nelement()
-            # del grads, fwd_out
             self.model.zero_grad()
             optimizer.zero_grad()
 
+            copy_start = torch.cuda.Event(enable_timing=True)
+            copy_start.record()
+            with torch.no_grad():
+                copy_time = time.time()
+                _t = fwd_out.cpu()
+                copy_time = time.time() - copy_time
+            copy_end = torch.cuda.Event(enable_timing=True)
+            copy_end.record()
+
             mem_usage = torch.cuda.max_memory_allocated(self.device)
         
-            fwd_times.append(fwd_time)
-            bwd_times.append(bwd_time)
+            fwd_times.append((fwd_start, fwd_end))
+            bwd_times.append((bwd_start, bwd_end))
+            copy_times.append((copy_start, copy_end))
             avg_mem_usage += mem_usage
 
-            del inputs
+            del inputs, fwd_out
             self.fwd_inp = None; self.bwd_grad = None
-        
-            # opt_state_mem = torch.cuda.memory_allocated(self.device)
-            # optimizer.state = collections.defaultdict(dict) # Reset state
-            # opt_state_mem = opt_state_mem - torch.cuda.memory_allocated(self.device)
+    
+        torch.cuda.synchronize()
+        for i in range(num_compute_passes):
+            fwd_start, fwd_end = fwd_times[i]
+            bwd_start, bwd_end = bwd_times[i]
+            copy_start, copy_end = copy_times[i]
+            fwd_times[i] = fwd_start.elapsed_time(fwd_end) / 1000
+            bwd_times[i] = bwd_start.elapsed_time(bwd_end) / 1000
+            copy_times[i] = copy_start.elapsed_time(copy_end) / 1000
+        # print(fwd_times)
+
+        opt_state_mem = torch.cuda.memory_allocated(self.device)
+        optimizer.state = collections.defaultdict(dict) # Reset state
+        opt_state_mem = opt_state_mem - torch.cuda.memory_allocated(self.device)
                 
-        print("fwd:", fwd_times, 'bwd:', bwd_times)
         fwd_times = remove_outliers(fwd_times)
         bwd_times = remove_outliers(bwd_times)
+        copy_times = remove_outliers(copy_times)
         fwd_time = sum(fwd_times)/len(fwd_times)
         bwd_time = sum(bwd_times)/len(bwd_times)
+        copy_time = sum(copy_times)/len(copy_times)
         mem_usage = avg_mem_usage / num_compute_passes
-        return fwd_time, bwd_time
+        return fwd_time, bwd_time, copy_time, mem_usage, fwd_act_size
         
         
                 
@@ -537,22 +864,3 @@ class PassThroughModule(Module):
     def forward(self,*args,**kwargs):
         return None
 
-
-def remove_outliers(data):
-    #define a list to accumlate anomalies
-    anomalies = []
-    
-    n = len(data)
-    data = sorted(data)
-    if n % 2:
-        median = data[n//2]
-    else:
-        median = (data[n//2] + data[(n//2)-1])/2
-     
-    upper_limit = 3*median
-    # print(lower_limit)
-    filtered = []
-    for point in data:
-        if point <= upper_limit:
-            filtered.append(point)
-    return filtered

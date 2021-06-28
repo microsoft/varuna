@@ -21,6 +21,7 @@ Megatron-LM/logs/*
 Megatron-LM/ssh_logs/*
 available_machines.out
 Megatron-LM/scripts
+Megatron-LM/*.sh
 
 varuna/genschedule
 varuna/apex/
@@ -54,3 +55,6 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
+Megatron-LM/examples/pretrain_gpt2_varuna.sh
+Megatron-LM/varuna_current_machines
+Megatron-LM/varuna.env
