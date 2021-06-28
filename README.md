@@ -123,9 +123,26 @@ if __name__ == "__main__":
 - manager ip argument
 - checkpoint folder -->
 
-<!-- ### Profiling, config selection -->
+### Profiling, config selection
 
+Varuna supports auto-configuration data-parallel and pipeline-parallel dimensions that saves the user from running and comparing different configs for better performance. To enable this, the user needs to run one-time profiling of the model and network conditions using the `Profiler` class in Varuna.
+This is instantiated similar to Varuna and runs as a distributed process:
 
+~~~~
+model = BuildModel()
+profiler = Profiler(model, args.device, fp16=args.fp16)
+
+def get_batch(size):
+  # function to get sample batches of given size for profiling
+  return batch
+
+profiler.initialize(get_batch)
+microbatches_to_profile = list(range(1,max_micro_BS))
+profile = profiler.profile_all(get_batch, microbatches_to_profile, out_folder=args.save)
+
+~~~~
+
+Each process profiles the compute of different cutpoints and at the same time measures communication with other processes. This builds and saves a profile of the model in the specified location, from where it can be accessed by the `AutoConfig` class. `AutoConfig` calculates the different configs for a given number of GPUs and simulates them using information from the pre-built profile to compare and return the best performing setting in a few seconds. This calculation is triggered by run_varuna when no nstages and chunk_size arguments are given and a profile location is passed.
 
 <!-- ### Checkpointing -->
 

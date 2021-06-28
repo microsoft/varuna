@@ -83,8 +83,6 @@ def sender(send_rank, send_shape, send_times, dtype):
         handle.wait()
         send_times.append(time.time() - start_time)
 
-    del output_acts
-
 class Profiler:
     r"""Module for varuna profiling. Similar to ``Varuna`` class, the model must be 
     wrapped in an instance of ``Profiler`` before optimizer creation and the 
@@ -97,7 +95,7 @@ class Profiler:
 
     ~~~~
 
-    def get_batch_fn(size, device):
+    def get_batch(size):
         # function to get sample batches of given size for profiling
         return batch
     profiler = Profiler(model, get_batch_fn, fp16=args.fp16, device = args.local_rank,
@@ -123,8 +121,8 @@ class Profiler:
     :type list or None
     :param add_to_existing: Whether to continue profiling by adding to cutpoint profiles already saved in out_folder
     :type add_To_existing: bool
-    
     """
+
     def __init__(self, model, get_batch, device=-1, gpus_per_node=None,
                 fp16 = False, out_folder="profiles", pstages_to_profile=None,
                 from_cache=True, add_to_existing=False):
