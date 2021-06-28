@@ -99,19 +99,10 @@ class Varuna(Module):
         self.partitions, self.data_depth = utils.get_varuna_config(stage_to_rank_map)
         self.stage, self.rank_within_stage = utils.get_this_rank_config_varuna(stage_to_rank_map, self.rank)
         self.manager_ip, self.manager_port = utils.get_heartbeat_server_info()
-        self.rank_within_stage = rank_within_stage
 
         if self.stage == -1:
             raise ValueError("Rank " + str(self.rank) + " not found in stage to rank map!")
         self.data_parallel = self.data_depth > 1
-
-        model_in_cpu = not next(model.parameters()).is_cuda
-        assert model_in_cpu, "Model should be on CPU before passing to varuna!"
-        assert isinstance(dummy_inputs, dict), "Sample inputs should be a dictionary!"
-        for key in dummy_inputs:
-            val = dummy_inputs[key]
-            if isinstance(val, torch.Tensor) and val.is_cuda:
-                dummy_inputs[key] = val.cpu()
 
         model_in_cpu = not next(model.parameters()).is_cuda
         assert model_in_cpu, "Model should be on CPU before passing to varuna!"
@@ -165,7 +156,8 @@ class Varuna(Module):
             "last_chunk_size": self.last_chunk_size,
             "stage_to_rank_map": self.stage_to_rank_map,
             "local_rank": self.local_rank,
-            "chunk_size": chunk_size
+            "chunk_size": chunk_size,
+            "rank_within_stage": self.rank_within_stage
         }
 
         self.chunks = math.ceil(self.batch_size / self.micro_batch_size)
@@ -443,6 +435,8 @@ class Varuna(Module):
         if self.fp16:
             for param in self.optimizer._amp_stash.all_fp32_from_fp16_params:
                 param.grad = None
+        for param in self.model.parameters():
+            param.grad = None
 
     def checkpoint(self, global_store, step=None, tempdir=None, shard=False, on_demand=False):
         r""" Writes a varuna checkpoint with model parameters, optimizer state etc. 
@@ -531,7 +525,7 @@ class Varuna(Module):
                     send_weight = p
                 if parameter_names[p] == recv_wt_name:
                     recv_weight = p
-            if recv_stage == send_stage:
+            if recv_stage == send_stage and self.stage == recv_stage:
                 if recv_weight.data_ptr() != send_weight.data_ptr():
                     recv_weight.grad.add_(send_weight.grad)
                     send_weight.grad.data.copy_(recv_weight.grad.data)
@@ -541,9 +535,9 @@ class Varuna(Module):
             elif self.stage == recv_stage:
                 dist.all_reduce(recv_weight.grad.data, group=self.tied_group)
 
-    def all_reduce_dp_grads(self):
+    def all_reduce_dp_grads(self, params):
         allred_init_start = time.time()
-        master_grads = [p.grad for p in amp.master_params(self.optimizer) if p.grad is not None]
+        master_grads = [p.grad for p in params if p.grad is not None]
         flat_grad_size = sum(p.numel() for p in master_grads)
         flat_raw = torch.empty( flat_grad_size, device=self.device, 
                                 dtype=torch.float16 if self.fp16 else torch.float32)
@@ -581,20 +575,29 @@ class Varuna(Module):
 
     def sync_across_workers(self, max_norm):
 
-        master_grads, overflow_buf = self.all_reduce_dp_grads()
+        if self.fp16:
+            params = list(amp.master_params(self.optimizer))
+        else:
+            params = []
+            for group in self.optimizer.param_groups:
+                params.extend(group['params'])
+        
+        master_grads, overflow_buf = self.all_reduce_dp_grads(params)
 
         overflow_buf = overflow_buf.to(torch.float32)
         if overflow_buf.item():
             print(f"{self.rank} Overflow !!")
         overflow_buf, global_grad_norm, reduced_loss = self.all_reduce_pipeline_meta(master_grads, 
                                                                     overflow_buf if self.fp16 else None)
+        global_grad_norm_sq = global_grad_norm ** 2
         self.average_loss = reduced_loss
 
         if max_norm is not None:
-            clipped = utils.clip_grad_norm(amp.master_params(self.optimizer), global_grad_norm, max_norm)
+            clipped = utils.clip_grad_norm(params, global_grad_norm_sq, max_norm)
             if clipped:
                 global_grad_norm = max_norm
 
+        had_overflow = False
         if self.fp16:
             scaler = _amp_state.loss_scalers[0]
             overflow_buf = torch.cuda.IntTensor([0 if overflow_buf.item()==0 else 1])
@@ -644,11 +647,18 @@ class Varuna(Module):
         extra_norm_sq = 0.0
         for i,w in enumerate(self.shared_weights):
             recv_stage, send_stage = self.shared_weight_stages[i]
+            recv_wt_name, send_wt_name = w
+            recv_weight, send_weight = None, None
+            for p in self.parameter_names:
+                if self.parameter_names[p] == send_wt_name:
+                    send_weight = p
+                if self.parameter_names[p] == recv_wt_name:
+                    recv_weight = p
             if recv_stage == send_stage:
-                continue
+                if self.stage == recv_stage and recv_weight.data_ptr() == send_weight.data_ptr():
+                    continue
             if self.stage == send_stage:
-                for p in self.parameter_names:
-                    if self.parameter_names[p] == w[1]:
-                        extra_norm_sq += torch.norm(p.grad) ** 2
-                        break
+                if send_weight.grad is not None:
+                    extra_norm_sq += torch.norm(send_weight.grad) ** 2
+
         return extra_norm_sq

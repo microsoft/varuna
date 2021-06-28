@@ -8,6 +8,8 @@ from .utils import HEARTBEAT_IP_ENV_VAR, HEARTBEAT_PORT_ENV_VAR, VARUNA_TEMP_FOL
 HEARTBEAT_PORT = 5000 
 MORPH_PORT = 4200
 
+# TODO: readme/docs for launch process
+
 launch_args_filename = "launch_args"
 # TODO move this to args/utils
 running_machines_list = "varuna_current_machines"

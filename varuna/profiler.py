@@ -131,6 +131,7 @@ class Profiler:
         stages_to_profile = pstages_to_profile
         self.model = model
         self.ret_val = None
+        # TODO: test fp32
         self.fp16 = fp16
         self.rank = dist.get_rank()
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
