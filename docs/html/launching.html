@@ -5,7 +5,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Varuna documentation &#8212; Varuna  documentation</title>
+    <title>Launching Varuna &#8212; Varuna  documentation</title>
     <link rel="stylesheet" href="_static/alabaster.css" type="text/css" />
     <link rel="stylesheet" href="_static/pygments.css" type="text/css" />
     <script id="documentation_options" data-url_root="./" src="_static/documentation_options.js"></script>
@@ -15,7 +15,8 @@
     <script src="_static/language_data.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
-    <link rel="next" title="Launching Varuna" href="launching.html" />
+    <link rel="next" title="CutPoints" href="cutpoint.html" />
+    <link rel="prev" title="Varuna documentation" href="index.html" />
    
   <link rel="stylesheet" href="_static/custom.css" type="text/css" />
   
@@ -32,26 +33,26 @@
 
           <div class="body" role="main">
             
-  <div class="section" id="varuna-documentation">
-<h1>Varuna documentation<a class="headerlink" href="#varuna-documentation" title="Permalink to this headline">¶</a></h1>
-<p>Detailed documentation for Varuna functions and classes can be found and navigated here.</p>
-<div class="toctree-wrapper compound">
-<p class="caption"><span class="caption-text">Contents:</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="launching.html">Launching Varuna</a></li>
-<li class="toctree-l1"><a class="reference internal" href="cutpoint.html">CutPoints</a></li>
-<li class="toctree-l1"><a class="reference internal" href="varuna.html">The Varuna class</a></li>
-<li class="toctree-l1"><a class="reference internal" href="profiler.html">Profiling for Varuna</a></li>
-</ul>
+  <div class="section" id="launching-varuna">
+<h1>Launching Varuna<a class="headerlink" href="#launching-varuna" title="Permalink to this headline">¶</a></h1>
+<p>Training with varuna can be run with the run_varuna module as follows:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python -m varuna.run_varuna --machine_list &lt;file_with_ips&gt; --gpus_per_node &lt;num_gpus_per_node&gt;
+--batch-size &lt;total_effective_batch_size&gt; --nstages &lt;number_of_pipeline_stages&gt;
+--chunk_size &lt;micro_batch_size_for_pipeline&gt;
+--code_dir &lt;working_dir_for_training&gt; user_training_script.py &lt;...user args...&gt;
+</pre></div>
 </div>
-</div>
-<div class="section" id="indices-and-tables">
-<h1>Indices and tables<a class="headerlink" href="#indices-and-tables" title="Permalink to this headline">¶</a></h1>
-<ul class="simple">
-<li><p><a class="reference internal" href="genindex.html"><span class="std std-ref">Index</span></a></p></li>
-<li><p><a class="reference internal" href="py-modindex.html"><span class="std std-ref">Module Index</span></a></p></li>
-<li><p><a class="reference internal" href="search.html"><span class="std std-ref">Search Page</span></a></p></li>
-</ul>
+<p>This expects all machines in the machine_list to be reachable from the launching machine, to be
+set up with necessary code/libraries in code_dir and have gpus_per_node GPUs working.
+The job is launched with all workers running the user_training_script and args.</p>
+<p>This launcher passes a few arguments to the user training script for Varuna. These should be passed during <cite>Varuna</cite> initialisation in the python script:
+* rank: process rank in overall distributed job
+* local_rank: process rank in the local node
+* stage_to_rank_map: varuna config info about stage placement
+* chunk_size: micro batch size for Varuna pipeline</p>
+<p>The arguments for number of pipeline stages (nstages) and micro-batch size (chunk_size) can be
+omitted if the user wishes Varuna to determine the most optimal configuration for these.
+This requires the user to run profiling before training and pass the location of stored profiles to the launcher.</p>
 </div>
 
 
@@ -61,7 +62,7 @@
       </div>
       <div class="sphinxsidebar" role="navigation" aria-label="main navigation">
         <div class="sphinxsidebarwrapper">
-<h1 class="logo"><a href="#">Varuna</a></h1>
+<h1 class="logo"><a href="index.html">Varuna</a></h1>
 
 
 
@@ -72,8 +73,8 @@
 
 <h3>Navigation</h3>
 <p class="caption"><span class="caption-text">Contents:</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="launching.html">Launching Varuna</a></li>
+<ul class="current">
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Launching Varuna</a></li>
 <li class="toctree-l1"><a class="reference internal" href="cutpoint.html">CutPoints</a></li>
 <li class="toctree-l1"><a class="reference internal" href="varuna.html">The Varuna class</a></li>
 <li class="toctree-l1"><a class="reference internal" href="profiler.html">Profiling for Varuna</a></li>
@@ -82,8 +83,9 @@
 <div class="relations">
 <h3>Related Topics</h3>
 <ul>
-  <li><a href="#">Documentation overview</a><ul>
-      <li>Next: <a href="launching.html" title="next chapter">Launching Varuna</a></li>
+  <li><a href="index.html">Documentation overview</a><ul>
+      <li>Previous: <a href="index.html" title="previous chapter">Varuna documentation</a></li>
+      <li>Next: <a href="cutpoint.html" title="next chapter">CutPoints</a></li>
   </ul></li>
 </ul>
 </div>
@@ -117,7 +119,7 @@
       &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
       
       |
-      <a href="_sources/index.rst.txt"
+      <a href="_sources/launching.rst.txt"
           rel="nofollow">Page source</a>
     </div>
 

@@ -49,14 +49,14 @@ wrapped in an instance of <code class="docutils literal notranslate"><span class
 be used by each worker. Each worker profiles compute for the different <a href="#id1"><span class="problematic" id="id2">``</span></a>CutPoint``s 
 in the model while simultaneously measuring communication links between workers.
 The profiler should be used in three steps:</p>
-<dl class="simple">
-<dt>def get_batch_fn(size, device):</dt><dd><p># function to get sample batches of given size for profiling
-return batch</p>
-</dd>
-<dt>profiler = Profiler(model, get_batch_fn, fp16=args.fp16, device = args.local_rank,</dt><dd><p>from_cache=True, out_folder=args.save)</p>
-</dd>
-</dl>
-<p>profile = profiler.profile_all(microbatch_sizes_to_profile)</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span> <span class="nf">get_batch</span><span class="p">(</span><span class="n">size</span><span class="p">):</span>
+    <span class="c1"># function to get sample batches of given size for profiling</span>
+    <span class="k">return</span> <span class="n">batch</span>
+<span class="n">profiler</span> <span class="o">=</span> <span class="n">Profiler</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">get_batch_fn</span><span class="p">,</span> <span class="n">fp16</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">fp16</span><span class="p">,</span> <span class="n">device</span> <span class="o">=</span> <span class="n">args</span><span class="o">.</span><span class="n">local_rank</span><span class="p">,</span>
+                    <span class="n">from_cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">out_folder</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">save</span><span class="p">)</span>
+<span class="n">profile</span> <span class="o">=</span> <span class="n">profiler</span><span class="o">.</span><span class="n">profile_all</span><span class="p">(</span><span class="n">microbatch_sizes_to_profile</span><span class="p">)</span>
+</pre></div>
+</div>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters</dt>
 <dd class="field-odd"><ul class="simple">
@@ -107,6 +107,7 @@ which is the default if not specified.</p></li>
 <h3>Navigation</h3>
 <p class="caption"><span class="caption-text">Contents:</span></p>
 <ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="launching.html">Launching Varuna</a></li>
 <li class="toctree-l1"><a class="reference internal" href="cutpoint.html">CutPoints</a></li>
 <li class="toctree-l1"><a class="reference internal" href="varuna.html">The Varuna class</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Profiling for Varuna</a></li>

@@ -93,16 +93,14 @@ class Profiler:
     in the model while simultaneously measuring communication links between workers.
     The profiler should be used in three steps:
 
-    ~~~~
-
-    def get_batch(size):
-        # function to get sample batches of given size for profiling
-        return batch
-    profiler = Profiler(model, get_batch_fn, fp16=args.fp16, device = args.local_rank,
-                        from_cache=True, out_folder=args.save)
-    profile = profiler.profile_all(microbatch_sizes_to_profile)
-
-    ~~~~
+    .. code-block:: python
+    
+        def get_batch(size):
+            # function to get sample batches of given size for profiling
+            return batch
+        profiler = Profiler(model, get_batch_fn, fp16=args.fp16, device = args.local_rank,
+                            from_cache=True, out_folder=args.save)
+        profile = profiler.profile_all(microbatch_sizes_to_profile)
     
     :param model: The model to profile.
     :type model: torch.nn.Module 
@@ -121,6 +119,7 @@ class Profiler:
     :type list or None
     :param add_to_existing: Whether to continue profiling by adding to cutpoint profiles already saved in out_folder
     :type add_To_existing: bool
+    
     """
 
     def __init__(self, model, get_batch, device=-1, gpus_per_node=None,
