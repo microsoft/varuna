@@ -12,6 +12,7 @@ Detailed documentation for Varuna functions and classes can be found and navigat
    :maxdepth: 2
    :caption: Contents:
 
+   launching
    cutpoint
    varuna
    profiler

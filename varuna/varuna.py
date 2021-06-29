@@ -553,7 +553,7 @@ class Varuna(Module):
         amp_C.multi_tensor_scale(65536,
             overflow_buf,
             [master_grads, allreduced_views],
-            loss_scale / (self.data_depth * self.chunks))
+            loss_scale / (self.data_depth))
 
         if log_verbose:
             print(f'{self.rank} {self.rank_within_stage} starting gradient all-reduce')
