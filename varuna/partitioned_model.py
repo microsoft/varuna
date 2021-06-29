@@ -143,6 +143,7 @@ def dry_run(model, get_batch, from_cache):
     for h in hooks:
         h.remove()
 
+    # TODO: move to proper temp location
     with open("_tmp_ord_mod",'wb') as f:
         pickle.dump(list(ordered_modules.keys()),f)
     with open("_tmp_inp_shapes",'wb') as f:
