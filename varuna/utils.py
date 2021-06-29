@@ -63,7 +63,7 @@ def clip_grad_norm(parameters, grad_norm_sq, max_norm, norm_type=2):
     """Clips gradient norm of an iterable of parameters.
 
     This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
-    added functionality to handle model parallel parameters. Note that
+    modified to handle pipeline parallel parameters. Note that
     the gradients are modified in place.
 
     Arguments:
@@ -82,7 +82,7 @@ def clip_grad_norm(parameters, grad_norm_sq, max_norm, norm_type=2):
     max_norm = float(max_norm)
     norm_type = float(norm_type)
     
-    total_norm = grad_norm_sq.item() ** (1. / norm_type)
+    total_norm = grad_norm_sq.item() ** (1. / norm_type)    
     # print(f'clip_grad_norm() total_norm = {total_norm}')
     clip_coef = max_norm / (total_norm + 1e-6)
     if clip_coef < 1:

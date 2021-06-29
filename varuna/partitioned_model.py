@@ -7,7 +7,7 @@ import inspect
 import time
 import pickle
 
-from .utils import save_rng_states, restore_rng_states
+from .utils import save_rng_states, restore_rng_states, VARUNA_TEMP_FOLDER
 
 from collections import OrderedDict 
 
@@ -89,7 +89,6 @@ class CutPoint(Module):
         self.cp_func = c
 
 
-# TODO: unify this class and PartitionedModel
 def dry_run(model, get_batch, from_cache):
     # executes the forward pass of the module on dummy inputs. 
     # Sets the order in which modules are used and the total number of cutpoints declared.
@@ -144,6 +143,7 @@ def dry_run(model, get_batch, from_cache):
     for h in hooks:
         h.remove()
 
+    # TODO: move to proper temp location
     with open("_tmp_ord_mod",'wb') as f:
         pickle.dump(list(ordered_modules.keys()),f)
     with open("_tmp_inp_shapes",'wb') as f:
@@ -518,8 +518,8 @@ class PartitionedModel(Module):
     def set_recv_fn(self, recompute=False):
         acts = None
         if recompute:
-            ctx, acts = self.recompute_queue.get()
-            restore_rng_states(ctx, self.device)
+            rng_states, acts = self.recompute_queue.get()
+            restore_rng_states(rng_states, self.device)
         else:
             acts = self.acts_queue.get() if self.stage > 0 else None
         if self.stage > 0:
@@ -536,6 +536,15 @@ class PartitionedModel(Module):
         if self.post_cp is not None:
             self.post_cp.recv_fn = recv
         return acts
+
+    def set_recv_acts(self, shape, receive_rank):
+        def recv(grads=False):
+            x = torch.zeros(shape, dtype=torch.float16 if self.fp16 else torch.float32)
+            dist.recv(x, receive_rank)
+            return x.to(self.device)
+        if self.pre_cp is not None:
+            self.pre_cp.recv_fn = recv
+
 
     def clear_recv_fn(self):
         if self.pre_cp is not None:

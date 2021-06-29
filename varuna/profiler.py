@@ -83,16 +83,52 @@ def sender(send_rank, send_shape, send_times, dtype):
         handle.wait()
         send_times.append(time.time() - start_time)
 
-    del output_acts
-
 class Profiler:
+    r"""Module for varuna profiling. Similar to ``Varuna`` class, the model must be 
+    wrapped in an instance of ``Profiler`` before optimizer creation and the 
+    :attr:`model` passed should be on CPU.
 
-    def __init__(self, model, get_batch, device=-1, gpus_per_node=None, 
-                fp16 = False, out_folder="profiles", pstages_to_profile=None, 
+    Varuna profiling runs in a distributed process and the ``Profiler`` should
+    be used by each worker. Each worker profiles compute for the different ``CutPoint``s 
+    in the model while simultaneously measuring communication links between workers.
+    The profiler should be used in three steps:
+
+    .. code-block:: python
+    
+        def get_batch(size):
+            # function to get sample batches of given size for profiling
+            return batch
+        profiler = Profiler(model, get_batch_fn, fp16=args.fp16, device = args.local_rank,
+                            from_cache=True, out_folder=args.save)
+        profile = profiler.profile_all(microbatch_sizes_to_profile)
+    
+    :param model: The model to profile.
+    :type model: torch.nn.Module 
+    :param get_batch_fn: Function to get batch of a given size, used for different sizes by the profiler
+    :type get_batch_fn: function(size, device='cpu')   
+    :param device: index of the cuda device to use. Recommended to be the same as local_rank,
+        which is the default if not specified.
+    :type device: int
+    :param fp16: whether to enable mixed precision training.
+    :type fp16: bool
+    :param from_cache: Whether to use cached information anout model structure, if available.
+    :type from_cache: bool
+    :param out_folder: Path to folder for saving compute and communication profiles
+    :type out_folder: string or PathLike object
+    :param pstages_to_profile: List of indices of cutpoints to profile, by default this contains all cutpoints
+    :type list or None
+    :param add_to_existing: Whether to continue profiling by adding to cutpoint profiles already saved in out_folder
+    :type add_To_existing: bool
+    
+    """
+
+    def __init__(self, model, get_batch, device=-1, gpus_per_node=None,
+                fp16 = False, out_folder="profiles", pstages_to_profile=None,
                 from_cache=True, add_to_existing=False):
         stages_to_profile = pstages_to_profile
         self.model = model
         self.ret_val = None
+        # TODO: test fp32
         self.fp16 = fp16
         self.rank = dist.get_rank()
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
