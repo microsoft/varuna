@@ -20,8 +20,9 @@ This launcher passes a few arguments to the user training script for Varuna. The
 * local_rank: process rank in the local node 
 * stage_to_rank_map: varuna config info about stage placement
 * chunk_size: micro batch size for Varuna pipeline
+* batch-size: per process batch size
 
 The arguments for number of pipeline stages (nstages) and micro-batch size (chunk_size) can be
 omitted if the user wishes Varuna to determine the most optimal configuration for these. 
-This requires the user to run profiling before training and pass the location of stored profiles to the launcher.
-  
+This requires the user to run profiling before training and pass the location of stored 
+profiles to the launcher. (see :doc:`profiler`)
