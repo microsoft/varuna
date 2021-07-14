@@ -1,0 +1,157 @@
+
+<!DOCTYPE html>
+
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Morphing &#8212; Varuna  documentation</title>
+    <link rel="stylesheet" href="_static/alabaster.css" type="text/css" />
+    <link rel="stylesheet" href="_static/pygments.css" type="text/css" />
+    <script id="documentation_options" data-url_root="./" src="_static/documentation_options.js"></script>
+    <script src="_static/jquery.js"></script>
+    <script src="_static/underscore.js"></script>
+    <script src="_static/doctools.js"></script>
+    <script src="_static/language_data.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="prev" title="Profiling for Varuna" href="profiler.html" />
+   
+  <link rel="stylesheet" href="_static/custom.css" type="text/css" />
+  
+  
+  <meta name="viewport" content="width=device-width, initial-scale=0.9, maximum-scale=0.9" />
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <div class="section" id="morphing">
+<h1>Morphing<a class="headerlink" href="#morphing" title="Permalink to this headline">¶</a></h1>
+<p>Varuna enables distributed training on a changing set of resources, as the list
+of machines available may grow or shrink. This is done by “morphing” - reconfiguring the
+training job to process the total effective batch size over the new resources. Varuna performs
+morphing by checkpointing and restarting efficiently, which requires that the training job has access to
+a long-living ‘manager’ machine and a global storage for all workers.</p>
+<p>The manager launches the <cite>run_varuna</cite> command, detects changes in the available resource set, slow GPUs
+or transient errors in the job, and cooridinates checkpoint/restarts. If desirable, the manager
+can be notified of an upcoming preemption (loss of a machine) through the function <cite>notify_manager_preempt</cite>.
+For example in Azure, a ‘preempt’ signal is issued with preemption time.</p>
+<p>To enable morphing, the user must make some modifications to their script:</p>
+<ul class="simple">
+<li><dl class="simple">
+<dt>An additional <cite>resume_step</cite> argument is passed to each worker for restarts. (So that there</dt><dd><p>are no race conditions while checking this step from the global storage)</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>A simple signal handler for <cite>SIGUSR1</cite> in the workers to call varuna’s <cite>on_demand_checkpoint</cite> (<a class="reference internal" href="varuna.html"><span class="doc">The Varuna class</span></a>)</dt><dd><p>and exit. The checkpointing may fail if workers are lost during the call.</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>(recommended) With morphing, <cite>Varuna</cite> checkpointing should be enabled with background copying and sharding flags for</dt><dd><p>faster checkpointing. The checkpoint frequency should be high to avoid loss of compute on checkpoint/restarts
+(in case on demand checkpoints fail).</p>
+</dd>
+</dl>
+</li>
+</ul>
+<p>These changes are illustrated in the megatron example.</p>
+<p>The key idea behind morphing is to re-distribute the total <cite>batch_size</cite> specified by the user accross
+pipeline parallel stages and data parallel replicas. To do this efficiently, it is recommended to use
+auto-configuration of the dimensions of pipeline and data parallelism as well as the micro-batch size.
+<cite>AutoConfig</cite> by varuna is enabled if these arguments (<cite>nstages</cite> and <cite>chunk_size</cite>) are not specified
+while launching <cite>run_varuna</cite>. This estimates the best varuna configuration at each point and requires
+the user to run profiling before training and specify the location of stored profiles to the
+launcher. (see <a class="reference internal" href="profiler.html"><span class="doc">Profiling for Varuna</span></a>)</p>
+<div class="section" id="slow-gpu-detection">
+<h2>Slow GPU detection<a class="headerlink" href="#slow-gpu-detection" title="Permalink to this headline">¶</a></h2>
+<p>With low-priority VMs, a user might see faulty “straggler” GPUs that have significantly longer compute
+times than the others. These are detected by varuna when morphing is enabled by the manager.
+The IPs with the slow GPUs are written to a file “slow_machines.out”. The user may listen on this file
+to remove machines with faulty GPUs.</p>
+</div>
+</div>
+
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="main navigation">
+        <div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="index.html">Varuna</a></h1>
+
+
+
+
+
+
+
+
+<h3>Navigation</h3>
+<p class="caption"><span class="caption-text">Contents:</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="launching.html">Launching Varuna</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cutpoint.html">CutPoints</a></li>
+<li class="toctree-l1"><a class="reference internal" href="varuna.html">The Varuna class</a></li>
+<li class="toctree-l1"><a class="reference internal" href="profiler.html">Profiling for Varuna</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Morphing</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#slow-gpu-detection">Slow GPU detection</a></li>
+</ul>
+</li>
+</ul>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="index.html">Documentation overview</a><ul>
+      <li>Previous: <a href="profiler.html" title="previous chapter">Profiling for Varuna</a></li>
+  </ul></li>
+</ul>
+</div>
+<div id="searchbox" style="display: none" role="search">
+  <h3 id="searchlabel">Quick search</h3>
+    <div class="searchformwrapper">
+    <form class="search" action="search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" />
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</div>
+<script>$('#searchbox').show(0);</script>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &copy;2021, Nitika Saran.
+      
+      |
+      Powered by <a href="http://sphinx-doc.org/">Sphinx 3.1.2</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="_sources/morphing.rst.txt"
+          rel="nofollow">Page source</a>
+    </div>
+
+    
+
+    
+  </body>
+</html>

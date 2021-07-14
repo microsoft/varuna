@@ -35,24 +35,38 @@
             
   <div class="section" id="launching-varuna">
 <h1>Launching Varuna<a class="headerlink" href="#launching-varuna" title="Permalink to this headline">¶</a></h1>
-<p>Training with varuna can be run with the run_varuna module as follows:</p>
+<p>Varuna distributed training is run as a set of processes for each GPU on each machine. It uses PyTorch’s
+distributed framework and must be used with the gloo backend.
+This distributed process is triggered from a single machine with a list of reachable machines (IPs) as
+<cite>machine_list</cite> and <cite>gpus_per_node</cite> GPUs on each node. This triggering machine is usually the ‘manager’
+(as explained in <a class="reference internal" href="morphing.html"><span class="doc">Morphing</span></a>). Morphing is enabled by default, to disable it use the <cite>no_morphing</cite> flag.
+Training with varuna can be run with the <cite>run_varuna</cite> module as follows:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python -m varuna.run_varuna --machine_list &lt;file_with_ips&gt; --gpus_per_node &lt;num_gpus_per_node&gt;
 --batch-size &lt;total_effective_batch_size&gt; --nstages &lt;number_of_pipeline_stages&gt;
 --chunk_size &lt;micro_batch_size_for_pipeline&gt;
 --code_dir &lt;working_dir_for_training&gt; user_training_script.py &lt;...user args...&gt;
 </pre></div>
 </div>
-<p>This expects all machines in the machine_list to be reachable from the launching machine, to be
-set up with necessary code/libraries in code_dir and have gpus_per_node GPUs working.
-The job is launched with all workers running the user_training_script and args.</p>
-<p>This launcher passes a few arguments to the user training script for Varuna. These should be passed during <cite>Varuna</cite> initialisation in the python script:
-* rank: process rank in overall distributed job
-* local_rank: process rank in the local node
-* stage_to_rank_map: varuna config info about stage placement
-* chunk_size: micro batch size for Varuna pipeline</p>
-<p>The arguments for number of pipeline stages (nstages) and micro-batch size (chunk_size) can be
+<p>This expects all machines in the <cite>machine_list</cite> to be reachable and to be
+set up with necessary code/libraries in <cite>code_dir</cite>. The user’s code should also
+be modified to add <cite>CutPoint`s and use the `Varuna</cite> training class.
+The job is launched with all workers (<cite>gpus_per_node x &lt;num-servers&gt;</cite> in total)
+running the <cite>user_training_script</cite> with user args and arguments passed by varuna’s launcher.
+Any environment variables that the user wishes to pass to each worker may be specified
+in an <cite>env_file</cite> passed to the launcher.</p>
+<p>These arguments passed by the launcher to the user training script for Varuna
+must be parsed by user’s training script and passed during <cite>Varuna</cite> initialisation:</p>
+<ul class="simple">
+<li><p>rank: process rank in overall distributed job</p></li>
+<li><p>local_rank: process rank in the local node</p></li>
+<li><p>stage_to_rank_map: varuna config info about stage placement</p></li>
+<li><p>chunk_size: micro batch size for Varuna pipeline</p></li>
+<li><p>batch-size: per process batch size</p></li>
+</ul>
+<p>The arguments for number of pipeline stages <cite>nstages</cite> and micro-batch size <cite>chunk_size</cite> can be
 omitted if the user wishes Varuna to determine the most optimal configuration for these.
-This requires the user to run profiling before training and pass the location of stored profiles to the launcher.</p>
+This requires the user to run profiling before training and pass the location of stored
+profiles to the launcher. (see <a class="reference internal" href="profiler.html"><span class="doc">Profiling for Varuna</span></a>)</p>
 </div>
 
 
@@ -78,6 +92,7 @@ This requires the user to run profiling before training and pass the location of
 <li class="toctree-l1"><a class="reference internal" href="cutpoint.html">CutPoints</a></li>
 <li class="toctree-l1"><a class="reference internal" href="varuna.html">The Varuna class</a></li>
 <li class="toctree-l1"><a class="reference internal" href="profiler.html">Profiling for Varuna</a></li>
+<li class="toctree-l1"><a class="reference internal" href="morphing.html">Morphing</a></li>
 </ul>
 
 <div class="relations">
