@@ -34,18 +34,18 @@ Example:
    # parameter sharing across the model, marked as pairs of param_names
    shared_weights = [("language_model.embedding.word_embeddings.weight","lm_head_weight")]  
    model = Varuna( model, args.stage_to_rank_map, dry_run_input, global_batch_size, 
-                     args.chunk_size, args.fp16, local_rank=args.local_rank, 
-                     device=args.local_rank, shared_weights=shared_weights)
+                      args.chunk_size, args.fp16, local_rank=args.local_rank, 
+                       device=args.local_rank, shared_weights=shared_weights)
 
    # now model is a subset of the original model, moved to the GPU on each process
 
    optimizer = get_optimizer(model)
    model.set_optimizer(optimizer)
 
-.. autoclass:: Varuna
-   
-   .. automethod:: set_optimizer
-   .. automethod:: step
-   .. automethod:: checkpoint
-   .. automethod:: load_checkpoint
-   .. automethod:: evaluate
+   .. autoclass:: Varuna
+      
+        .. automethod:: set_optimizer
+        .. automethod:: step
+        .. automethod:: checkpoint
+        .. automethod:: load_checkpoint
+        .. automethod:: evaluate
