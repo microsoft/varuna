@@ -1,0 +1,4 @@
+wheel
+setuptools
+torch==1.7.1
+apex

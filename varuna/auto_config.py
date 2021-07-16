@@ -106,7 +106,7 @@ class AutoConfig:
                     long_send_time, alr, verbose=False):
         tools_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),'tools')
         sim_binary = os.path.join(tools_dir, "simulator", "simulate-varuna")
-
+        # TODO: use C++ extension for python?
         command = f"GPUS_PER_VM={self.gpus_per_vm} {sim_binary} " + \
                     f"{pp_size} {num_microbatches} {send_time} {alr} {long_send_time}"
         if verbose:

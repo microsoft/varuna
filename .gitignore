@@ -29,6 +29,7 @@ all_machines
 varuna/genschedule
 varuna/apex/
 varuna/versions
+tools/simulator/simulate-varuna
 
 # Byte-compiled / optimized / DLL files
 *__pycache__/

@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.abspath('..'))
 project = 'Varuna'
 copyright = '2021, Nitika Saran'
 author = 'Nitika Saran'
-
+master_doc = "index"
 
 # -- General configuration ---------------------------------------------------
 
