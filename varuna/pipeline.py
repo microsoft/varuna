@@ -5,10 +5,12 @@ import torch.distributed as dist
 
 from queue import Queue
 from threading import Thread
-
-from apex import amp
-from apex.amp import _amp_state
-import amp_C, apex_C
+try:
+    from apex import amp
+    from apex.amp import _amp_state
+    import amp_C, apex_C
+except:
+    pass
 
 import math
 import os, sys

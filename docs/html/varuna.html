@@ -1,18 +1,26 @@
 
-<!DOCTYPE html>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
+  "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
 
-<html>
+<html xmlns="http://www.w3.org/1999/xhtml">
   <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
     <title>The Varuna class &#8212; Varuna  documentation</title>
     <link rel="stylesheet" href="_static/alabaster.css" type="text/css" />
     <link rel="stylesheet" href="_static/pygments.css" type="text/css" />
-    <script id="documentation_options" data-url_root="./" src="_static/documentation_options.js"></script>
-    <script src="_static/jquery.js"></script>
-    <script src="_static/underscore.js"></script>
-    <script src="_static/doctools.js"></script>
-    <script src="_static/language_data.js"></script>
+    <script type="text/javascript">
+      var DOCUMENTATION_OPTIONS = {
+        URL_ROOT:    './',
+        VERSION:     '',
+        COLLAPSE_INDEX: false,
+        FILE_SUFFIX: '.html',
+        HAS_SOURCE:  true,
+        SOURCELINK_SUFFIX: '.txt'
+      };
+    </script>
+    <script type="text/javascript" src="_static/jquery.js"></script>
+    <script type="text/javascript" src="_static/underscore.js"></script>
+    <script type="text/javascript" src="_static/doctools.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
     <link rel="next" title="Profiling for Varuna" href="profiler.html" />
@@ -20,44 +28,43 @@
    
   <link rel="stylesheet" href="_static/custom.css" type="text/css" />
   
-  
   <meta name="viewport" content="width=device-width, initial-scale=0.9, maximum-scale=0.9" />
 
-  </head><body>
+  </head>
+  <body>
   
 
     <div class="document">
       <div class="documentwrapper">
         <div class="bodywrapper">
-          
-
           <div class="body" role="main">
             
   <div class="section" id="the-varuna-class">
 <h1>The Varuna class<a class="headerlink" href="#the-varuna-class" title="Permalink to this headline">¶</a></h1>
-<p>The torch.nn.Module object for your DNN model should be wrapped in a <a class="reference internal" href="#varuna.Varuna" title="varuna.Varuna"><code class="xref py py-class docutils literal notranslate"><span class="pre">Varuna</span></code></a> instance for training.
+<p>The torch.nn.Module object for your DNN model should be wrapped in a <a class="reference internal" href="#varuna.Varuna" title="varuna.Varuna"><code class="xref py py-class docutils literal"><span class="pre">Varuna</span></code></a> instance for training.
 This class extends torch.nn.Module and handles distributed pipeline &amp; data parallelism, mixed precision and
 shared parameter weights internally.</p>
-<p>Wrapping in <a class="reference internal" href="#varuna.Varuna" title="varuna.Varuna"><code class="xref py py-class docutils literal notranslate"><span class="pre">Varuna</span></code></a> partitions the model into pipeline stages across the distributed job.
-For this, it uses stage allocation information that is passed by <code class="docutils literal notranslate"><span class="pre">varuna.launcher</span></code> to all
-worker processes. The launcher uses a string argument <code class="docutils literal notranslate"><span class="pre">stage_to_rank_map</span></code> which must be parsed
-and used for <a class="reference internal" href="#varuna.Varuna" title="varuna.Varuna"><code class="xref py py-class docutils literal notranslate"><span class="pre">Varuna</span></code></a> initialisation. (see <a class="reference internal" href="launching.html"><span class="doc">Launching Varuna</span></a>)</p>
+<p>Wrapping in <a class="reference internal" href="#varuna.Varuna" title="varuna.Varuna"><code class="xref py py-class docutils literal"><span class="pre">Varuna</span></code></a> partitions the model into pipeline stages across the distributed job.
+For this, it uses stage allocation information that is passed by <code class="docutils literal"><span class="pre">varuna.launcher</span></code> to all
+worker processes. The launcher uses a string argument <code class="docutils literal"><span class="pre">stage_to_rank_map</span></code> which must be parsed
+and used for <a class="reference internal" href="#varuna.Varuna" title="varuna.Varuna"><code class="xref py py-class docutils literal"><span class="pre">Varuna</span></code></a> initialisation. (see <a class="reference internal" href="launching.html"><span class="doc">Launching Varuna</span></a>)</p>
 <p>For profiling and automatic partitioning, Varuna needs sample inputs.
-For this, a <code class="docutils literal notranslate"><span class="pre">get_batch_fn</span></code> needs to be passed during initialisation which returns a sample input batch
-of a given size. This is used to profile the model’s computation graph and should return
-a dictionary of keywords to args, similar to the <code class="docutils literal notranslate"><span class="pre">step</span></code> function.</p>
-<p>The model passed to <a class="reference internal" href="#varuna.Varuna" title="varuna.Varuna"><code class="xref py py-class docutils literal notranslate"><span class="pre">Varuna</span></code></a> should be on CPU. Once the profiling and partitioning are done,
-the model is moved to the assigned GPU. So the user need not do <code class="docutils literal notranslate"><span class="pre">model.cuda()</span></code> anywhere.</p>
-<p>Optimizer creation should be after wrapping in <a class="reference internal" href="#varuna.Varuna" title="varuna.Varuna"><code class="xref py py-class docutils literal notranslate"><span class="pre">Varuna</span></code></a>, since it requires model parameters as input.
+For this, a <code class="docutils literal"><span class="pre">get_batch_fn</span></code> needs to be passed during initialisation which returns a sample input batch
+of a given size. This is used to profile the model’s computation graph and should return</p>
+<blockquote>
+<div>a dictionary of keywords to args, similar to the <code class="docutils literal"><span class="pre">step</span></code> function.</div></blockquote>
+<p>The model passed to <a class="reference internal" href="#varuna.Varuna" title="varuna.Varuna"><code class="xref py py-class docutils literal"><span class="pre">Varuna</span></code></a> should be on CPU. Once the profiling and partitioning are done,
+the model is moved to the assigned GPU. So the user need not do <code class="docutils literal"><span class="pre">model.cuda()</span></code> anywhere.</p>
+<p>Optimizer creation should be after wrapping in <a class="reference internal" href="#varuna.Varuna" title="varuna.Varuna"><code class="xref py py-class docutils literal"><span class="pre">Varuna</span></code></a>, since it requires model parameters as input.
 The optimizer needs to be registered with Varuna using a setter.</p>
 <p>Example:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">model</span> <span class="o">=</span> <span class="n">MyModel</span><span class="p">()</span>             <span class="c1"># full model on CPU</span>
-<span class="k">def</span> <span class="nf">get_batch_fn</span><span class="p">(</span><span class="n">size</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+<div class="highlight-python"><div class="highlight"><pre><span></span><span class="n">model</span> <span class="o">=</span> <span class="n">MyModel</span><span class="p">()</span>             <span class="c1"># full model on CPU</span>
+<span class="k">def</span> <span class="nf">get_batch_fn</span><span class="p">(</span><span class="n">size</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="bp">None</span><span class="p">):</span>
    <span class="n">batch</span> <span class="o">=</span> <span class="n">dataset</span><span class="p">[:</span><span class="n">size</span><span class="p">]</span>
-   <span class="k">if</span> <span class="n">device</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+   <span class="k">if</span> <span class="n">device</span> <span class="ow">is</span> <span class="ow">not</span> <span class="bp">None</span><span class="p">:</span>
       <span class="n">batch</span> <span class="o">=</span> <span class="p">[</span><span class="n">t</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">batch</span><span class="p">]</span>
    <span class="n">inputs</span><span class="p">,</span> <span class="n">mask</span> <span class="o">=</span> <span class="n">batch</span>
-   <span class="k">return</span> <span class="p">{</span><span class="s1">&#39;inputs&#39;</span><span class="p">:</span> <span class="n">inputs</span><span class="p">,</span> <span class="s1">&#39;mask&#39;</span><span class="p">:</span> <span class="n">mask</span><span class="p">,</span> <span class="s1">&#39;extra_norm&#39;</span><span class="p">:</span> <span class="kc">True</span> <span class="p">}</span>
+   <span class="k">return</span> <span class="p">{</span><span class="s1">&#39;inputs&#39;</span><span class="p">:</span> <span class="n">inputs</span><span class="p">,</span> <span class="s1">&#39;mask&#39;</span><span class="p">:</span> <span class="n">mask</span><span class="p">,</span> <span class="s1">&#39;extra_norm&#39;</span><span class="p">:</span> <span class="bp">True</span> <span class="p">}</span>
 <span class="c1"># parameter sharing across the model, marked as pairs of param_names</span>
 <span class="n">shared_weights</span> <span class="o">=</span> <span class="p">[(</span><span class="s2">&quot;language_model.embedding.word_embeddings.weight&quot;</span><span class="p">,</span><span class="s2">&quot;lm_head_weight&quot;</span><span class="p">)]</span>
 <span class="n">model</span> <span class="o">=</span> <span class="n">Varuna</span><span class="p">(</span> <span class="n">model</span><span class="p">,</span> <span class="n">args</span><span class="o">.</span><span class="n">stage_to_rank_map</span><span class="p">,</span> <span class="n">get_batch_fn</span><span class="p">,</span> <span class="n">global_batch_size</span><span class="p">,</span>
@@ -70,151 +77,175 @@ The optimizer needs to be registered with Varuna using a setter.</p>
 <span class="n">model</span><span class="o">.</span><span class="n">set_optimizer</span><span class="p">(</span><span class="n">optimizer</span><span class="p">)</span>
 </pre></div>
 </div>
-<dl class="py class">
+<dl class="class">
 <dt id="varuna.Varuna">
-<em class="property">class </em><code class="sig-prename descclassname">varuna.</code><code class="sig-name descname">Varuna</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">model</span></em>, <em class="sig-param"><span class="n">stage_to_rank_map</span></em>, <em class="sig-param"><span class="n">get_batch_fn</span></em>, <em class="sig-param"><span class="n">batch_size</span></em>, <em class="sig-param"><span class="n">chunk_size</span></em>, <em class="sig-param"><span class="n">fp16</span><span class="o">=</span><span class="default_value">False</span></em>, <em class="sig-param"><span class="n">local_rank</span><span class="o">=</span><span class="default_value">- 1</span></em>, <em class="sig-param"><span class="n">device</span><span class="o">=</span><span class="default_value">- 1</span></em>, <em class="sig-param"><span class="n">shared_weights</span><span class="o">=</span><span class="default_value">None</span></em>, <em class="sig-param"><span class="n">from_cache</span><span class="o">=</span><span class="default_value">True</span></em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna" title="Permalink to this definition">¶</a></dt>
+<em class="property">class </em><code class="descclassname">varuna.</code><code class="descname">Varuna</code><span class="sig-paren">(</span><em>model</em>, <em>stage_to_rank_map</em>, <em>get_batch_fn</em>, <em>batch_size</em>, <em>chunk_size</em>, <em>fp16=False</em>, <em>local_rank=-1</em>, <em>device=-1</em>, <em>shared_weights=None</em>, <em>from_cache=True</em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna" title="Permalink to this definition">¶</a></dt>
 <dd><p>Module to implement varuna training. The model must be wrapped in an instance 
-of <code class="docutils literal notranslate"><span class="pre">Varuna</span></code> before training. This should be done before optimizer creation and the 
-<code class="xref py py-attr docutils literal notranslate"><span class="pre">model</span></code> passed should be on CPU.</p>
-<p>Creating a <code class="docutils literal notranslate"><span class="pre">Varuna</span></code> instance profiles the model briefly using <code class="xref py py-attr docutils literal notranslate"><span class="pre">dummy_inputs</span></code>
+of <code class="docutils literal"><span class="pre">Varuna</span></code> before training. This should be done before optimizer creation and the 
+<code class="xref py py-attr docutils literal"><span class="pre">model</span></code> passed should be on CPU.</p>
+<p>Creating a <code class="docutils literal"><span class="pre">Varuna</span></code> instance profiles the model briefly using <code class="xref py py-attr docutils literal"><span class="pre">dummy_inputs</span></code>
 and partitions it according to the distributed rank and launcher arguments.
 The partitioned model is then moved to the allocated cuda device. The profiling
-information is cached and can be re-used on resuming, unless <code class="xref py py-attr docutils literal notranslate"><span class="pre">from_cache</span></code> is False.
-The <code class="docutils literal notranslate"><span class="pre">Varuna</span></code> module performs mixed precision training internally if enabled through the 
-<code class="xref py py-attr docutils literal notranslate"><span class="pre">fp16</span></code> arg, no external handling is required.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters</dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>model</strong> (<em>torch.nn.Module</em>) – The model to initialize for training.</p></li>
-<li><p><strong>stage_to_rank_map</strong> (<em>dict</em>) – Placement of pipeline stages in the distribued job, encoded as a string. 
-Passed by <code class="docutils literal notranslate"><span class="pre">varuna.launcher</span></code> to each worker as an argument.</p></li>
-<li><p><strong>get_batch_fn</strong> (<em>function</em><em>(</em><em>size: int</em><em>, </em><em>device: torch.device</em><em> or </em><em>None</em><em>)</em>) – Function to get sample input batches of a given size, as dictionaries. 
-These are used to profile the model structure as <code class="docutils literal notranslate"><span class="pre">model(**get_batch_fn(k,</span> <span class="pre">device='cpu))</span></code>.</p></li>
-<li><p><strong>batch_size</strong> (<em>int</em>) – Global batch size for the distributed training job.</p></li>
-<li><p><strong>chunk_size</strong> (<em>int</em>) – The micro-batch size to be used for pipeline parallelism.</p></li>
-<li><p><strong>fp16</strong> (<em>bool</em>) – whether to enable mixed precision training.</p></li>
-<li><p><strong>local_rank</strong> (<em>int</em>) – The local rank as passed by <code class="docutils literal notranslate"><span class="pre">varuna.launcher</span></code>. If not given, 
-defaults to the global rank.</p></li>
-<li><p><strong>device</strong> (<em>int</em>) – index of the cuda device to use. Recommended to be the same as local_rank,
-which is the default if not specified.</p></li>
-<li><p><strong>shared_weights</strong> (<em>list</em><em> or </em><em>None</em>) – A list of tuples, where each each tuple is a pair of weight names (strings),
-such that the two weights are shared in the model (see weight sharing)</p></li>
-<li><p><strong>from_cache</strong> (<em>bool</em>) – Whether to use cached profiling information if available.</p></li>
+information is cached and can be re-used on resuming, unless <code class="xref py py-attr docutils literal"><span class="pre">from_cache</span></code> is False.
+The <code class="docutils literal"><span class="pre">Varuna</span></code> module performs mixed precision training internally if enabled through the 
+<code class="xref py py-attr docutils literal"><span class="pre">fp16</span></code> arg, no external handling is required.</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first last simple">
+<li><strong>model</strong> (<em>torch.nn.Module</em>) – The model to initialize for training.</li>
+<li><strong>stage_to_rank_map</strong> (<em>dict</em>) – Placement of pipeline stages in the distribued job, encoded as a string. 
+Passed by <code class="docutils literal"><span class="pre">varuna.launcher</span></code> to each worker as an argument.</li>
+<li><strong>get_batch_fn</strong> (<em>function</em><em>(</em><em>size: int</em><em>, </em><em>device: torch.device</em><em> or </em><em>None</em><em>)</em>) – Function to get sample input batches of a given size, as dictionaries. 
+These are used to profile the model structure as <code class="docutils literal"><span class="pre">model(**get_batch_fn(k,</span> <span class="pre">device='cpu))</span></code>.</li>
+<li><strong>batch_size</strong> (<em>int</em>) – Global batch size for the distributed training job.</li>
+<li><strong>chunk_size</strong> (<em>int</em>) – The micro-batch size to be used for pipeline parallelism.</li>
+<li><strong>fp16</strong> (<em>bool</em>) – whether to enable mixed precision training.</li>
+<li><strong>local_rank</strong> (<em>int</em>) – The local rank as passed by <code class="docutils literal"><span class="pre">varuna.launcher</span></code>. If not given, 
+defaults to the global rank.</li>
+<li><strong>device</strong> (<em>int</em>) – index of the cuda device to use. Recommended to be the same as local_rank,
+which is the default if not specified.</li>
+<li><strong>shared_weights</strong> (<em>list</em><em> or </em><em>None</em>) – A list of tuples, where each each tuple is a pair of weight names (strings),
+such that the two weights are shared in the model (see weight sharing)</li>
+<li><strong>from_cache</strong> (<em>bool</em>) – Whether to use cached profiling information if available.</li>
 </ul>
-</dd>
-</dl>
+</td>
+</tr>
+</tbody>
+</table>
 <div class="admonition note">
-<p class="admonition-title">Note</p>
-<p>Optimizer initiliastion should be done after  <code class="docutils literal notranslate"><span class="pre">Varuna</span></code> initialisation, so that the <code class="docutils literal notranslate"><span class="pre">param_group</span></code> s
+<p class="first admonition-title">Note</p>
+<p class="last">Optimizer initiliastion should be done after  <code class="docutils literal"><span class="pre">Varuna</span></code> initialisation, so that the <code class="docutils literal"><span class="pre">param_group</span></code> s
 for the optimizer only contain parameters from the partitioned model. This is important both for memory 
-usage and correctness of fp16 training. Once <code class="docutils literal notranslate"><span class="pre">Varuna</span></code> and the optimizer are initialised, <a class="reference internal" href="#varuna.Varuna.set_optimizer" title="varuna.Varuna.set_optimizer"><code class="xref py py-func docutils literal notranslate"><span class="pre">set_optimizer()</span></code></a>
+usage and correctness of fp16 training. Once <code class="docutils literal"><span class="pre">Varuna</span></code> and the optimizer are initialised, <a class="reference internal" href="#varuna.Varuna.set_optimizer" title="varuna.Varuna.set_optimizer"><code class="xref py py-func docutils literal"><span class="pre">set_optimizer()</span></code></a>
 should be called to connect the two.</p>
 </div>
-<dl class="py method">
+<dl class="method">
 <dt id="varuna.Varuna.set_optimizer">
-<code class="sig-name descname">set_optimizer</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">optimizer</span></em>, <em class="sig-param"><span class="n">loss_scale</span><span class="o">=</span><span class="default_value">'dynamic'</span></em>, <em class="sig-param"><span class="n">init_loss_scale</span><span class="o">=</span><span class="default_value">1048576</span></em>, <em class="sig-param"><span class="n">min_loss_scale</span><span class="o">=</span><span class="default_value">1.0</span></em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna.set_optimizer" title="Permalink to this definition">¶</a></dt>
-<dd><p>Configure optimizer for training. if <code class="docutils literal notranslate"><span class="pre">fp16</span></code> is enabled, this function
+<code class="descname">set_optimizer</code><span class="sig-paren">(</span><em>optimizer</em>, <em>loss_scale='dynamic'</em>, <em>init_loss_scale=1048576</em>, <em>min_loss_scale=1.0</em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna.set_optimizer" title="Permalink to this definition">¶</a></dt>
+<dd><p>Configure optimizer for training. if <code class="docutils literal"><span class="pre">fp16</span></code> is enabled, this function
 initializes the mixed precision state in apex.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters</dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>optimizer</strong> (<em>torch.nn.Optimizer</em>) – the optimizer for training.</p></li>
-<li><p><strong>loss_scale</strong> (<em>float</em><em> or </em><em>&quot;dynamic&quot;</em><em>, </em><em>optional</em>) – A floating point number for a static loss scale 
-or the string “dynamic” for dynamic loss scaling.</p></li>
-<li><p><strong>init_loss_scale</strong> (<em>float</em><em>, </em><em>optional</em>) – Initial loss scale (for dynamic scaling)</p></li>
-<li><p><strong>min_loss_scale</strong> (<em>float</em><em>, </em><em>optional</em>) – minimum loss scale (for dynamic scaling)</p></li>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first last simple">
+<li><strong>optimizer</strong> (<em>torch.nn.Optimizer</em>) – the optimizer for training.</li>
+<li><strong>loss_scale</strong> (<em>float</em><em> or </em><em>&quot;dynamic&quot;</em><em>, </em><em>optional</em>) – A floating point number for a static loss scale 
+or the string “dynamic” for dynamic loss scaling.</li>
+<li><strong>init_loss_scale</strong> (<em>float</em><em>, </em><em>optional</em>) – Initial loss scale (for dynamic scaling)</li>
+<li><strong>min_loss_scale</strong> (<em>float</em><em>, </em><em>optional</em>) – minimum loss scale (for dynamic scaling)</li>
 </ul>
-</dd>
-</dl>
+</td>
+</tr>
+</tbody>
+</table>
 </dd></dl>
 
-<dl class="py method">
+<dl class="method">
 <dt id="varuna.Varuna.step">
-<code class="sig-name descname">step</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">inputs</span></em>, <em class="sig-param"><span class="n">clip_grad_max_norm</span><span class="o">=</span><span class="default_value">None</span></em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna.step" title="Permalink to this definition">¶</a></dt>
+<code class="descname">step</code><span class="sig-paren">(</span><em>inputs</em>, <em>clip_grad_max_norm=None</em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna.step" title="Permalink to this definition">¶</a></dt>
 <dd><p>Perform a single training step. Executes forward and backward passes for 
 the global batch. This function must be called by all distributed workers in the training loop.
 After this function, the optimizer gradients are reduced accross data parallel replicas and
 overflow is checked for mixed precision training. Returns average loss and a boolean for overflow.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters</dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>inputs</strong> (<em>dict</em>) – The inputs to the model as a dictionary. These should be coordinated amongst workers -
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first simple">
+<li><strong>inputs</strong> (<em>dict</em>) – The inputs to the model as a dictionary. These should be coordinated amongst workers -
 the global batch is sharded across data parallel replicas, so each worker should have 
-<code class="docutils literal notranslate"><span class="pre">global_batch_size</span> <span class="pre">/</span> <span class="pre">data_parallel_depth</span></code> number of examples. And all pipeline stages of the same
-data parallel replica should recieve the same inputs.</p></li>
-<li><p><strong>clip_grad_max_norm</strong> (<em>float</em><em> or </em><em>None</em><em>, </em><em>optional</em>) – If given, the L2 gradient norm of the entire model
-is clipped to this upper bound.</p></li>
+<code class="docutils literal"><span class="pre">global_batch_size</span> <span class="pre">/</span> <span class="pre">data_parallel_depth</span></code> number of examples. And all pipeline stages of the same
+data parallel replica should recieve the same inputs.</li>
+<li><strong>clip_grad_max_norm</strong> (<em>float</em><em> or </em><em>None</em><em>, </em><em>optional</em>) – If given, the L2 gradient norm of the entire model
+is clipped to this upper bound.</li>
 </ul>
-</dd>
-<dt class="field-even">Returns</dt>
-<dd class="field-even"><p>A tuple of the form (average_loss, overflow)</p>
-</dd>
-<dt class="field-odd">Return type</dt>
-<dd class="field-odd"><p>tuple[float, bool]</p>
-</dd>
-</dl>
+</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><p class="first">A tuple of the form (average_loss, overflow)</p>
+</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body"><p class="first last">tuple[float, bool]</p>
+</td>
+</tr>
+</tbody>
+</table>
 </dd></dl>
 
-<dl class="py method">
+<dl class="method">
 <dt id="varuna.Varuna.checkpoint">
-<code class="sig-name descname">checkpoint</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">global_store</span></em>, <em class="sig-param"><span class="n">step</span><span class="o">=</span><span class="default_value">None</span></em>, <em class="sig-param"><span class="n">tempdir</span><span class="o">=</span><span class="default_value">None</span></em>, <em class="sig-param"><span class="n">shard</span><span class="o">=</span><span class="default_value">False</span></em>, <em class="sig-param"><span class="n">on_demand</span><span class="o">=</span><span class="default_value">False</span></em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna.checkpoint" title="Permalink to this definition">¶</a></dt>
+<code class="descname">checkpoint</code><span class="sig-paren">(</span><em>global_store</em>, <em>step=None</em>, <em>tempdir=None</em>, <em>shard=False</em>, <em>on_demand=False</em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna.checkpoint" title="Permalink to this definition">¶</a></dt>
 <dd><p>Writes a varuna checkpoint with model parameters, optimizer state etc. 
 Each checkpoint is a directory, written under the given path.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters</dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>global_store</strong> (<em>dict</em>) – path to a folder accessible by all nodes/ranks in the training job. 
-For example, path to a mounted blob storage. This is where the varuna checkpoint folder is written.</p></li>
-<li><p><strong>step</strong> (<em>int</em><em> or </em><em>None</em><em>, </em><em>optional</em>) – iteration number for checkpoint. If None, it’ll be taken from varuna’s tracked progress.</p></li>
-<li><p><strong>tempdir</strong> (<em>str</em><em>, </em><em>optional</em>) – path to a local directory to which to write checkpoints temporarily, and sync
-with the global store in the background. Lowers checkpoint write time in the critical path.</p></li>
-<li><p><strong>shard</strong> (<em>bool</em><em>, </em><em>optional</em>) – whether to shard checkpoint writes over data parallel workers as well. Speeds up checkpoint</p></li>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first last simple">
+<li><strong>global_store</strong> (<em>dict</em>) – path to a folder accessible by all nodes/ranks in the training job. 
+For example, path to a mounted blob storage. This is where the varuna checkpoint folder is written.</li>
+<li><strong>step</strong> (<em>int</em><em> or </em><em>None</em><em>, </em><em>optional</em>) – iteration number for checkpoint. If None, it’ll be taken from varuna’s tracked progress.</li>
+<li><strong>tempdir</strong> (<em>str</em><em>, </em><em>optional</em>) – path to a local directory to which to write checkpoints temporarily, and sync
+with the global store in the background. Lowers checkpoint write time in the critical path.</li>
+<li><strong>shard</strong> (<em>bool</em><em>, </em><em>optional</em>) – whether to shard checkpoint writes over data parallel workers as well. Speeds up checkpoint</li>
 </ul>
-</dd>
-</dl>
+</td>
+</tr>
+</tbody>
+</table>
 </dd></dl>
 
-<dl class="py method">
+<dl class="method">
 <dt id="varuna.Varuna.load_checkpoint">
-<code class="sig-name descname">load_checkpoint</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">global_store</span></em>, <em class="sig-param"><span class="n">iteration</span></em>, <em class="sig-param"><span class="n">check_complete</span><span class="o">=</span><span class="default_value">True</span></em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna.load_checkpoint" title="Permalink to this definition">¶</a></dt>
+<code class="descname">load_checkpoint</code><span class="sig-paren">(</span><em>global_store</em>, <em>iteration</em>, <em>check_complete=True</em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna.load_checkpoint" title="Permalink to this definition">¶</a></dt>
 <dd><p>Loads a varuna checkpoint from a shared directory. Each varuna checkpoint is a directory
 named as “varuna_ckpt_&lt;iteration&gt;”. So the path under which all such checkpoints were written
 should be specified.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters</dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>global_store</strong> (<em>str</em>) – path under which varuna checkpoints were written. 
-Should be accessible by all workers.</p></li>
-<li><p><strong>iteration</strong> (<em>int</em>) – Which iteration checkpoint to load.</p></li>
-<li><p><strong>check_complete</strong> (<em>bool</em><em>, </em><em>optional</em>) – Check that the checkpoint is complete before loading it.
-A checkpoint can be incomplete if the write was interrupted.</p></li>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first last simple">
+<li><strong>global_store</strong> (<em>str</em>) – path under which varuna checkpoints were written. 
+Should be accessible by all workers.</li>
+<li><strong>iteration</strong> (<em>int</em>) – Which iteration checkpoint to load.</li>
+<li><strong>check_complete</strong> (<em>bool</em><em>, </em><em>optional</em>) – Check that the checkpoint is complete before loading it.
+A checkpoint can be incomplete if the write was interrupted.</li>
 </ul>
-</dd>
-</dl>
+</td>
+</tr>
+</tbody>
+</table>
 </dd></dl>
 
-<dl class="py method">
+<dl class="method">
 <dt id="varuna.Varuna.evaluate">
-<code class="sig-name descname">evaluate</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">inputs</span></em>, <em class="sig-param"><span class="n">batch_size</span><span class="o">=</span><span class="default_value">None</span></em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna.evaluate" title="Permalink to this definition">¶</a></dt>
+<code class="descname">evaluate</code><span class="sig-paren">(</span><em>inputs</em>, <em>batch_size=None</em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna.evaluate" title="Permalink to this definition">¶</a></dt>
 <dd><p>Evaluate the model on the given inputs. This must be called on all workers
 because it uses pipeline &amp; data parallelism. Inputs should be for the respective data parallel replica
-and have <code class="docutils literal notranslate"><span class="pre">batch_size/data_parallel_depth</span></code> examples, similar to <a class="reference internal" href="#varuna.Varuna.step" title="varuna.Varuna.step"><code class="xref py py-func docutils literal notranslate"><span class="pre">step()</span></code></a>.
+and have <code class="docutils literal"><span class="pre">batch_size/data_parallel_depth</span></code> examples, similar to <a class="reference internal" href="#varuna.Varuna.step" title="varuna.Varuna.step"><code class="xref py py-func docutils literal"><span class="pre">step()</span></code></a>.
 Returns loss averaged over all workers.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters</dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>inputs</strong> (<em>dict</em>) – Model inputs as dictionary. The number of examples
-for these inputs should be the same as the batch_size defined for training.</p></li>
-<li><p><strong>batch_size</strong> (<em>int</em><em>, </em><em>optional</em>) – Batch size for evaluation, if not given it’s the same as training batch size.</p></li>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first simple">
+<li><strong>inputs</strong> (<em>dict</em>) – Model inputs as dictionary. The number of examples
+for these inputs should be the same as the batch_size defined for training.</li>
+<li><strong>batch_size</strong> (<em>int</em><em>, </em><em>optional</em>) – Batch size for evaluation, if not given it’s the same as training batch size.</li>
 </ul>
-</dd>
-<dt class="field-even">Returns</dt>
-<dd class="field-even"><p>average loss</p>
-</dd>
-<dt class="field-odd">Return type</dt>
-<dd class="field-odd"><p>float</p>
-</dd>
-</dl>
+</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><p class="first">average loss</p>
+</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body"><p class="first last">float</p>
+</td>
+</tr>
+</tbody>
+</table>
 </dd></dl>
 
 </dd></dl>
@@ -223,30 +254,10 @@ for these inputs should be the same as the batch_size defined for training.</p><
 
 
           </div>
-          
         </div>
       </div>
       <div class="sphinxsidebar" role="navigation" aria-label="main navigation">
-        <div class="sphinxsidebarwrapper">
-<h1 class="logo"><a href="index.html">Varuna</a></h1>
-
-
-
-
-
-
-
-
-<h3>Navigation</h3>
-<p class="caption"><span class="caption-text">Contents:</span></p>
-<ul class="current">
-<li class="toctree-l1"><a class="reference internal" href="launching.html">Launching Varuna</a></li>
-<li class="toctree-l1"><a class="reference internal" href="cutpoint.html">CutPoints</a></li>
-<li class="toctree-l1 current"><a class="current reference internal" href="#">The Varuna class</a></li>
-<li class="toctree-l1"><a class="reference internal" href="profiler.html">Profiling for Varuna</a></li>
-</ul>
-
-<div class="relations">
+        <div class="sphinxsidebarwrapper"><div class="relations">
 <h3>Related Topics</h3>
 <ul>
   <li><a href="index.html">Documentation overview</a><ul>
@@ -255,24 +266,23 @@ for these inputs should be the same as the batch_size defined for training.</p><
   </ul></li>
 </ul>
 </div>
+  <div role="note" aria-label="source link">
+    <h3>This Page</h3>
+    <ul class="this-page-menu">
+      <li><a href="_sources/varuna.rst.txt"
+            rel="nofollow">Show Source</a></li>
+    </ul>
+   </div>
 <div id="searchbox" style="display: none" role="search">
-  <h3 id="searchlabel">Quick search</h3>
-    <div class="searchformwrapper">
+  <h3>Quick search</h3>
     <form class="search" action="search.html" method="get">
-      <input type="text" name="q" aria-labelledby="searchlabel" />
-      <input type="submit" value="Go" />
+      <div><input type="text" name="q" /></div>
+      <div><input type="submit" value="Go" /></div>
+      <input type="hidden" name="check_keywords" value="yes" />
+      <input type="hidden" name="area" value="default" />
     </form>
-    </div>
 </div>
-<script>$('#searchbox').show(0);</script>
-
-
-
-
-
-
-
-
+<script type="text/javascript">$('#searchbox').show(0);</script>
         </div>
       </div>
       <div class="clearer"></div>
@@ -281,8 +291,8 @@ for these inputs should be the same as the batch_size defined for training.</p><
       &copy;2021, Nitika Saran.
       
       |
-      Powered by <a href="http://sphinx-doc.org/">Sphinx 3.1.2</a>
-      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      Powered by <a href="http://sphinx-doc.org/">Sphinx 1.6.7</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.8</a>
       
       |
       <a href="_sources/varuna.rst.txt"

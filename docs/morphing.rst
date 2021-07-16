@@ -16,7 +16,7 @@ To enable morphing, the user must make some modifications to their script:
 
 * An additional `resume_step` argument is passed to each worker for restarts. (So that there 
     are no race conditions while checking this step from the global storage)
-* A simple signal handler for `SIGUSR1` in the workers to call varuna's `on_demand_checkpoint` (:doc:`Varuna` class)
+* A simple signal handler for `SIGUSR1` in the workers to call varuna's `on_demand_checkpoint` (:doc:`varuna`)
     and exit. The checkpointing may fail if workers are lost during the call.
 * (recommended) With morphing, `Varuna` checkpointing should be enabled with background copying and sharding flags for 
     faster checkpointing. The checkpoint frequency should be high to avoid loss of compute on checkpoint/restarts 

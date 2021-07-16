@@ -16,6 +16,7 @@ Detailed documentation for Varuna functions and classes can be found and navigat
    cutpoint
    varuna
    profiler
+   morphing
 
 
 
