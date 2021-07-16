@@ -41,23 +41,26 @@ shared parameter weights internally.</p>
 <p>Wrapping in <a class="reference internal" href="#varuna.Varuna" title="varuna.Varuna"><code class="xref py py-class docutils literal notranslate"><span class="pre">Varuna</span></code></a> partitions the model into pipeline stages across the distributed job.
 For this, it uses stage allocation information that is passed by <code class="docutils literal notranslate"><span class="pre">varuna.launcher</span></code> to all
 worker processes. The launcher uses a string argument <code class="docutils literal notranslate"><span class="pre">stage_to_rank_map</span></code> which must be parsed
-and used for <a class="reference internal" href="#varuna.Varuna" title="varuna.Varuna"><code class="xref py py-class docutils literal notranslate"><span class="pre">Varuna</span></code></a> initialisation.</p>
-<p>Sample inputs (with any batch size) also need to be passed for this automatic partitioning. These inputs
-are used to profile the model’s computation graph and should be passed a a dictionary of keywords to args.</p>
+and used for <a class="reference internal" href="#varuna.Varuna" title="varuna.Varuna"><code class="xref py py-class docutils literal notranslate"><span class="pre">Varuna</span></code></a> initialisation. (see <a class="reference internal" href="launching.html"><span class="doc">Launching Varuna</span></a>)</p>
+<p>For profiling and automatic partitioning, Varuna needs sample inputs.
+For this, a <code class="docutils literal notranslate"><span class="pre">get_batch_fn</span></code> needs to be passed during initialisation which returns a sample input batch
+of a given size. This is used to profile the model’s computation graph and should return
+a dictionary of keywords to args, similar to the <code class="docutils literal notranslate"><span class="pre">step</span></code> function.</p>
 <p>The model passed to <a class="reference internal" href="#varuna.Varuna" title="varuna.Varuna"><code class="xref py py-class docutils literal notranslate"><span class="pre">Varuna</span></code></a> should be on CPU. Once the profiling and partitioning are done,
 the model is moved to the assigned GPU. So the user need not do <code class="docutils literal notranslate"><span class="pre">model.cuda()</span></code> anywhere.</p>
 <p>Optimizer creation should be after wrapping in <a class="reference internal" href="#varuna.Varuna" title="varuna.Varuna"><code class="xref py py-class docutils literal notranslate"><span class="pre">Varuna</span></code></a>, since it requires model parameters as input.
 The optimizer needs to be registered with Varuna using a setter.</p>
 <p>Example:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">model</span> <span class="o">=</span> <span class="n">MyModel</span><span class="p">()</span>             <span class="c1"># full model on CPU</span>
-<span class="n">dry_run_input</span> <span class="o">=</span> <span class="p">{</span>             <span class="c1"># sample inputs for MyModel</span>
-   <span class="s1">&#39;inputs&#39;</span><span class="p">:</span> <span class="n">inputs</span><span class="p">,</span>          <span class="c1"># keyword: arg</span>
-   <span class="s1">&#39;mask&#39;</span><span class="p">:</span> <span class="n">mask</span><span class="p">,</span>
-   <span class="s1">&#39;extra_norm&#39;</span><span class="p">:</span> <span class="kc">True</span>
-<span class="p">}</span>
+<span class="k">def</span> <span class="nf">get_batch_fn</span><span class="p">(</span><span class="n">size</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+   <span class="n">batch</span> <span class="o">=</span> <span class="n">dataset</span><span class="p">[:</span><span class="n">size</span><span class="p">]</span>
+   <span class="k">if</span> <span class="n">device</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+      <span class="n">batch</span> <span class="o">=</span> <span class="p">[</span><span class="n">t</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">batch</span><span class="p">]</span>
+   <span class="n">inputs</span><span class="p">,</span> <span class="n">mask</span> <span class="o">=</span> <span class="n">batch</span>
+   <span class="k">return</span> <span class="p">{</span><span class="s1">&#39;inputs&#39;</span><span class="p">:</span> <span class="n">inputs</span><span class="p">,</span> <span class="s1">&#39;mask&#39;</span><span class="p">:</span> <span class="n">mask</span><span class="p">,</span> <span class="s1">&#39;extra_norm&#39;</span><span class="p">:</span> <span class="kc">True</span> <span class="p">}</span>
 <span class="c1"># parameter sharing across the model, marked as pairs of param_names</span>
 <span class="n">shared_weights</span> <span class="o">=</span> <span class="p">[(</span><span class="s2">&quot;language_model.embedding.word_embeddings.weight&quot;</span><span class="p">,</span><span class="s2">&quot;lm_head_weight&quot;</span><span class="p">)]</span>
-<span class="n">model</span> <span class="o">=</span> <span class="n">Varuna</span><span class="p">(</span> <span class="n">model</span><span class="p">,</span> <span class="n">args</span><span class="o">.</span><span class="n">stage_to_rank_map</span><span class="p">,</span> <span class="n">dry_run_input</span><span class="p">,</span> <span class="n">global_batch_size</span><span class="p">,</span>
+<span class="n">model</span> <span class="o">=</span> <span class="n">Varuna</span><span class="p">(</span> <span class="n">model</span><span class="p">,</span> <span class="n">args</span><span class="o">.</span><span class="n">stage_to_rank_map</span><span class="p">,</span> <span class="n">get_batch_fn</span><span class="p">,</span> <span class="n">global_batch_size</span><span class="p">,</span>
                   <span class="n">args</span><span class="o">.</span><span class="n">chunk_size</span><span class="p">,</span> <span class="n">args</span><span class="o">.</span><span class="n">fp16</span><span class="p">,</span> <span class="n">local_rank</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">local_rank</span><span class="p">,</span>
                   <span class="n">device</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">local_rank</span><span class="p">,</span> <span class="n">shared_weights</span><span class="o">=</span><span class="n">shared_weights</span><span class="p">)</span>
 
@@ -69,7 +72,7 @@ The optimizer needs to be registered with Varuna using a setter.</p>
 </div>
 <dl class="py class">
 <dt id="varuna.Varuna">
-<em class="property">class </em><code class="sig-prename descclassname">varuna.</code><code class="sig-name descname">Varuna</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">model</span></em>, <em class="sig-param"><span class="n">stage_to_rank_map</span></em>, <em class="sig-param"><span class="n">get_batch_fn</span></em>, <em class="sig-param"><span class="n">batch_size</span></em>, <em class="sig-param"><span class="n">chunk_size</span></em>, <em class="sig-param"><span class="n">fp16</span><span class="o">=</span><span class="default_value">False</span></em>, <em class="sig-param"><span class="n">local_rank</span><span class="o">=</span><span class="default_value">- 1</span></em>, <em class="sig-param"><span class="n">device</span><span class="o">=</span><span class="default_value">- 1</span></em>, <em class="sig-param"><span class="n">shared_weights</span><span class="o">=</span><span class="default_value">None</span></em>, <em class="sig-param"><span class="n">from_cache</span><span class="o">=</span><span class="default_value">True</span></em>, <em class="sig-param"><span class="n">auto_partitioned</span><span class="o">=</span><span class="default_value">False</span></em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna" title="Permalink to this definition">¶</a></dt>
+<em class="property">class </em><code class="sig-prename descclassname">varuna.</code><code class="sig-name descname">Varuna</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">model</span></em>, <em class="sig-param"><span class="n">stage_to_rank_map</span></em>, <em class="sig-param"><span class="n">get_batch_fn</span></em>, <em class="sig-param"><span class="n">batch_size</span></em>, <em class="sig-param"><span class="n">chunk_size</span></em>, <em class="sig-param"><span class="n">fp16</span><span class="o">=</span><span class="default_value">False</span></em>, <em class="sig-param"><span class="n">local_rank</span><span class="o">=</span><span class="default_value">- 1</span></em>, <em class="sig-param"><span class="n">device</span><span class="o">=</span><span class="default_value">- 1</span></em>, <em class="sig-param"><span class="n">shared_weights</span><span class="o">=</span><span class="default_value">None</span></em>, <em class="sig-param"><span class="n">from_cache</span><span class="o">=</span><span class="default_value">True</span></em><span class="sig-paren">)</span><a class="headerlink" href="#varuna.Varuna" title="Permalink to this definition">¶</a></dt>
 <dd><p>Module to implement varuna training. The model must be wrapped in an instance 
 of <code class="docutils literal notranslate"><span class="pre">Varuna</span></code> before training. This should be done before optimizer creation and the 
 <code class="xref py py-attr docutils literal notranslate"><span class="pre">model</span></code> passed should be on CPU.</p>
@@ -241,7 +244,6 @@ for these inputs should be the same as the batch_size defined for training.</p><
 <li class="toctree-l1"><a class="reference internal" href="cutpoint.html">CutPoints</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">The Varuna class</a></li>
 <li class="toctree-l1"><a class="reference internal" href="profiler.html">Profiling for Varuna</a></li>
-<li class="toctree-l1"><a class="reference internal" href="morphing.html">Morphing</a></li>
 </ul>
 
 <div class="relations">

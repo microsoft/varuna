@@ -10,10 +10,12 @@ shared parameter weights internally.
 Wrapping in :class:`Varuna` partitions the model into pipeline stages across the distributed job.
 For this, it uses stage allocation information that is passed by ``varuna.launcher`` to all
 worker processes. The launcher uses a string argument ``stage_to_rank_map`` which must be parsed
-and used for :class:`Varuna` initialisation.
+and used for :class:`Varuna` initialisation. (see :doc:`launching`)
 
-Sample inputs (with any batch size) also need to be passed for this automatic partitioning. These inputs
-are used to profile the model's computation graph and should be passed a a dictionary of keywords to args.
+For profiling and automatic partitioning, Varuna needs sample inputs.
+For this, a ``get_batch_fn`` needs to be passed during initialisation which returns a sample input batch
+of a given size. This is used to profile the model's computation graph and should return
+a dictionary of keywords to args, similar to the ``step`` function.
 
 The model passed to :class:`Varuna` should be on CPU. Once the profiling and partitioning are done,
 the model is moved to the assigned GPU. So the user need not do ``model.cuda()`` anywhere.
@@ -26,14 +28,15 @@ Example:
 .. code-block:: python
 
    model = MyModel()             # full model on CPU
-   dry_run_input = {             # sample inputs for MyModel
-      'inputs': inputs,          # keyword: arg
-      'mask': mask,
-      'extra_norm': True 
-   }
+   def get_batch_fn(size, device=None):
+      batch = dataset[:size]
+      if device is not None:
+         batch = [t.to(device) for t in batch]
+      inputs, mask = batch
+      return {'inputs': inputs, 'mask': mask, 'extra_norm': True }
    # parameter sharing across the model, marked as pairs of param_names
    shared_weights = [("language_model.embedding.word_embeddings.weight","lm_head_weight")]  
-   model = Varuna( model, args.stage_to_rank_map, dry_run_input, global_batch_size, 
+   model = Varuna( model, args.stage_to_rank_map, get_batch_fn, global_batch_size, 
                      args.chunk_size, args.fp16, local_rank=args.local_rank, 
                      device=args.local_rank, shared_weights=shared_weights)
 

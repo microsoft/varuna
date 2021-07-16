@@ -42,7 +42,7 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     pass
 
 def check_progress():
-    global completed_steps
+    global completed_steps, running_machines_list
     last_checked_iter = -1
     while True:
         try:
@@ -76,7 +76,6 @@ def check_progress():
         time.sleep(60*30)
 
 if __name__ == "__main__":
-    global running_machines_list
     
     running_machines_list = sys.argv[1]
     HOST = socket.gethostbyname(socket.gethostname())
