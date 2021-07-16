@@ -1,35 +1,41 @@
 
-<!DOCTYPE html>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
+  "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
 
-<html>
+<html xmlns="http://www.w3.org/1999/xhtml">
   <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
     <title>Morphing &#8212; Varuna  documentation</title>
     <link rel="stylesheet" href="_static/alabaster.css" type="text/css" />
     <link rel="stylesheet" href="_static/pygments.css" type="text/css" />
-    <script id="documentation_options" data-url_root="./" src="_static/documentation_options.js"></script>
-    <script src="_static/jquery.js"></script>
-    <script src="_static/underscore.js"></script>
-    <script src="_static/doctools.js"></script>
-    <script src="_static/language_data.js"></script>
+    <script type="text/javascript">
+      var DOCUMENTATION_OPTIONS = {
+        URL_ROOT:    './',
+        VERSION:     '',
+        COLLAPSE_INDEX: false,
+        FILE_SUFFIX: '.html',
+        HAS_SOURCE:  true,
+        SOURCELINK_SUFFIX: '.txt'
+      };
+    </script>
+    <script type="text/javascript" src="_static/jquery.js"></script>
+    <script type="text/javascript" src="_static/underscore.js"></script>
+    <script type="text/javascript" src="_static/doctools.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
     <link rel="prev" title="Profiling for Varuna" href="profiler.html" />
    
   <link rel="stylesheet" href="_static/custom.css" type="text/css" />
   
-  
   <meta name="viewport" content="width=device-width, initial-scale=0.9, maximum-scale=0.9" />
 
-  </head><body>
+  </head>
+  <body>
   
 
     <div class="document">
       <div class="documentwrapper">
         <div class="bodywrapper">
-          
-
           <div class="body" role="main">
             
   <div class="section" id="morphing">
@@ -45,20 +51,20 @@ can be notified of an upcoming preemption (loss of a machine) through the functi
 For example in Azure, a ‘preempt’ signal is issued with preemption time.</p>
 <p>To enable morphing, the user must make some modifications to their script:</p>
 <ul class="simple">
-<li><dl class="simple">
-<dt>An additional <cite>resume_step</cite> argument is passed to each worker for restarts. (So that there</dt><dd><p>are no race conditions while checking this step from the global storage)</p>
-</dd>
+<li><dl class="first docutils">
+<dt>An additional <cite>resume_step</cite> argument is passed to each worker for restarts. (So that there</dt>
+<dd>are no race conditions while checking this step from the global storage)</dd>
 </dl>
 </li>
-<li><dl class="simple">
-<dt>A simple signal handler for <cite>SIGUSR1</cite> in the workers to call varuna’s <cite>on_demand_checkpoint</cite> (<a class="reference internal" href="varuna.html"><span class="doc">The Varuna class</span></a>)</dt><dd><p>and exit. The checkpointing may fail if workers are lost during the call.</p>
-</dd>
+<li><dl class="first docutils">
+<dt>A simple signal handler for <cite>SIGUSR1</cite> in the workers to call varuna’s <cite>on_demand_checkpoint</cite> (<a class="reference internal" href="varuna.html"><span class="doc">The Varuna class</span></a> class)</dt>
+<dd>and exit. The checkpointing may fail if workers are lost during the call.</dd>
 </dl>
 </li>
-<li><dl class="simple">
-<dt>(recommended) With morphing, <cite>Varuna</cite> checkpointing should be enabled with background copying and sharding flags for</dt><dd><p>faster checkpointing. The checkpoint frequency should be high to avoid loss of compute on checkpoint/restarts
-(in case on demand checkpoints fail).</p>
-</dd>
+<li><dl class="first docutils">
+<dt>(recommended) With morphing, <cite>Varuna</cite> checkpointing should be enabled with background copying and sharding flags for</dt>
+<dd>faster checkpointing. The checkpoint frequency should be high to avoid loss of compute on checkpoint/restarts
+(in case on demand checkpoints fail).</dd>
 </dl>
 </li>
 </ul>
@@ -81,33 +87,17 @@ to remove machines with faulty GPUs.</p>
 
 
           </div>
-          
         </div>
       </div>
       <div class="sphinxsidebar" role="navigation" aria-label="main navigation">
         <div class="sphinxsidebarwrapper">
-<h1 class="logo"><a href="index.html">Varuna</a></h1>
-
-
-
-
-
-
-
-
-<h3>Navigation</h3>
-<p class="caption"><span class="caption-text">Contents:</span></p>
-<ul class="current">
-<li class="toctree-l1"><a class="reference internal" href="launching.html">Launching Varuna</a></li>
-<li class="toctree-l1"><a class="reference internal" href="cutpoint.html">CutPoints</a></li>
-<li class="toctree-l1"><a class="reference internal" href="varuna.html">The Varuna class</a></li>
-<li class="toctree-l1"><a class="reference internal" href="profiler.html">Profiling for Varuna</a></li>
-<li class="toctree-l1 current"><a class="current reference internal" href="#">Morphing</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="#slow-gpu-detection">Slow GPU detection</a></li>
+  <h3><a href="index.html">Table Of Contents</a></h3>
+  <ul>
+<li><a class="reference internal" href="#">Morphing</a><ul>
+<li><a class="reference internal" href="#slow-gpu-detection">Slow GPU detection</a></li>
 </ul>
 </li>
 </ul>
-
 <div class="relations">
 <h3>Related Topics</h3>
 <ul>
@@ -116,24 +106,23 @@ to remove machines with faulty GPUs.</p>
   </ul></li>
 </ul>
 </div>
+  <div role="note" aria-label="source link">
+    <h3>This Page</h3>
+    <ul class="this-page-menu">
+      <li><a href="_sources/morphing.rst.txt"
+            rel="nofollow">Show Source</a></li>
+    </ul>
+   </div>
 <div id="searchbox" style="display: none" role="search">
-  <h3 id="searchlabel">Quick search</h3>
-    <div class="searchformwrapper">
+  <h3>Quick search</h3>
     <form class="search" action="search.html" method="get">
-      <input type="text" name="q" aria-labelledby="searchlabel" />
-      <input type="submit" value="Go" />
+      <div><input type="text" name="q" /></div>
+      <div><input type="submit" value="Go" /></div>
+      <input type="hidden" name="check_keywords" value="yes" />
+      <input type="hidden" name="area" value="default" />
     </form>
-    </div>
 </div>
-<script>$('#searchbox').show(0);</script>
-
-
-
-
-
-
-
-
+<script type="text/javascript">$('#searchbox').show(0);</script>
         </div>
       </div>
       <div class="clearer"></div>
@@ -142,8 +131,8 @@ to remove machines with faulty GPUs.</p>
       &copy;2021, Nitika Saran.
       
       |
-      Powered by <a href="http://sphinx-doc.org/">Sphinx 3.1.2</a>
-      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      Powered by <a href="http://sphinx-doc.org/">Sphinx 1.6.7</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.8</a>
       
       |
       <a href="_sources/morphing.rst.txt"
