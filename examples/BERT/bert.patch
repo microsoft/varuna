@@ -1,0 +1,411 @@
+diff --git a/PyTorch/LanguageModeling/BERT/modeling.py b/PyTorch/LanguageModeling/BERT/modeling.py
+index 0a1bd8f..65ebecd 100755
+--- a/PyTorch/LanguageModeling/BERT/modeling.py
++++ b/PyTorch/LanguageModeling/BERT/modeling.py
+@@ -41,6 +41,8 @@ from torch.nn.parameter import Parameter
+ import torch.nn.functional as F
+ import torch.nn.init as init
+ 
++from varuna import CutPoint
++
+ logger = logging.getLogger(__name__)
+ 
+ PRETRAINED_MODEL_ARCHIVE_MAP = {
+@@ -321,7 +323,7 @@ class BertLayerNorm(Module):
+ 
+ 
+     def forward(self, x):
+-        if self.apex_enabled and not torch.jit.is_scripting():
++        if self.apex_enabled and x.is_cuda and not torch.jit.is_scripting():
+             x = self.fused_layer_norm(x)
+         else:
+             u = x.mean(-1, keepdim=True)
+@@ -484,6 +486,7 @@ class BertEncoder(nn.Module):
+     def __init__(self, config):
+         super(BertEncoder, self).__init__()
+         self.layer = nn.ModuleList([BertLayer(config) for _ in range(config.num_hidden_layers)])
++        self.cutpoints = nn.ModuleList([CutPoint() for _ in range(config.num_hidden_layers - 1)])
+         self.output_all_encoded_layers = config.output_all_encoded_layers
+         self._checkpoint_activations = False
+ 
+@@ -518,6 +521,9 @@ class BertEncoder(nn.Module):
+ 
+                 if self.output_all_encoded_layers:
+                     all_encoder_layers.append(hidden_states)
++                
++                if i < len(self.cutpoints):
++                    hidden_states = self.cutpoints[i](hidden_states)
+ 
+         if not self.output_all_encoded_layers or self._checkpoint_activations:
+             all_encoder_layers.append(hidden_states)
+@@ -558,7 +564,7 @@ class BertLMPredictionHead(nn.Module):
+         self.decoder = nn.Linear(bert_model_embedding_weights.size(1),
+                                  bert_model_embedding_weights.size(0),
+                                  bias=False)
+-        self.decoder.weight = bert_model_embedding_weights
++        self.decoder.weight = nn.Parameter(bert_model_embedding_weights)
+         self.bias = nn.Parameter(torch.zeros(bert_model_embedding_weights.size(0)))
+ 
+     def forward(self, hidden_states):
+@@ -826,7 +832,8 @@ class BertModel(BertPreTrainedModel):
+         # positions we want to attend and -10000.0 for masked positions.
+         # Since we are adding it to the raw scores before the softmax, this is
+         # effectively the same as removing these entirely.
+-        extended_attention_mask = extended_attention_mask.to(dtype=self.embeddings.word_embeddings.weight.dtype) # fp16 compatibility
++        param_dtype = list(self.parameters())[0].dtype
++        extended_attention_mask = extended_attention_mask.to(dtype=param_dtype) # fp16 compatibility
+         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+ 
+         embedding_output = self.embeddings(input_ids, token_type_ids)
+diff --git a/PyTorch/LanguageModeling/BERT/run_pretraining.py b/PyTorch/LanguageModeling/BERT/run_pretraining.py
+index a357788..cb103b0 100755
+--- a/PyTorch/LanguageModeling/BERT/run_pretraining.py
++++ b/PyTorch/LanguageModeling/BERT/run_pretraining.py
+@@ -50,6 +50,7 @@ from apex.parallel.distributed import flat_dist_call
+ import amp_C
+ import apex_C
+ from apex.amp import _amp_state
++from varuna import Varuna, get_varuna_config, get_this_rank_config_varuna
+ 
+ import dllogger
+ from concurrent.futures import ProcessPoolExecutor
+@@ -131,6 +132,16 @@ class BertPretrainingCriterion(torch.nn.Module):
+         total_loss = masked_lm_loss + next_sentence_loss
+         return total_loss
+ 
++class BertForPreTrainingWithCriterion(torch.nn.Module):
++    def __init__(self, config):
++        super(BertForPreTrainingWithCriterion, self).__init__()
++        self.model = modeling.BertForPreTraining(config)
++        self.criterion = BertPretrainingCriterion(config.vocab_size)
++    def forward(self, input_ids, token_type_ids, attention_mask, masked_lm_labels, next_sentence_labels):
++        prediction_scores, seq_relationship_score = self.model(input_ids, token_type_ids, attention_mask)
++        loss = self.criterion(prediction_scores, seq_relationship_score, masked_lm_labels, next_sentence_labels)
++        return loss
++
+ 
+ def parse_arguments():
+ 
+@@ -278,6 +289,17 @@ def parse_arguments():
+                         help='Disable tqdm progress bar')
+     parser.add_argument('--steps_this_run', type=int, default=-1,
+                         help='If provided, only run this many steps before exiting')
++    parser.add_argument('--varuna', action='store_true',
++                        help='Flag to enable training with Varuna')
++    parser.add_argument('--stage_to_rank_map', default=None, type=str,
++                        help = "stage to rank map of Varuna model")
++    parser.add_argument("--chunk_size", type=int,default=None,
++                        help = "number of microbatches for pipeline")
++    parser.add_argument("--batch-size", type=int, default=None,
++                        help = "per-process batch size given by varuna")
++    parser.add_argument("--rank", type=int, default=-1)
++    parser.add_argument("--profiling", action='store_true', 
++                        help="whether to run profiling for Varuna")
+ 
+     args = parser.parse_args()
+     args.fp16 = args.fp16 or args.amp
+@@ -300,10 +322,10 @@ def setup_training(args):
+         torch.cuda.set_device(args.local_rank)
+         device = torch.device("cuda", args.local_rank)
+         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+-        torch.distributed.init_process_group(backend='nccl', init_method='env://')
++        torch.distributed.init_process_group(backend='gloo' if args.varuna else 'nccl', init_method='env://')
+         args.n_gpu = 1
+         
+-    if args.gradient_accumulation_steps == 1:
++    if args.varuna or (args.gradient_accumulation_steps == 1):
+         args.allreduce_post_accumulation = False
+         args.allreduce_post_accumulation_fp16 = False
+         
+@@ -317,6 +339,9 @@ def setup_training(args):
+     print("device: {} n_gpu: {}, distributed training: {}, 16-bits training: {}".format(
+         device, args.n_gpu, bool(args.local_rank != -1), args.fp16))
+ 
++    if args.varuna:
++        args.gradient_accumulation_steps = 1
++        args.train_batch_size = args.batch_size
+     if args.gradient_accumulation_steps < 1:
+         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
+             args.gradient_accumulation_steps))
+@@ -338,7 +363,7 @@ def setup_training(args):
+ 
+     return device, args
+ 
+-def prepare_model_and_optimizer(args, device):
++def prepare_model_and_optimizer(args, device, get_dict_batch):
+ 
+     # Prepare model
+     config = modeling.BertConfig.from_json_file(args.config_file)
+@@ -348,9 +373,27 @@ def prepare_model_and_optimizer(args, device):
+         config.vocab_size += 8 - (config.vocab_size % 8)
+ 
+     modeling.ACT2FN["bias_gelu"] = modeling.bias_gelu_training
+-    model = modeling.BertForPreTraining(config)
++    model = BertForPreTrainingWithCriterion(config)
++
++    if args.varuna:
++        data_file = None
++        for f in os.listdir(args.input_dir):
++            if os.path.isfile(os.path.join(args.input_dir, f)) and 'training' in f:
++                data_file = os.path.join(args.input_dir, f)
++                break
++        train_data = pretraining_dataset(data_file, args.max_predictions_per_seq)
++        def get_batch_fn(size, device=None):
++            batch = next(iter(torch.utils.data.DataLoader(train_data, batch_size=size)))
++            return get_dict_batch(batch, device=device)
++        # shared_weights = []
++        pipeline_parallel_size, data_parallel_size = get_varuna_config(args.stage_to_rank_map)
++        global_batch_size = args.train_batch_size * data_parallel_size
++        shared_weights = [("model.bert.embeddings.word_embeddings.weight", "model.cls.predictions.decoder.weight")]
++        model = Varuna(model, args.stage_to_rank_map, get_batch_fn, global_batch_size, 
++                args.chunk_size, fp16=args.fp16, device=device, shared_weights=shared_weights)
+ 
+     checkpoint = None
++    load_iter = None
+     if not args.resume_from_checkpoint:
+         global_step = 0
+     else:
+@@ -365,7 +408,10 @@ def prepare_model_and_optimizer(args, device):
+         else:
+             checkpoint = torch.load(args.init_checkpoint, map_location="cpu")
+ 
+-        model.load_state_dict(checkpoint['model'], strict=False)
++        # varuna ckpt will be loaded later with optimizer
++        if not args.varuna:
++            model.load_state_dict(checkpoint['model'], strict=False)
++        load_iter = global_step
+         
+         if args.phase2 and not args.init_checkpoint:
+             global_step -= args.phase1_end_step
+@@ -385,7 +431,9 @@ def prepare_model_and_optimizer(args, device):
+     lr_scheduler = PolyWarmUpScheduler(optimizer, 
+                                        warmup=args.warmup_proportion, 
+                                        total_steps=args.max_steps)
+-    if args.fp16:
++    if args.varuna:
++        model.set_optimizer(optimizer, loss_scale = "dynamic", init_loss_scale = args.init_loss_scale)
++    elif args.fp16:
+ 
+         if args.loss_scale == 0:
+             model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale="dynamic", cast_model_outputs=torch.float16)
+@@ -393,30 +441,34 @@ def prepare_model_and_optimizer(args, device):
+             model, optimizer = amp.initialize(model, optimizer, opt_level="O2", loss_scale=args.loss_scale, cast_model_outputs=torch.float16)
+         amp._amp_state.loss_scalers[0]._loss_scale = args.init_loss_scale
+ 
+-    model.checkpoint_activations(args.checkpoint_activations)
++    if not args.varuna:
++        model.checkpoint_activations(args.checkpoint_activations)
+ 
+     if args.resume_from_checkpoint:
++        if not args.varuna:
++            optimizer.load_state_dict(checkpoint['optimizer'])  # , strict=False)
++        else:
++            model.load_checkpoint(args.output_dir, load_iter)
+         if args.phase2 or args.init_checkpoint:
+-            keys = list(checkpoint['optimizer']['state'].keys())
++            keys = list(optimizer.state.keys())
+             #Override hyperparameters from previous checkpoint
+             for key in keys:
+-                checkpoint['optimizer']['state'][key]['step'] = global_step
+-            for iter, item in enumerate(checkpoint['optimizer']['param_groups']):
+-                checkpoint['optimizer']['param_groups'][iter]['step'] = global_step
+-                checkpoint['optimizer']['param_groups'][iter]['t_total'] = args.max_steps
+-                checkpoint['optimizer']['param_groups'][iter]['warmup'] = args.warmup_proportion
+-                checkpoint['optimizer']['param_groups'][iter]['lr'] = args.learning_rate
+-        optimizer.load_state_dict(checkpoint['optimizer'])  # , strict=False)
++                optimizer.state[key]['step'] = global_step
++            for iter_, item in enumerate(optimizer.param_groups):
++                optimizer.param_groups[iter_]['step'] = global_step
++                optimizer.param_groups[iter_]['t_total'] = args.max_steps
++                optimizer.param_groups[iter_]['warmup'] = args.warmup_proportion
++                optimizer.param_groups[iter_]['lr'] = args.learning_rate
+ 
+         # Restore AMP master parameters          
+-        if args.fp16:
++        if args.fp16 and not args.varuna:
+             optimizer._lazy_init_maybe_master_weights()
+             optimizer._amp_stash.lazy_init_called = True
+             optimizer.load_state_dict(checkpoint['optimizer'])
+             for param, saved_param in zip(amp.master_params(optimizer), checkpoint['master params']):
+                 param.data.copy_(saved_param.data)
+ 
+-    if args.local_rank != -1:
++    if args.local_rank != -1 and not args.varuna:
+         if not args.allreduce_post_accumulation:
+             model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
+         else:
+@@ -424,9 +476,9 @@ def prepare_model_and_optimizer(args, device):
+     elif args.n_gpu > 1:
+         model = torch.nn.DataParallel(model)
+ 
+-    criterion = BertPretrainingCriterion(config.vocab_size)
++    # criterion = BertPretrainingCriterion(config.vocab_size)
+ 
+-    return model, optimizer, lr_scheduler, checkpoint, global_step, criterion
++    return model, optimizer, lr_scheduler, checkpoint, global_step
+ 
+ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
+ 
+@@ -480,7 +532,8 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
+         for param in model.parameters():
+             param.grad = None
+     else:
+-        optimizer.step()
++        if not (args.varuna and overflow_buf):
++            optimizer.step()
+         #optimizer.zero_grad()
+         for param in model.parameters():
+             param.grad = None
+@@ -503,7 +556,19 @@ def main():
+     dllogger.log(step="PARAMETER", data={"Config": [str(args)]})
+ 
+     # Prepare optimizer
+-    model, optimizer, lr_scheduler, checkpoint, global_step, criterion = prepare_model_and_optimizer(args, device)
++    def get_dict_batch(batch, device=None):
++        if device is not None:
++            batch = [t.to(device) for t in batch]
++        input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
++        batch = dict({"input_ids": input_ids, 
++                    "token_type_ids": segment_ids, 
++                    "attention_mask":input_mask, 
++                    "masked_lm_labels": masked_lm_labels, 
++                    "next_sentence_labels": next_sentence_labels})
++        return batch
++        
++
++    model, optimizer, lr_scheduler, checkpoint, global_step = prepare_model_and_optimizer(args, device, get_dict_batch)
+ 
+     if is_main_process():
+         dllogger.log(step="PARAMETER", data={"SEED": args.seed})
+@@ -545,11 +610,18 @@ def main():
+ 
+             shared_file_list = {}
+ 
+-            if torch.distributed.is_initialized() and get_world_size() > num_files:
+-                remainder = get_world_size() % num_files
+-                data_file = files[(f_start_id*get_world_size()+get_rank() + remainder*f_start_id)%num_files]
++            if args.varuna:
++                pipeline_parallel_size, data_parallel_size = get_varuna_config(args.stage_to_rank_map)
++                pipeline_stage, data_parallel_rank = get_this_rank_config_varuna(args.stage_to_rank_map, args.rank)
++            else:
++                data_parallel_size = get_world_size()
++                data_parallel_rank = get_rank()
++
++            if torch.distributed.is_initialized() and data_parallel_size > num_files:
++                remainder = data_parallel_size % num_files
++                data_file = files[((f_start_id*data_parallel_size+data_parallel_rank) + remainder*f_start_id)%num_files]
+             else:
+-                data_file = files[(f_start_id*get_world_size()+get_rank())%num_files]
++                data_file = files[(f_start_id*data_parallel_size+data_parallel_rank)%num_files]
+ 
+             previous_file = data_file
+ 
+@@ -572,10 +644,10 @@ def main():
+             for f_id in range(f_start_id + 1 , len(files)):
+                 
+    
+-                if get_world_size() > num_files:
+-                    data_file = files[(f_id*get_world_size()+get_rank() + remainder*f_id)%num_files]
++                if data_parallel_size > num_files:
++                    data_file = files[(f_id*data_parallel_size+data_parallel_rank + remainder*f_id)%num_files]
+                 else:
+-                    data_file = files[(f_id*get_world_size()+get_rank())%num_files]
++                    data_file = files[(f_id*data_parallel_size+data_parallel_rank)%num_files]
+ 
+                 previous_file = data_file
+ 
+@@ -588,24 +660,27 @@ def main():
+                 for step, batch in enumerate(train_iter):
+ 
+                     training_steps += 1
+-                    batch = [t.to(device) for t in batch]
+-                    input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
+-                    prediction_scores, seq_relationship_score = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask)
+-                    loss = criterion(prediction_scores, seq_relationship_score, masked_lm_labels, next_sentence_labels)
+-                    if args.n_gpu > 1:
+-                        loss = loss.mean()  # mean() to average on multi-gpu.
+-
+-                    divisor = args.gradient_accumulation_steps
+-                    if args.gradient_accumulation_steps > 1:
+-                        if not args.allreduce_post_accumulation:
+-                            # this division was merged into predivision
+-                            loss = loss / args.gradient_accumulation_steps
+-                            divisor = 1.0
+-                    if args.fp16:
+-                        with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
+-                            scaled_loss.backward()
++                    batch = get_dict_batch(batch, device=device)
++                    if args.varuna:
++                        loss, overflow, grad_norm = model.step(batch)
++                        loss = torch.tensor(loss)
++                        divisor = 1
+                     else:
+-                        loss.backward()
++                        loss = model(**batch)
++                        if args.n_gpu > 1:
++                            loss = loss.mean()  # mean() to average on multi-gpu.
++
++                        divisor = args.gradient_accumulation_steps
++                        if args.gradient_accumulation_steps > 1:
++                            if not args.allreduce_post_accumulation:
++                                # this division was merged into predivision
++                                loss = loss / args.gradient_accumulation_steps
++                                divisor = 1.0
++                        if args.fp16:
++                            with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
++                                scaled_loss.backward()
++                        else:
++                            loss.backward()
+                     average_loss += loss.item()
+ 
+                     if training_steps % args.gradient_accumulation_steps == 0:
+@@ -640,16 +715,22 @@ def main():
+                             model_to_save = model.module if hasattr(model,
+                                                                     'module') else model  # Only save the model it-self
+                             if args.resume_step < 0 or not args.phase2:
+-                                output_save_file = os.path.join(args.output_dir, "ckpt_{}.pt".format(global_step))
++                                save_step = global_step
+                             else:
+-                                output_save_file = os.path.join(args.output_dir, "ckpt_{}.pt".format(global_step + args.phase1_end_step))
+-                            if args.do_train:
+-                                torch.save({'model': model_to_save.state_dict(),
+-                                            'optimizer': optimizer.state_dict(),
+-                                            'master params': list(amp.master_params(optimizer)),
+-                                            'files': [f_id] + files,
++                                save_step = global_step + args.phase1_end_step
++                            output_save_file = os.path.join(args.output_dir, "ckpt_{}.pt".format(save_step))
++                            if args.varuna:
++                                ckpt_future = model.checkpoint(args.output_dir, tempdir=None, step=save_step)
++                            if args.do_train and (not args.varuna or get_rank()==0):
++                                save_dict = dict()
++                                if not args.varuna:
++                                    save_dict = {'model': model_to_save.state_dict(),
++                                                'optimizer': optimizer.state_dict(),
++                                                'master params': list(amp.master_params(optimizer))}
++                                save_dict.update({'files': [f_id] + files,
+                                             'epoch': epoch,
+-                                            'data_loader': None if global_step >= args.max_steps else train_dataloader}, output_save_file)
++                                            'data_loader': None if global_step >= args.max_steps else train_dataloader})
++                                torch.save(save_dict, output_save_file)
+ 
+                                 most_recent_ckpts_paths.append(output_save_file)
+                                 if len(most_recent_ckpts_paths) > 3:
+@@ -676,15 +757,15 @@ if __name__ == "__main__":
+ 
+     now = time.time()
+     args, final_loss, train_time_raw, global_step = main()
+-    gpu_count = args.n_gpu
++    dp_count = args.n_gpu
+     global_step += args.phase1_end_step if (args.phase2 and args.resume_step > 0) else 0
+     if args.resume_step == -1:
+         args.resume_step = 0
+     if torch.distributed.is_initialized():
+-        gpu_count = get_world_size()
++        dp_count = get_world_size() if not args.varuna else get_varuna_config(args.stage_to_rank_map)[1]
+     if is_main_process():
+         e2e_time = time.time() - now
+-        training_perf = args.train_batch_size * args.gradient_accumulation_steps * gpu_count\
++        training_perf = args.train_batch_size * args.gradient_accumulation_steps * dp_count\
+                         * (global_step - args.resume_step + skipped_steps) / train_time_raw
+         dllogger.log(step=tuple(), data={"e2e_train_time": e2e_time, "training_sequences_per_second": training_perf,
+                                          "final_loss": final_loss, "raw_train_time": train_time_raw })

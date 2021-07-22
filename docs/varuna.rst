@@ -15,7 +15,7 @@ and used for :class:`Varuna` initialisation. (see :doc:`launching`)
 For profiling and automatic partitioning, Varuna needs sample inputs.
 For this, a ``get_batch_fn`` needs to be passed during initialisation which returns a sample input batch
 of a given size. This is used to profile the model's computation graph and should return
- a dictionary of keywords to args, similar to the ``step`` function.
+a dictionary of keywords to args, similar to the ``step`` function.
 
 The model passed to :class:`Varuna` should be on CPU. Once the profiling and partitioning are done,
 the model is moved to the assigned GPU. So the user need not do ``model.cuda()`` anywhere.
