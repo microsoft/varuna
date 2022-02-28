@@ -10,6 +10,11 @@ git checkout c481324031ecf0f70f8939516c02e16cac60446d
 cp /path/to/bert.patch ./
 git apply bert.patch
 ~~~~
+## Running
+
+Please follow the instructions in the original repository along with instructions for Varuna training in the docs ("Launching Varuna" at docs/html/launching.html) for steps to run.
+
+## Changes for Varuna Training
 
 Some changes that are made in the patch are explained below.
 

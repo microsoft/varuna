@@ -2,6 +2,7 @@
 import os, subprocess
 from argparse import ArgumentParser, REMAINDER
 import socket, time
+import sys
 
 from .utils import HEARTBEAT_IP_ENV_VAR, HEARTBEAT_PORT_ENV_VAR, VARUNA_TEMP_FOLDER, MORPH_PORT_ENV_VAR
 
@@ -46,8 +47,8 @@ def kill_morph_listeners():
     os.system("sudo pkill -f varuna.catch")
 
 def get_launch_cmd_format(args):
-    launch_cmd = []
-    launch_cmd.append(f"python -u -m varuna.launcher" \
+    launch_cmd = [sys.executable]
+    launch_cmd.append(f" -u -m varuna.launcher" \
         +  f" --ngpus_per_server {args.gpus_per_node}  " \
         +  " --node_rank {} --nservers {} --master_addr {}"
         +  f" --nstages {args.nstages} --batch_size {args.batch_size}" \
@@ -163,16 +164,23 @@ if __name__ == "__main__":
     
     for i,machine in enumerate(reachable_machines):
         launch_cmd = launch_cmd_format.format(i, reachable_count, master_addr)
-        cmd = ["ssh"]
-        cmd.append(machine)
-        cmd.append(f"echo \"{launch_cmd}\" > launch_varuna.sh; ")
-        cmd.append(f"{HEARTBEAT_IP_ENV_VAR}={args.manager_ip}") 
-        cmd.append(f"{MORPH_PORT_ENV_VAR}={MORPH_PORT} {HEARTBEAT_PORT_ENV_VAR}={HEARTBEAT_PORT}")
-        cmd.append(get_env_vars(args.env_file))
-        cmd.append("bash launch_varuna.sh")
-        print(" ".join(cmd ))
         out_file = open(f"ssh_logs/ssh_out_{i}", "w")
         err_file = open(f"ssh_logs/ssh_err_{i}", "w")
+        
+        if machine == "127.0.0.1":
+            cmd = launch_cmd.split(" ")
+            cmd = [x_ for x_ in cmd if x_ != ""]
+            # print("launch cmd is ", cmd)
+        else:
+            cmd = ["ssh"]
+            cmd.append(machine)
+            cmd.append(f"echo \"{launch_cmd}\" > launch_varuna.sh; ")
+            cmd.append(f"{HEARTBEAT_IP_ENV_VAR}={args.manager_ip}") 
+            cmd.append(f"{MORPH_PORT_ENV_VAR}={MORPH_PORT} {HEARTBEAT_PORT_ENV_VAR}={HEARTBEAT_PORT}")
+            cmd.append(get_env_vars(args.env_file))
+            cmd.append("bash launch_varuna.sh")
+            print(" ".join(cmd ))
+       
         process = subprocess.Popen(cmd, env=current_env, 
                                     stdout=out_file,
                                     stderr=err_file)

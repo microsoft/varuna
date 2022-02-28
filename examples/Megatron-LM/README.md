@@ -1,8 +1,8 @@
-Varuna can be used with [NVIDIA Megatron-LM](https://github.com/NVIDIA/Megatron-LM)'s pytorch models. Here we've made the modifications for GPT-2 training.
+Varuna can be used with [NVIDIA Megatron-LM](https://github.com/NVIDIA/Megatron-LM)'s pytorch models. Here we've made required modifications for GPT-2 training.
 
-This example is built on [this commit](https://github.com/NVIDIA/Megatron-LM/commit/28cd66e1a2d01ada962c356f4a23961cbf4c00b3) of the Megatron repo. An older commit is given as an
+This example is built on [this commit](https://github.com/NVIDIA/Megatron-LM/commit/28cd66e1a2d01ada962c356f4a23961cbf4c00b3) of the Megatron-LM repo. An older commit is given as an
 example here because the versions after this implement custom pipeline parallelism.
-The diff file megatron.patch in this example folder can be applied to this commit to get a working version of 
+The diff file `megatron.patch` in this example folder can be applied to this commit to get a working version of 
 Megatron-LM GPT-2 with Varuna. 
 ~~~~
 git clone https://github.com/NVIDIA/Megatron-LM
@@ -12,6 +12,21 @@ cp /path/to/megatron.patch ./
 git apply megatron.patch
 ~~~~
 The scripts in this folder can then be used for profiling (profile_gpt2.sh) and pretraining (pretrain_gpt2_varuna.sh) with varuna.
+
+## Running
+
+Pretraining for the Megatron-LM model can be triggered using the `pretrain_gpt2_varuna.sh` in this folder, once the code is set up.
+Parameters for different sized models (355M, 1.5B, 2.5B, 8.3B) are given in the script and can be commented/un-commented as required.
+Parameters for the dataset and model write path will need to be set before running. The no
+Varuna parallelisation requires GPUs. FP16 training requires specialized V100 GPUs.
+~~~~
+bash pretrain_gpt2_varuna.sh
+~~~~
+Please refer to the "Launching Varuna" page in the docs (available at docs/html/launching.html) for more details on how to run.
+
+
+
+## Changes for Varuna Training
 
 Some of the changes in the Megatron patch are explained below.
 

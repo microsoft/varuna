@@ -114,8 +114,11 @@ class Varuna(Module):
 
         if device == -1:
             device = self.local_rank
-        torch.cuda.set_device(device)
-        self.device = torch.device("cuda", device)
+        if device == "cpu":
+            self.device = torch.device("cpu")
+        else:
+            torch.cuda.set_device(device)
+            self.device = torch.device("cuda", device)
 
         self.optimizer = None
         self.fp16 = fp16
@@ -283,7 +286,10 @@ class Varuna(Module):
             print(f'{self.rank} {self.rank_within_stage} all-reduce')
 
         sync_start_time = time.time()
-        overflow, grad_norm = self.sync_across_workers(clip_grad_max_norm)
+        if self.fp16 or (self.data_depth > 1) or (self.partitions > 1):
+            overflow, grad_norm = self.sync_across_workers(clip_grad_max_norm)
+        else:
+            overflow = False; grad_norm = 1
         sync_time =  time.time() - sync_start_time
     
         if log_verbose:
