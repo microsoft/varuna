@@ -297,7 +297,7 @@ class Pipeline:
 
             i+=1
         
-        if torch.cuda.is_available():
+        if self.device != "cpu":
             torch.cuda.synchronize(self.device)
             if len(self.pre_fwd_events) > 0:
                 avg_fwd_time = 0.0
