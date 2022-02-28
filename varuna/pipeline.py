@@ -223,13 +223,15 @@ class Pipeline:
         # forward
         if task == 0:
             torch.set_grad_enabled(grad_mode)
-            pre_fwd = torch.cuda.Event(enable_timing=True)
-            post_fwd = torch.cuda.Event(enable_timing=True)
-            pre_fwd.record()
+            if torch.cuda.is_available():
+                pre_fwd = torch.cuda.Event(enable_timing=True)
+                post_fwd = torch.cuda.Event(enable_timing=True)
+                pre_fwd.record()
             output = self.model(inputs_as_dict, save_ctx=not grad_mode, handle_comm=True)
-            post_fwd.record()
-            self.pre_fwd_events.append(pre_fwd)
-            self.post_fwd_events.append(post_fwd)
+            if torch.cuda.is_available():
+                post_fwd.record()
+                self.pre_fwd_events.append(pre_fwd)
+                self.post_fwd_events.append(post_fwd)
 
             if grad_mode == True:
                 # save loss and input activations for the backward pass to use
@@ -295,15 +297,16 @@ class Pipeline:
 
             i+=1
         
-        torch.cuda.synchronize(self.device)
-        if len(self.pre_fwd_events) > 0:
-            avg_fwd_time = 0.0
-            for i in range(len(self.pre_fwd_events)):
-                start = self.pre_fwd_events[i]
-                end = self.post_fwd_events[i]
-                avg_fwd_time += start.elapsed_time(end)
-            avg_fwd_time = avg_fwd_time / len(self.pre_fwd_events)
-            self.avg_fwd_time = avg_fwd_time
+        if self.device != "cpu":
+            torch.cuda.synchronize(self.device)
+            if len(self.pre_fwd_events) > 0:
+                avg_fwd_time = 0.0
+                for i in range(len(self.pre_fwd_events)):
+                    start = self.pre_fwd_events[i]
+                    end = self.post_fwd_events[i]
+                    avg_fwd_time += start.elapsed_time(end)
+                avg_fwd_time = avg_fwd_time / len(self.pre_fwd_events)
+                self.avg_fwd_time = avg_fwd_time
 
         if self.pipeline_group is not None:
             torch.distributed.barrier(group=self.pipeline_group)

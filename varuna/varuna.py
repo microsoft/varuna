@@ -114,8 +114,11 @@ class Varuna(Module):
 
         if device == -1:
             device = self.local_rank
-        torch.cuda.set_device(device)
-        self.device = torch.device("cuda", device)
+        if device == "cpu":
+            self.device = torch.device("cpu")
+        else:
+            torch.cuda.set_device(device)
+            self.device = torch.device("cuda", device)
 
         self.optimizer = None
         self.fp16 = fp16
@@ -216,9 +219,12 @@ class Varuna(Module):
             ranks = [self.stage_to_rank_map[i][replica] for i in range(self.partitions)]
             if len(ranks) > 1:
                 pipeline_groups[replica] = dist.new_group(ranks=ranks)
-                recv_stage, send_stage = self.shared_weight_stages[0]
-                tied_ranks = [ranks[recv_stage], ranks[send_stage]]
-                tied_groups[replica] = dist.new_group(ranks=tied_ranks)
+                if self.shared_weight_stages is not None:
+                    recv_stage, send_stage = self.shared_weight_stages[0]
+                    tied_ranks = [ranks[recv_stage], ranks[send_stage]]
+                    tied_groups[replica] = dist.new_group(ranks=tied_ranks)
+                else:
+                    tied_groups[replica] = None
             else:
                 pipeline_groups[replica] = None
                 tied_groups[replica] = None
@@ -283,7 +289,10 @@ class Varuna(Module):
             print(f'{self.rank} {self.rank_within_stage} all-reduce')
 
         sync_start_time = time.time()
-        overflow, grad_norm = self.sync_across_workers(clip_grad_max_norm)
+        if self.fp16 or (self.data_depth > 1) or (self.partitions > 1):
+            overflow, grad_norm = self.sync_across_workers(clip_grad_max_norm)
+        else:
+            overflow = False; grad_norm = 1
         sync_time =  time.time() - sync_start_time
     
         if log_verbose:

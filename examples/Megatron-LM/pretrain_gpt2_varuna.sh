@@ -1,24 +1,36 @@
 #! /bin/bash
 
-# Runs the "345M" parameter model
-
-RANK=0
-WORLD_SIZE=1
-
-NNODES=$1
-NODE_RANK=$2
-MASTER_ADDR=$3
-ckpt=$4
 
 DATA_PATH=<Specify path and file prefix>_text_document
 CHECKPOINT_PATH=<Specify path>
 
+# 355m model
+$NUM_LAYERS=24
+$HIDDEN_SIZE=1024
+$NUM_ATTENTION_HEADS=16
+
+# # 1.5bn model
+# $NUM_LAYERS=48
+# $HIDDEN_SIZE=1600
+# $NUM_ATTENTION_HEADS=16
+
+# # 2.5bn model
+# $NUM_LAYERS=54
+# $HIDDEN_SIZE=1920
+# $NUM_ATTENTION_HEADS=20
+
+# #8.3bn model
+# $NUM_LAYERS=72
+# $HIDDEN_SIZE=3072
+# $NUM_ATTENTION_HEADS=32
+
+
 # NCCL_DEBUG=INFO NCCL_SOCKET_IFNAME=eth0 NCCL_SOCKET_NTHREADS=4 NCCL_NSOCKS_PERTHREAD=4 \
-python3 -m varuna.run_varuna --nstages 2 --batch_size 512 --chunk_size 4 --gpus_per_node 4 \
+python3 -m varuna.run_varuna --nstages 2 --batch_size 8192 --chunk_size 4 --gpus_per_node 4 \
 --no_morphing pretrain_gpt2.py \
-       --num-layers 24 \
-       --hidden-size 1024 \
-       --num-attention-heads 16 \
+       --num-layers $NUM_LAYERS \
+       --hidden-size $HIDDEN_SIZE \
+       --num-attention-heads $NUM_ATTENTION_HEADS \
        --seq-length 1024 \
        --max-position-embeddings 1024 \
        --train-iters 18750 \

@@ -65,3 +65,5 @@ docs/_build
 Megatron-LM/examples/pretrain_gpt2_varuna.sh
 Megatron-LM/varuna_current_machines
 Megatron-LM/varuna.env
+.DS_Store
+examples/.DS_Store

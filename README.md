@@ -2,9 +2,15 @@
 
 _Varuna_ is a tool for efficient training of large DNN models on commodity GPUs and networking. It implements a combination of pipeline parallelism and data parallelism in PyTorch, and enables training on a changing set of resources smoothly.
 
+This repository is an implementation of the paper:
+
+["Varuna: Scalable, Low-cost Training of Massive Deep Learning Models"](https://arxiv.org/abs/2111.04007), to appear in EuroSys'22.
+
 ## Setup & Installation
 
-Varuna requires python 3, PyTorch (1.5+) and apex. The patch apex.patch in this directory needs to be applied to apex before building it.
+Varuna requires python 3, [PyTorch](https://pytorch.org/get-started/locally/) (1.5+) and [apex](https://github.com/NVIDIA/apex). 
+
+The patch `apex.patch` in this directory needs to be applied to apex before building it. Varuna's code and this patch has been tested for [this commit](https://github.com/NVIDIA/apex/commit/0c2c6eea6556b208d1a8711197efc94899e754e1) of apex.
 ~~~~
 git clone https://github.com/NVIDIA/apex
 cp apex.patch /path/to/apex/
@@ -19,7 +25,9 @@ python setup.py install
 ## Running
 
 Varuna trains large DNN models by parallelising them into sequential pipeline stages and data parallel replicas across a set of GPUs. These methods are called pipeline parallelism and data parallelism respectively.
-To enable parallel training with Varuna, there are several steps the user must follow. Detailed docs are in the `docs/` folder as webpages (`html/index.html`) or pdf (`varuna.pdf`). Examples of models working with varuna can also be found in `examples/`.
+To enable parallel training with Varuna, there are several steps the user must follow. Detailed docs are in the `docs/` folder as webpages (`html/index.html`) or pdf (`varuna.pdf`). 
+
+Examples of models working with varuna can also be found in `examples/`. Please see this folder to run examples with BERT and Megatron-LM.
 
 Some of the steps for are briefly described below.
 
