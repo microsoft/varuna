@@ -219,9 +219,12 @@ class Varuna(Module):
             ranks = [self.stage_to_rank_map[i][replica] for i in range(self.partitions)]
             if len(ranks) > 1:
                 pipeline_groups[replica] = dist.new_group(ranks=ranks)
-                recv_stage, send_stage = self.shared_weight_stages[0]
-                tied_ranks = [ranks[recv_stage], ranks[send_stage]]
-                tied_groups[replica] = dist.new_group(ranks=tied_ranks)
+                if self.shared_weight_stages is not None:
+                    recv_stage, send_stage = self.shared_weight_stages[0]
+                    tied_ranks = [ranks[recv_stage], ranks[send_stage]]
+                    tied_groups[replica] = dist.new_group(ranks=tied_ranks)
+                else:
+                    tied_groups[replica] = None
             else:
                 pipeline_groups[replica] = None
                 tied_groups[replica] = None

@@ -116,6 +116,8 @@ def dry_run(model, get_batch, from_cache):
         hooks.append( module.register_forward_hook(get_hook(name)))
         if isinstance(module, CutPoint):
             num_cutpoints += 1
+
+    print("Num cutpoints is", num_cutpoints)
     
     # TODO: do this extra compute on GPU? large models...
     model(**dummy_inputs)
