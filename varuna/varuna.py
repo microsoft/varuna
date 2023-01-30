@@ -654,6 +654,8 @@ class Varuna(Module):
         
     def extra_grad_norm_sq(self):
         extra_norm_sq = 0.0
+        if self.shared_weights is None:
+            return extra_norm_sq
         for i,w in enumerate(self.shared_weights):
             recv_stage, send_stage = self.shared_weight_stages[i]
             recv_wt_name, send_wt_name = w
